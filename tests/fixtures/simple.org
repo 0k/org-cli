@@ -1,0 +1,10 @@
+* First Heading
+Some content here.
+** Subheading A
+More content.
+** Subheading B :tag1:tag2:
+Tagged content.
+*** Deep Heading
+Very deep.
+* Second Top Level
+Final content.

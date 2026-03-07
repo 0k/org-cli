@@ -1,0 +1,19 @@
+[package]
+name = "org-cli"
+version = "0.1.0"
+edition = "2024"
+description = "CLI for querying and editing org-mode files"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+fern = "0.6"
+log = "0.4"
+orgize = "0.10.0-alpha.10"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["std", "local-offset", "formatting"] }
+
+[dev-dependencies]

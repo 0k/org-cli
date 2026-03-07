@@ -1,0 +1,48 @@
+#+TITLE: org-cli
+#+AUTHOR: vaab
+
+* Overview
+
+=org-cli= is a Rust command-line tool for querying and editing org-mode files.
+
+** Goals
+
+- Query org-mode files for information in various helpful ways
+- Edit org-mode files safely and compatibly
+- Provide machine-friendly output formats for shell integration
+
+** Output Formats
+
+All commands support three output modes:
+
+| Format | Flag | Use Case |
+|--------+------+----------|
+| Human  | (default) | Interactive terminal use |
+| NUL    | =-0= | Reliable bash piping (fixed fields) |
+| NDJSON | =-j= / =--json= | Programmatic JSON queries |
+
+* Installation
+
+#+begin_src bash
+cargo build --release
+#+end_src
+
+* Usage
+
+#+begin_src bash
+org-cli --help
+#+end_src
+
+* Development
+
+See [[file:AGENTS.md][AGENTS.md]] for development guidelines.
+
+#+begin_src bash
+cargo test                                 # Run tests
+cargo fmt                                  # Format code
+cargo clippy --all-targets --all-features  # Lint
+#+end_src
+
+* License
+
+MIT

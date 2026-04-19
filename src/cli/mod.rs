@@ -1,5 +1,6 @@
 //! CLI dispatch and argument handling.
 
+pub mod action;
 mod def;
 
 pub use def::Args;
@@ -32,6 +33,28 @@ pub fn run() -> Result<(), String> {
         None => {
             println!("org-cli: Query and edit org-mode files");
             println!("Run with --help for usage information.");
+            Ok(())
+        }
+        Some(def::Commands::Check {
+            paths,
+            nul,
+            json,
+            first,
+            strict,
+            strict_headings,
+        }) => {
+            let opts = action::check::CheckOptions {
+                paths,
+                nul,
+                json,
+                first,
+                strict,
+                strict_headings,
+            };
+            let exit_code = action::check::run(opts)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
             Ok(())
         }
     }

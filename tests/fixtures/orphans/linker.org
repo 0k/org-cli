@@ -1,0 +1,15 @@
+#+TITLE: Linker
+
+This hub references a few siblings, intentionally leaving some
+files unreferenced so the ``orphans`` integration test has
+deterministic targets to surface.
+
+- A regular file: [[file:ref.org][ref]]
+- A directory link (covers only the dir itself by default):
+  [[file:ref-folder/][ref-folder]]
+- The ``index.org`` of a folder (covers only ``index.org`` itself):
+  [[file:ref-folder/index.org][folder index]]
+- A nested file in a separate subtree:
+  [[file:sub/visited.org][visited]]
+- Self-link so this hub isn't itself reported as orphan:
+  [[file:linker.org][self]]

@@ -57,5 +57,31 @@ pub fn run() -> Result<(), String> {
             }
             Ok(())
         }
+        Some(def::Commands::Orphans {
+            paths,
+            nul,
+            json,
+            first,
+            filter_paths,
+            include_exts,
+            exclude_globs,
+            directory_references_all_children,
+        }) => {
+            let opts = action::orphans::OrphansOptions {
+                paths,
+                nul,
+                json,
+                first,
+                filter_paths,
+                include_exts,
+                exclude_globs,
+                directory_references_all_children,
+            };
+            let exit_code = action::orphans::run(opts)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
     }
 }

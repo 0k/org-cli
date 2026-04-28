@@ -58,4 +58,57 @@ pub enum Commands {
         #[arg(long)]
         strict_headings: bool,
     },
+
+    /// Find files that are *not* the target of any `[[file:...]]`
+    /// link anywhere in the scanned org graph (orphans /
+    /// "forgotten by the graph").
+    ///
+    /// PATH... gives the link-graph scope (which org files to scan
+    /// for links). The candidate set (which files to check for
+    /// orphan-ness) defaults to the same paths but can be narrowed
+    /// with --filter-path or widened to non-org files via
+    /// --include-ext.
+    Orphans {
+        /// Files or directories to scan for `[[file:...]]` links
+        /// AND, by default, to look for candidate files in. Walked
+        /// recursively for `*.org` files (link sources) and for
+        /// candidate files matching --include-ext.
+        #[arg(default_value = ".")]
+        paths: Vec<std::path::PathBuf>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per orphan).
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Stop at the first orphan found.
+        #[arg(short = '1', long)]
+        first: bool,
+
+        /// Only report orphans whose path is under one of these
+        /// prefixes (after canonicalization). Repeatable. When
+        /// omitted, every orphan found is reported.
+        #[arg(long = "filter-path", value_name = "PATH")]
+        filter_paths: Vec<std::path::PathBuf>,
+
+        /// File extensions to consider as orphan candidates.
+        /// Repeatable. Default: `org`. Pass e.g. `--include-ext pdf
+        /// --include-ext jpg` to widen the candidate set.
+        #[arg(long = "include-ext", value_name = "EXT")]
+        include_exts: Vec<String>,
+
+        /// Glob patterns to skip when scanning candidate files
+        /// (e.g. `--exclude '**/.git/**'`). Repeatable.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude_globs: Vec<String>,
+
+        /// When a link points to `foo/`, treat every file inside
+        /// `foo/` (recursively) as referenced. Default off: only
+        /// `foo/` itself is referenced.
+        #[arg(long = "directory-references-all-children")]
+        directory_references_all_children: bool,
+    },
 }

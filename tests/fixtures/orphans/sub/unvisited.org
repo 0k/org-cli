@@ -1,0 +1,4 @@
+#+TITLE: Unvisited
+
+Lives next to ``visited.org`` but is not linked anywhere.
+Surfaces both in a default run and via ``--filter-path sub``.

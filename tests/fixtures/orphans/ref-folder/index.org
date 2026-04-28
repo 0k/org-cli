@@ -1,0 +1,4 @@
+#+TITLE: Folder index
+
+Referenced explicitly from ``linker.org`` via a
+``ref-folder/index.org`` file link. Not an orphan.

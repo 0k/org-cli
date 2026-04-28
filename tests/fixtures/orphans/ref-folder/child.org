@@ -1,0 +1,9 @@
+#+TITLE: Folder child
+
+Sibling of ``index.org`` inside ``ref-folder/``. The hub links
+to ``ref-folder/`` (directory link) and to
+``ref-folder/index.org`` but NOT to this file. By default this
+must be reported as an orphan.
+
+With ``--directory-references-all-children`` the directory link
+absorbs this file and it is no longer reported.

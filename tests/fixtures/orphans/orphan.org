@@ -1,0 +1,4 @@
+#+TITLE: Orphan
+
+Nothing in the fixture links to this file. It must be reported
+as an orphan by ``org-cli orphans tests/fixtures/orphans``.

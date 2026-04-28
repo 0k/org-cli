@@ -16,9 +16,11 @@ use std::path::{Path, PathBuf};
 use colored::*;
 use log::{debug, warn};
 use serde::Serialize;
-use walkdir::WalkDir;
 
-use crate::org::link::{Anchor, AnchorIndex, BreakReason, Link, extract_file_links};
+use crate::cli::action::walk::collect_org_files;
+use crate::org::link::{
+    Anchor, AnchorIndex, BreakReason, Link, extract_file_links, resolve_target,
+};
 
 /// CLI options received from `Commands::Check`.
 #[derive(Debug, Clone)]
@@ -78,7 +80,7 @@ pub fn run(opts: CheckOptions) -> Result<i32, String> {
             .unwrap_or_else(|| PathBuf::from("."));
 
         for link in extract_file_links(&content) {
-            let resolved = resolve_path(&source_dir, &link.target_path);
+            let resolved = resolve_target(&source_dir, &link).path;
 
             let break_reason = match validate_link(
                 &link,
@@ -230,52 +232,6 @@ fn ensure_index<'a>(
     entry.as_ref().ok_or(BreakReason::PathMissing)
 }
 
-/// Resolve `target_path` relative to `source_dir`, then canonicalize
-/// when possible. We avoid `canonicalize()` when the target is missing
-/// (it would error); instead we just absolutize via join.
-fn resolve_path(source_dir: &Path, target_path: &Path) -> PathBuf {
-    let joined = if target_path.is_absolute() {
-        target_path.to_path_buf()
-    } else {
-        source_dir.join(target_path)
-    };
-    // Canonicalize when we can, to give nice diagnostics. Fall back
-    // to the joined path (still suitable for existence checks).
-    fs::canonicalize(&joined).unwrap_or(joined)
-}
-
-/// Collect every `.org` file under the given input paths. Files
-/// passed directly are kept as-is even if they don't end in `.org`.
-fn collect_org_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
-    let mut out = Vec::new();
-    for input in inputs {
-        if !input.exists() {
-            return Err(format!("path not found: {}", input.display()));
-        }
-        if input.is_file() {
-            out.push(input.clone());
-            continue;
-        }
-        for entry in WalkDir::new(input).follow_links(false) {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path
-                .extension()
-                .map(|e| e.eq_ignore_ascii_case("org"))
-                .unwrap_or(false)
-            {
-                out.push(path.to_path_buf());
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------
 // Output formatting
 // ---------------------------------------------------------------------
@@ -392,45 +348,9 @@ mod tests {
         f.write_all(s.as_bytes()).unwrap();
     }
 
-    #[test]
-    fn test_collect_org_files_walks_recursively() {
-        let td = TempDir::new("collect");
-        write(&td.path().join("a.org"), "");
-        write(&td.path().join("nested/b.org"), "");
-        write(&td.path().join("nested/c.txt"), "");
-
-        let files = collect_org_files(&[td.path().to_path_buf()]).unwrap();
-        let names: Vec<_> = files
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert_eq!(names, vec!["a.org", "b.org"]);
-    }
-
-    #[test]
-    fn test_collect_org_files_keeps_explicit_files() {
-        let td = TempDir::new("explicit");
-        let f = td.path().join("notes.txt");
-        write(&f, "");
-        let files = collect_org_files(std::slice::from_ref(&f)).unwrap();
-        assert_eq!(files, vec![f]);
-    }
-
-    #[test]
-    fn test_resolve_path_relative() {
-        let base = PathBuf::from("/some/dir");
-        let r = resolve_path(&base, Path::new("../other/x.org"));
-        // We don't canonicalize a missing path; we expect a join.
-        assert_eq!(r, PathBuf::from("/some/dir/../other/x.org"));
-    }
-
-    #[test]
-    fn test_resolve_path_absolute() {
-        let base = PathBuf::from("/some/dir");
-        let r = resolve_path(&base, Path::new("/etc/hosts"));
-        // Existing path → canonicalized.
-        assert_eq!(r, PathBuf::from("/etc/hosts"));
-    }
+    // Note: `collect_org_files` and `resolve_path` are tested in
+    // their new homes (`cli::action::walk` and `org::link`
+    // respectively). This module no longer owns those tests.
 
     fn opts_for(paths: Vec<PathBuf>) -> CheckOptions {
         CheckOptions {

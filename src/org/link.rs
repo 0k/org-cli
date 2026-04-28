@@ -4,11 +4,15 @@
 //! links found in an org document, plus the indexing of anchorable
 //! targets (headings, `:CUSTOM_ID:` properties) inside an org file.
 //!
-//! Higher layers (`crate::cli::action::check`) consume these to
-//! validate cross-file link integrity.
+//! Higher layers (`crate::cli::action::check`,
+//! `crate::cli::action::orphans`) consume these to validate cross-file
+//! link integrity (forward) or detect unreferenced files (reverse).
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
+use log::warn;
 use orgize::{
     Org,
     ast::Headline,
@@ -30,6 +34,11 @@ pub struct Link {
     /// decoded. May be relative (resolved against the containing org
     /// file's directory by callers) or absolute.
     pub target_path: PathBuf,
+    /// `true` when the original path ended in `/`, marking it as a
+    /// directory citation (e.g. `[[file:photos/]]`). The slash is
+    /// stripped by `PathBuf` construction, so this flag preserves
+    /// the semantic information for downstream consumers.
+    pub target_is_directory: bool,
     /// Optional anchor following `::`. `None` when the link is just
     /// `[[file:path]]` or `[[file:path][desc]]`.
     pub anchor: Option<Anchor>,
@@ -167,6 +176,79 @@ impl AnchorIndex {
     }
 }
 
+/// One file-link target after relative-to-source resolution and
+/// (best-effort) canonicalization.
+///
+/// Two links pointing at the same file from different relative
+/// positions canonicalize to the same `path`, so [`ResolvedTarget`]s
+/// can be compared by set membership across the whole archive.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResolvedTarget {
+    /// Absolute path. Canonicalized when the path exists on disk;
+    /// otherwise the lexically-joined path (still usable for
+    /// existence checks and for diagnostics).
+    pub path: PathBuf,
+    /// `true` when the original link's path part ended in `/`,
+    /// marking it as a directory citation (e.g. `[[file:photos/]]`).
+    /// Callers decide whether to expand a directory link to cover
+    /// its contents.
+    pub is_directory_link: bool,
+}
+
+/// Resolve a single [`Link`]'s target against a source directory.
+///
+/// Used by both `check` (forward link validation) and `orphans`
+/// (reverse, unreferenced-file detection). Anchors are *not*
+/// considered here — the caller validates them separately if needed.
+///
+/// The returned path is canonicalized when possible (target exists),
+/// otherwise lexically joined. This matches the historical behavior
+/// of `cli::action::check::resolve_path`.
+pub fn resolve_target(source_dir: &Path, link: &Link) -> ResolvedTarget {
+    let joined = if link.target_path.is_absolute() {
+        link.target_path.clone()
+    } else {
+        source_dir.join(&link.target_path)
+    };
+    let path = fs::canonicalize(&joined).unwrap_or(joined);
+    ResolvedTarget {
+        path,
+        is_directory_link: link.target_is_directory,
+    }
+}
+
+/// Read every org file in `org_files`, extract all `[[file:...]]`
+/// links, resolve each target relative to its source file's
+/// directory, and return the de-duplicated set of resolved targets.
+///
+/// I/O failures on a single org file are logged via `log::warn!` and
+/// the file is skipped — same defensive policy as
+/// [`crate::cli::action::check`].
+///
+/// This is the **graph-walk core** shared by `check` (forward
+/// integrity: do these targets exist?) and `orphans` (reverse
+/// integrity: which on-disk files are *not* in this set?).
+pub fn collect_referenced_paths(org_files: &[PathBuf]) -> HashSet<ResolvedTarget> {
+    let mut out = HashSet::new();
+    for source_file in org_files {
+        let content = match fs::read_to_string(source_file) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("cannot read {}: {}", source_file.display(), e);
+                continue;
+            }
+        };
+        let source_dir = source_file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        for link in extract_file_links(&content) {
+            out.insert(resolve_target(&source_dir, &link));
+        }
+    }
+    out
+}
+
 /// Extract every `[[file:...]]` link from the given org content.
 ///
 /// The returned [`Link`]s have their `file:` prefix stripped and
@@ -185,6 +267,7 @@ pub fn extract_file_links(content: &str) -> Vec<Link> {
 
         let (path_str, anchor) = split_anchor(after_scheme);
         let decoded = percent_decode(path_str);
+        let target_is_directory = decoded.ends_with('/');
         let target_path = PathBuf::from(decoded);
 
         let offset: usize = link.start().into();
@@ -193,6 +276,7 @@ pub fn extract_file_links(content: &str) -> Vec<Link> {
         out.push(Link {
             raw: link.raw(),
             target_path,
+            target_is_directory,
             anchor,
             line,
             column,
@@ -425,5 +509,169 @@ mod tests {
             heading: "X".into(),
         };
         assert!(r.message().contains("X"));
+    }
+
+    // ---------------------------------------------------------------
+    // Tests for the shared resolver / collector used by both `check`
+    // and `orphans`.
+    // ---------------------------------------------------------------
+
+    /// Same tempdir helper as `check.rs::tests` — duplicated here on
+    /// purpose to keep `org::link` self-contained for testing. If a
+    /// third test module needs it we'll lift it.
+    mod tempdir_helper {
+        use std::fs;
+        use std::path::PathBuf;
+        pub struct TempDir(pub PathBuf);
+        impl TempDir {
+            pub fn new(tag: &str) -> Self {
+                let mut p = std::env::temp_dir();
+                let pid = std::process::id();
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0);
+                p.push(format!("org-cli-link-test-{}-{}-{}", tag, pid, nanos));
+                fs::create_dir_all(&p).unwrap();
+                Self(p)
+            }
+            pub fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    fn write_file(p: &Path, s: &str) {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, s).unwrap();
+    }
+
+    #[test]
+    fn test_extract_marks_directory_link() {
+        let src = "[[file:photos/][shots]] [[file:foo.org][f]]\n";
+        let links = extract_file_links(src);
+        assert_eq!(links.len(), 2);
+        // Order matches source order.
+        assert!(links[0].target_is_directory);
+        assert!(!links[1].target_is_directory);
+    }
+
+    #[test]
+    fn test_resolve_target_strips_anchor_concept() {
+        // Anchors don't reach `resolve_target` — they live in
+        // `Link::anchor`. The resolver only cares about the path.
+        // This test just documents that contract.
+        let src = "[[file:foo.org::*Heading][f]]\n";
+        let link = &extract_file_links(src)[0];
+        let r = resolve_target(Path::new("/tmp"), link);
+        assert!(r.path.ends_with("foo.org"));
+    }
+
+    #[test]
+    fn test_resolve_target_canonicalizes_when_path_exists() {
+        let td = tempdir_helper::TempDir::new("canon");
+        // Create the same target reachable from two different
+        // source dirs via different relative paths.
+        write_file(&td.path().join("topic/foo.org"), "* H\n");
+        std::fs::create_dir_all(td.path().join("visit")).unwrap();
+
+        let from_root = "[[file:topic/foo.org][f]]\n";
+        let link_a = &extract_file_links(from_root)[0];
+        let resolved_a = resolve_target(td.path(), link_a);
+
+        let from_visit = "[[file:../topic/foo.org][f]]\n";
+        let link_b = &extract_file_links(from_visit)[0];
+        let resolved_b = resolve_target(&td.path().join("visit"), link_b);
+
+        assert_eq!(
+            resolved_a, resolved_b,
+            "two relative paths to the same file must canonicalize equal"
+        );
+        assert!(!resolved_a.is_directory_link);
+    }
+
+    #[test]
+    fn test_resolve_target_keeps_directory_flag_through_canonicalization() {
+        let td = tempdir_helper::TempDir::new("dir-flag");
+        std::fs::create_dir_all(td.path().join("sub")).unwrap();
+        let src = "[[file:sub/][s]]\n";
+        let link = &extract_file_links(src)[0];
+        let r = resolve_target(td.path(), link);
+        assert!(r.is_directory_link, "trailing-slash semantic preserved");
+    }
+
+    #[test]
+    fn test_resolve_target_falls_back_when_path_missing() {
+        // No filesystem state; canonicalize fails; we expect the
+        // lexically-joined path back so callers can still reason
+        // about it (existence checks, error messages).
+        let src = "[[file:does/not/exist.org][x]]\n";
+        let link = &extract_file_links(src)[0];
+        let r = resolve_target(Path::new("/tmp"), link);
+        assert_eq!(r.path, PathBuf::from("/tmp/does/not/exist.org"));
+    }
+
+    #[test]
+    fn test_collect_referenced_paths_dedups_across_files() {
+        let td = tempdir_helper::TempDir::new("collect-dedup");
+        write_file(&td.path().join("target.org"), "* H\n");
+        write_file(&td.path().join("a.org"), "[[file:target.org][t]]\n");
+        write_file(
+            &td.path().join("nested/b.org"),
+            "[[file:../target.org][t]]\n",
+        );
+
+        let org_files = vec![td.path().join("a.org"), td.path().join("nested/b.org")];
+        let set = collect_referenced_paths(&org_files);
+        assert_eq!(
+            set.len(),
+            1,
+            "the same target reached via different relative paths must dedup"
+        );
+        let only = set.iter().next().unwrap();
+        assert!(only.path.ends_with("target.org"));
+        assert!(!only.is_directory_link);
+    }
+
+    #[test]
+    fn test_collect_referenced_paths_skips_unreadable_org() {
+        let td = tempdir_helper::TempDir::new("collect-unreadable");
+        // Path that doesn't exist — `read_to_string` errors are
+        // logged and the file is skipped, not propagated.
+        let bogus = td.path().join("ghost.org");
+        let set = collect_referenced_paths(&[bogus]);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_collect_referenced_paths_skips_non_file_links() {
+        let td = tempdir_helper::TempDir::new("collect-nonfile");
+        write_file(
+            &td.path().join("a.org"),
+            "[[https://example.com][site]] [[id:abc][by-id]]\n",
+        );
+        let set = collect_referenced_paths(&[td.path().join("a.org")]);
+        assert!(
+            set.is_empty(),
+            "only file: links contribute, got: {:?}",
+            set
+        );
+    }
+
+    #[test]
+    fn test_collect_referenced_paths_marks_directory_links() {
+        let td = tempdir_helper::TempDir::new("collect-dir");
+        std::fs::create_dir_all(td.path().join("photos")).unwrap();
+        write_file(&td.path().join("a.org"), "[[file:photos/][p]]\n");
+        let set = collect_referenced_paths(&[td.path().join("a.org")]);
+        assert_eq!(set.len(), 1);
+        assert!(set.iter().next().unwrap().is_directory_link);
     }
 }

@@ -214,6 +214,74 @@ fn list_aborts_before_processing_subsequent_clean_lines() {
 }
 
 #[test]
+fn add_inserts_canonical_clock_into_target_heading() {
+    let dir = std::env::temp_dir().join(format!(
+        "org-cli-add-int-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("target.org");
+    std::fs::write(
+        &p,
+        "** WIP fix login bug\n  :PROPERTIES:\n  :TASK_REF: 248\n  :END:\n",
+    )
+    .unwrap();
+
+    let out = Command::new(bin_path())
+        .arg("clock")
+        .arg("add")
+        .arg(&p)
+        .arg("248")
+        .arg("2025-06-06 09:30")
+        .arg("2025-06-06 11:45")
+        .arg("--tz")
+        .arg("+0200")
+        .arg("--write")
+        .arg("-j")
+        .output()
+        .expect("spawn org-cli");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().unwrap()).expect("NDJSON");
+    assert_eq!(v["applied"], true);
+    assert_eq!(v["edit_kind"], "created-logbook");
+
+    let after = std::fs::read_to_string(&p).unwrap();
+    assert!(
+        after
+            .contains("CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15"),
+        "expected canonical CLOCK line in:\n{}",
+        after
+    );
+    // The inserted line must pass ``clock check``.
+    let chk = Command::new(bin_path())
+        .arg("clock")
+        .arg("check")
+        .arg(&p)
+        .output()
+        .expect("spawn org-cli check");
+    assert_eq!(
+        chk.status.code(),
+        Some(0),
+        "clock check stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&chk.stdout),
+        String::from_utf8_lossy(&chk.stderr),
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fmt_minute_with_explicit_tz_outputs_canonical_line() {
     let out = Command::new(bin_path())
         .arg("clock")

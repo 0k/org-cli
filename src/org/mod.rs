@@ -4,4 +4,5 @@
 //! (e.g. `Link`). The CLI layer (`crate::cli::action`) composes them.
 
 pub mod clock;
+pub mod clock_add;
 pub mod link;

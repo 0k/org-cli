@@ -203,6 +203,58 @@ pub enum ClockCommands {
         json: bool,
     },
 
+    /// Find a heading in FILE and insert one canonical CLOCK
+    /// line into its `:LOGBOOK:` drawer (creating the drawer
+    /// if it doesn't exist yet).
+    ///
+    /// HEADING is digits-only → looked up as a `:TASK_REF:`
+    /// property; otherwise as a case-insensitive substring of
+    /// the heading title. Multiple substring matches surface as
+    /// an ambiguity error.
+    ///
+    /// The CLOCK line is generated through the same canonical
+    /// formatter as ``clock fmt``, so the inserted line is
+    /// guaranteed to pass ``clock check``.
+    Add {
+        /// Target org file.
+        file: std::path::PathBuf,
+
+        /// Heading identifier (digits → TASK_REF; otherwise
+        /// substring).
+        heading: String,
+
+        /// Start time. Same accepted forms as ``clock fmt``.
+        start: String,
+
+        /// End time. Same accepted forms as ``clock fmt``.
+        end: String,
+
+        /// Numerical zone like ``+0200`` or ``-0500``. When
+        /// omitted, the system's current local zone is used.
+        #[arg(long, value_name = "±HHMM")]
+        tz: Option<String>,
+
+        /// Emit `HH:MM:SS` precision instead of `HH:MM`.
+        #[arg(long)]
+        seconds: bool,
+
+        /// Round each side to the nearest N-minute mark. 0
+        /// (default) disables rounding. Mutually exclusive with
+        /// --seconds.
+        #[arg(long, default_value_t = 0)]
+        grid: u32,
+
+        /// Apply the rewrite in place. Without this flag the
+        /// proposed full file content is printed on stdout.
+        #[arg(long)]
+        write: bool,
+
+        /// NDJSON record describing the rewrite (file, line,
+        /// edit_kind, clock_line, heading_line, applied).
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
     /// Print one canonical `CLOCK:` line on stdout.
     Fmt {
         /// Start time. Accepts `HH:MM`, `HH:MM:SS`,

@@ -138,6 +138,34 @@ pub fn run() -> Result<(), String> {
                 }
                 Ok(())
             }
+            def::ClockCommands::Add {
+                file,
+                heading,
+                start,
+                end,
+                tz,
+                seconds,
+                grid,
+                write,
+                json,
+            } => {
+                let opts = action::clock::AddOptions {
+                    file,
+                    heading,
+                    start,
+                    end,
+                    tz,
+                    seconds,
+                    grid,
+                    write,
+                    json,
+                };
+                let exit_code = action::clock::run_add(opts)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
             def::ClockCommands::Fmt {
                 start,
                 end,

@@ -24,6 +24,7 @@ use crate::cli::action::walk::collect_org_files;
 use crate::org::clock::{
     fix_weekday_in_line, format_clock_line, parse_clock_line, recompute_duration_in_line,
 };
+use crate::org::clock_add::{HeadingQuery, apply_add};
 
 // =====================================================================
 // `clock check`
@@ -659,6 +660,127 @@ fn emit_reject<W: Write>(out: &mut W, r: &ListReject) -> io::Result<()> {
 }
 
 // =====================================================================
+// `clock add`
+// =====================================================================
+//
+// Find a heading in an org file and insert one canonical CLOCK
+// line into its `:LOGBOOK:` drawer (creating the drawer if
+// necessary). Generated through the same
+// `format_clock_line` code path as `clock fmt`, so the inserted
+// line is by construction `clock check`-clean.
+
+/// CLI options for `clock add`.
+#[derive(Debug, Clone)]
+pub struct AddOptions {
+    pub file: PathBuf,
+    /// Heading identifier. Digits-only → TASK_REF lookup;
+    /// otherwise case-insensitive substring of the heading
+    /// title.
+    pub heading: String,
+    pub start: String,
+    pub end: String,
+    pub tz: Option<String>,
+    pub seconds: bool,
+    pub grid: u32,
+    /// Apply the change in place. Without this flag the rewrite
+    /// is a dry run; the diff is printed on stdout.
+    pub write: bool,
+    /// NDJSON record on stdout describing the rewrite.
+    pub json: bool,
+}
+
+/// Run `clock add`. Returns 0 on success.
+pub fn run_add(opts: AddOptions) -> Result<i32, String> {
+    if opts.seconds && opts.grid != 0 {
+        return Err("--seconds and --grid are mutually exclusive".into());
+    }
+    if opts.grid != 0 && (opts.grid < 1 || 60 % opts.grid != 0) {
+        return Err(format!(
+            "--grid must be a positive divisor of 60 (got {})",
+            opts.grid
+        ));
+    }
+
+    // Build the canonical CLOCK line through the same path as
+    // `clock fmt` — reuse helpers so behaviour stays consistent.
+    let tz = match &opts.tz {
+        Some(s) => parse_numerical_tz(s)?,
+        None => current_local_tz_minutes(),
+    };
+    let tz_str = format_numerical_tz(tz);
+
+    let start = parse_user_datetime(&opts.start, "START")?;
+    let end = parse_user_datetime(&opts.end, "END")?;
+    let (start, end) = if opts.grid > 0 {
+        (
+            round_to_grid(start, opts.grid),
+            round_to_grid(end, opts.grid),
+        )
+    } else {
+        (start, end)
+    };
+    if end < start {
+        return Err("END is before START".into());
+    }
+
+    let clock_line = format_clock_line(start, end, &tz_str, opts.seconds);
+
+    let content = fs::read_to_string(&opts.file)
+        .map_err(|e| format!("cannot read {}: {}", opts.file.display(), e))?;
+
+    let query = HeadingQuery::from_cli(&opts.heading);
+    let (new_content, record) =
+        apply_add(&content, &query, &clock_line).map_err(|e| e.to_string())?;
+
+    if opts.write {
+        fs::write(&opts.file, &new_content)
+            .map_err(|e| format!("cannot write {}: {}", opts.file.display(), e))?;
+    }
+
+    if opts.json {
+        #[derive(Serialize)]
+        struct AddRecordOut<'a> {
+            file: &'a Path,
+            line: usize,
+            edit_kind: &'static str,
+            clock_line: &'a str,
+            heading_line: usize,
+            applied: bool,
+        }
+        let out = AddRecordOut {
+            file: &opts.file,
+            line: record.line,
+            edit_kind: record.edit_kind,
+            clock_line: &record.clock_line,
+            heading_line: record.heading_line,
+            applied: opts.write,
+        };
+        let line = serde_json::to_string(&out).map_err(|e| format!("serialising record: {}", e))?;
+        println!("{}", line);
+    } else if opts.write {
+        println!(
+            "{}: inserted at line {} ({})",
+            opts.file.display().to_string().bright_blue(),
+            record.line,
+            record.edit_kind.cyan(),
+        );
+        println!("  {}", record.clock_line);
+    } else {
+        // Dry run: print proposed full file content.
+        // Cheap & honest — no diff lib for now.
+        print!("{}", new_content);
+        eprintln!(
+            "\n(dry run; pass --write to apply. Would insert {:?} at line {} of {})",
+            record.edit_kind,
+            record.line,
+            opts.file.display(),
+        );
+    }
+
+    Ok(0)
+}
+
+// =====================================================================
 // `clock fmt`
 // =====================================================================
 
@@ -1144,6 +1266,106 @@ mod tests {
         );
         let exit = run_list(list_opts(vec![td.path().to_path_buf()])).unwrap();
         assert_eq!(exit, 0);
+    }
+
+    // ----- add ----------------------------------------------------------
+
+    fn add_opts(file: PathBuf, heading: &str, write: bool) -> AddOptions {
+        AddOptions {
+            file,
+            heading: heading.to_string(),
+            start: "2025-06-06 09:30".into(),
+            end: "2025-06-06 11:45".into(),
+            tz: Some("+0200".into()),
+            seconds: false,
+            grid: 0,
+            write,
+            json: true,
+        }
+    }
+
+    #[test]
+    fn add_dry_run_leaves_file_untouched() {
+        let td = TempDir::new("add-dry");
+        let path = td.path().join("a.org");
+        let original = "** WIP target\n  :PROPERTIES:\n  :TASK_REF: 248\n  :END:\n";
+        write(&path, original);
+        let exit = run_add(add_opts(path.clone(), "248", false)).unwrap();
+        assert_eq!(exit, 0);
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original, "dry run must not mutate the file");
+    }
+
+    #[test]
+    fn add_write_inserts_clock_into_existing_logbook() {
+        let td = TempDir::new("add-existing-logbook");
+        let path = td.path().join("a.org");
+        let original = "** WIP target\n  :LOGBOOK:\n  CLOCK: [2025-06-05 Thu 14:00 +0200]--[2025-06-05 Thu 15:00 +0200] =>  1:00\n  :END:\n";
+        write(&path, original);
+        let exit = run_add(add_opts(path.clone(), "target", true)).unwrap();
+        assert_eq!(exit, 0);
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(
+                "CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15"
+            ),
+            "new CLOCK line not present:\n{}",
+            after
+        );
+        // Original CLOCK still there.
+        assert!(after.contains("2025-06-05 Thu 14:00"));
+    }
+
+    #[test]
+    fn add_write_creates_logbook_when_absent() {
+        let td = TempDir::new("add-create-logbook");
+        let path = td.path().join("a.org");
+        let original = "** WIP target\n";
+        write(&path, original);
+        let exit = run_add(add_opts(path.clone(), "target", true)).unwrap();
+        assert_eq!(exit, 0);
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(":LOGBOOK:"),
+            "drawer not created:\n{}",
+            after
+        );
+        assert!(after.contains(":END:"));
+        assert!(after.contains("CLOCK: [2025-06-06 Fri 09:30 +0200]"));
+    }
+
+    #[test]
+    fn add_inserted_line_round_trips_through_check() {
+        // The CLOCK line generated by ``run_add`` must satisfy
+        // strict canonical validation — the whole point of
+        // routing through the same formatter as ``clock fmt``.
+        let td = TempDir::new("add-roundtrip");
+        let path = td.path().join("a.org");
+        write(&path, "** WIP target\n");
+        run_add(add_opts(path.clone(), "target", true)).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        // Locate the inserted CLOCK line and parse it.
+        let inserted = after
+            .lines()
+            .find(|l| l.trim_start().starts_with("CLOCK:"))
+            .expect("CLOCK line present");
+        let parsed = crate::org::clock::parse_clock_line(inserted)
+            .expect("structurally parseable")
+            .expect("closed-range");
+        assert!(parsed.violations.is_empty(), "got {:?}", parsed.violations);
+    }
+
+    #[test]
+    fn add_errors_on_missing_heading() {
+        let td = TempDir::new("add-missing");
+        let path = td.path().join("a.org");
+        write(&path, "** unrelated\n");
+        let err = run_add(add_opts(path, "999", true)).unwrap_err();
+        assert!(
+            err.contains("not found") || err.contains(":TASK_REF:"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     // ----- agenda set loader --------------------------------------------

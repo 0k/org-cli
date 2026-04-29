@@ -21,8 +21,10 @@ use log::{debug, warn};
 use serde::Serialize;
 
 use crate::cli::action::walk::collect_org_files;
+use crate::config::Config;
 use crate::org::clock::{
-    fix_weekday_in_line, format_clock_line, parse_clock_line, recompute_duration_in_line,
+    check_accepted_zones, fix_weekday_in_line, format_clock_line, parse_clock_line,
+    recompute_duration_in_line,
 };
 use crate::org::clock_add::{HeadingQuery, apply_add};
 
@@ -59,6 +61,11 @@ pub struct Violation {
 pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
     let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
     debug!("scanning {} org file(s)", files.len());
+
+    // Load accepted zones once. Empty list → the
+    // ``unaccepted-tz`` check is silently disabled.
+    let cfg = Config::load_default()?;
+    let zones = cfg.clock.resolve_zones()?;
 
     let mut violation_count: usize = 0;
     let mut writer = StdoutWriter::new(&opts);
@@ -98,6 +105,15 @@ pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
                         if emit_one(v.tag(), v.message())? {
                             break 'files;
                         }
+                    }
+                    // Accepted-zones check rides on top of the
+                    // structural violations; emit it only when the
+                    // line otherwise structurally parses (it does
+                    // here — we're inside Ok(Some)).
+                    if let Some(v) = check_accepted_zones(&p, &zones)
+                        && emit_one(v.tag(), v.message())?
+                    {
+                        break 'files;
                     }
                 }
                 Err(err) => {
@@ -256,6 +272,9 @@ pub fn run_fix(opts: FixOptions) -> Result<i32, String> {
     let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
     debug!("scanning {} org file(s) for weekday-mismatch", files.len());
 
+    let cfg = Config::load_default()?;
+    let zones = cfg.clock.resolve_zones()?;
+
     let mut total_rewrites: usize = 0;
     let mut writer: io::BufWriter<io::Stdout> = io::BufWriter::new(io::stdout());
 
@@ -277,6 +296,19 @@ pub fn run_fix(opts: FixOptions) -> Result<i32, String> {
                 Some(stripped) => (stripped, "\n"),
                 None => (chunk, ""),
             };
+            // Strict accepted-zone gate: a line whose embedded
+            // offset matches no configured zone is suspect on the
+            // TZ axis itself; we cannot mechanically fix the
+            // weekday or duration without first agreeing what
+            // the line *means*. Refuse to mutate the whole line.
+            if !zones.is_empty()
+                && let Ok(Some(p)) = parse_clock_line(orig)
+                && check_accepted_zones(&p, &zones).is_some()
+            {
+                new_content.push_str(orig);
+                new_content.push_str(eol);
+                continue;
+            }
             // Apply weekday fix first. The duration recompute
             // uses the strict parser, which only succeeds on a
             // line whose weekday already matches the date — so
@@ -498,6 +530,9 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
     let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
     debug!("listing CLOCK lines from {} org file(s)", files.len());
 
+    let cfg = Config::load_default()?;
+    let zones = cfg.clock.resolve_zones()?;
+
     let mut stdout = io::BufWriter::new(io::stdout());
     let mut stderr = io::BufWriter::new(io::stderr());
 
@@ -517,6 +552,16 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
             match parse_clock_line(raw) {
                 Ok(None) => continue, // not a closed-range CLOCK
                 Ok(Some(p)) if p.violations.is_empty() => {
+                    if let Some(v) = check_accepted_zones(&p, &zones) {
+                        let rej = ListReject {
+                            file: file.clone(),
+                            line: idx + 1,
+                            raw: raw.to_string(),
+                            tag: v.tag(),
+                            message: v.message(),
+                        };
+                        return abort_list(&mut stdout, &mut stderr, &rej);
+                    }
                     let rec = build_clock_record(file, idx + 1, raw, &p);
                     if opts.json {
                         let line = serde_json::to_string(&rec)
@@ -723,6 +768,11 @@ pub fn run_add(opts: AddOptions) -> Result<i32, String> {
         return Err("END is before START".into());
     }
 
+    // Producer-side accepted-zone guard (same rule as `clock fmt`).
+    let cfg = Config::load_default()?;
+    let zones = cfg.clock.resolve_zones()?;
+    guard_accepted_zone_at(start, tz, &zones)?;
+
     let clock_line = format_clock_line(start, end, &tz_str, opts.seconds);
 
     let content = fs::read_to_string(&opts.file)
@@ -832,9 +882,53 @@ pub fn run_fmt(opts: FmtOptions) -> Result<(), String> {
         return Err("END is before START".into());
     }
 
+    // Producer-side accepted-zone guard: refuse to emit a line
+    // whose offset matches no configured accepted zone at the
+    // start instant.  Silent when the config is empty.
+    let cfg = Config::load_default()?;
+    let zones = cfg.clock.resolve_zones()?;
+    guard_accepted_zone_at(start, tz, &zones)?;
+
     let line = format_clock_line(start, end, &tz_str, opts.seconds);
     println!("{}", line);
     Ok(())
+}
+
+/// Producer-side accepted-zone guard.  Errors out if `tz_minutes`
+/// (the offset we're about to emit) matches none of the
+/// configured zones at `start_naive`'s instant.  No-op when
+/// `zones` is empty.
+fn guard_accepted_zone_at(
+    start_naive: NaiveDateTime,
+    tz_minutes: i32,
+    zones: &[chrono_tz::Tz],
+) -> Result<(), String> {
+    if zones.is_empty() {
+        return Ok(());
+    }
+    use chrono::{Offset, TimeZone};
+    let any_match = zones.iter().any(|z| {
+        let resolved = z
+            .from_local_datetime(&start_naive)
+            .single()
+            .or_else(|| z.from_local_datetime(&start_naive).earliest());
+        match resolved {
+            Some(dt) => dt.offset().fix().local_minus_utc() / 60 == tz_minutes,
+            None => false,
+        }
+    });
+    if any_match {
+        Ok(())
+    } else {
+        let names: Vec<&str> = zones.iter().map(|z| z.name()).collect();
+        Err(format!(
+            "refusing to emit CLOCK with offset {} on {}: matches no \
+             configured accepted zone (configured: {})",
+            format_numerical_tz(tz_minutes),
+            start_naive.format("%Y-%m-%d %H:%M:%S"),
+            names.join(", "),
+        ))
+    }
 }
 
 /// Parse `HH:MM`, `HH:MM:SS`, `YYYY-MM-DD HH:MM`, or
@@ -1366,6 +1460,57 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    // ----- accepted-zones producer guard --------------------------------
+
+    fn paris_only() -> Vec<chrono_tz::Tz> {
+        vec!["Europe/Paris".parse().unwrap()]
+    }
+
+    #[test]
+    fn guard_silent_when_zones_empty() {
+        // Even a wildly unmatching offset is allowed when the
+        // user has not configured accepted zones.
+        let dt = NaiveDate::from_ymd_opt(2025, 6, 6)
+            .unwrap()
+            .and_hms_opt(9, 30, 0)
+            .unwrap();
+        assert!(guard_accepted_zone_at(dt, 330, &[]).is_ok());
+    }
+
+    #[test]
+    fn guard_accepts_paris_summer_offset() {
+        let dt = NaiveDate::from_ymd_opt(2025, 6, 6)
+            .unwrap()
+            .and_hms_opt(9, 30, 0)
+            .unwrap();
+        assert!(guard_accepted_zone_at(dt, 120, &paris_only()).is_ok());
+    }
+
+    #[test]
+    fn guard_rejects_paris_winter_with_summer_offset() {
+        let dt = NaiveDate::from_ymd_opt(2026, 1, 7)
+            .unwrap()
+            .and_hms_opt(9, 30, 0)
+            .unwrap();
+        let err = guard_accepted_zone_at(dt, 120, &paris_only()).unwrap_err();
+        assert!(err.contains("+0200"), "got: {}", err);
+        assert!(err.contains("Europe/Paris"), "got: {}", err);
+    }
+
+    #[test]
+    fn guard_rejects_unrecognised_offset() {
+        let dt = NaiveDate::from_ymd_opt(2025, 6, 6)
+            .unwrap()
+            .and_hms_opt(9, 30, 0)
+            .unwrap();
+        // +0530 (India) is neither Paris nor Shanghai.
+        let zones: Vec<chrono_tz::Tz> = vec![
+            "Europe/Paris".parse().unwrap(),
+            "Asia/Shanghai".parse().unwrap(),
+        ];
+        assert!(guard_accepted_zone_at(dt, 330, &zones).is_err());
     }
 
     // ----- agenda set loader --------------------------------------------

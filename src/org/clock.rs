@@ -152,6 +152,19 @@ pub enum ClockViolation {
     /// The spacing of the `=> H:MM[:SS]` suffix doesn't match
     /// Emacs' canonical `printf("=> %2d:%02d")` form.
     SpacingMismatch { found: String, expected: String },
+    /// The line's embedded numerical offset matches no
+    /// configured accepted IANA zone at its instant. Emitted
+    /// only when the user has populated
+    /// `clock.accepted-zones` in their config; otherwise the
+    /// check is silent.
+    UnacceptedTz {
+        /// Signed minutes embedded on the line (same on both
+        /// sides since `tz-mismatch` would otherwise have
+        /// fired).
+        tz_minutes: i32,
+        /// IANA zone names that were checked, in config order.
+        configured: Vec<String>,
+    },
 }
 
 impl ClockViolation {
@@ -163,6 +176,7 @@ impl ClockViolation {
             ClockViolation::TzMismatch { .. } => "tz-mismatch",
             ClockViolation::DurationMismatch { .. } => "duration-mismatch",
             ClockViolation::SpacingMismatch { .. } => "spacing-mismatch",
+            ClockViolation::UnacceptedTz { .. } => "unaccepted-tz",
         }
     }
 
@@ -197,6 +211,14 @@ impl ClockViolation {
                 "duration suffix has non-canonical spacing {:?} (expected {:?})",
                 found, expected
             ),
+            ClockViolation::UnacceptedTz {
+                tz_minutes,
+                configured,
+            } => format!(
+                "offset {} matches no configured accepted zone (configured: {})",
+                format_tz_signed(*tz_minutes),
+                configured.join(", "),
+            ),
         }
     }
 
@@ -226,6 +248,58 @@ fn format_tz_signed(minutes: i32) -> String {
     let sign = if minutes < 0 { '-' } else { '+' };
     let abs = minutes.abs();
     format!("{}{:02}{:02}", sign, abs / 60, abs % 60)
+}
+
+/// Check whether the parsed line's embedded numerical offset
+/// matches at least one of the configured IANA zones at the
+/// line's start instant. Returns `Some(violation)` when the
+/// offset is outside the accepted set, `None` otherwise.
+///
+/// Silently does nothing (returns `None`) when `zones` is
+/// empty: the check is opt-in.
+///
+/// This function is in the `clock` module rather than the
+/// action layer so unit tests can drive it directly without
+/// touching the filesystem.
+pub fn check_accepted_zones(
+    parsed: &ParsedClockLine,
+    zones: &[chrono_tz::Tz],
+) -> Option<ClockViolation> {
+    if zones.is_empty() {
+        return None;
+    }
+    // The line carries the same TZ on both sides (a TzMismatch
+    // line would already be flagged separately); use the start.
+    let want_minutes = parsed.line.start.tz_minutes;
+    // Build a NaiveDateTime for the start instant.
+    let s = &parsed.line.start;
+    let naive = chrono::NaiveDateTime::new(
+        s.date,
+        chrono::NaiveTime::from_hms_opt(s.hour, s.minute, s.second.unwrap_or(0))
+            .expect("in-range time"),
+    );
+    use chrono::{Offset, TimeZone};
+    let any_match = zones.iter().any(|tz| {
+        // Resolve the local instant in this zone. ``single()``
+        // may be `None` during a DST fold; in that case fall
+        // back to ``earliest()`` to get a deterministic answer.
+        let resolved = tz
+            .from_local_datetime(&naive)
+            .single()
+            .or_else(|| tz.from_local_datetime(&naive).earliest());
+        match resolved {
+            Some(dt) => dt.offset().fix().local_minus_utc() / 60 == want_minutes,
+            None => false,
+        }
+    });
+    if any_match {
+        None
+    } else {
+        Some(ClockViolation::UnacceptedTz {
+            tz_minutes: want_minutes,
+            configured: zones.iter().map(|tz| tz.name().to_string()).collect(),
+        })
+    }
 }
 
 /// Parse one line.
@@ -975,6 +1049,98 @@ mod tests {
         let line = "CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:30";
         let tags = tags_of(line);
         assert!(tags.contains(&"duration-mismatch"), "got {:?}", tags);
+    }
+
+    // ----- accepted zones --------------------------------------------
+
+    fn parse_must_be_clean(line: &str) -> ParsedClockLine {
+        let p = parse_clock_line(line).unwrap().expect("closed-range");
+        assert!(
+            p.violations.is_empty(),
+            "unexpected violations on {:?}: {:?}",
+            line,
+            p.violations
+        );
+        p
+    }
+
+    fn paris() -> chrono_tz::Tz {
+        "Europe/Paris".parse().unwrap()
+    }
+    fn shanghai() -> chrono_tz::Tz {
+        "Asia/Shanghai".parse().unwrap()
+    }
+
+    #[test]
+    fn accepted_zones_silent_when_empty() {
+        let p = parse_must_be_clean(
+            "  CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15",
+        );
+        assert!(check_accepted_zones(&p, &[]).is_none());
+    }
+
+    #[test]
+    fn accepted_zones_paris_summer_clean() {
+        let p = parse_must_be_clean(
+            "  CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15",
+        );
+        assert!(check_accepted_zones(&p, &[paris()]).is_none());
+    }
+
+    #[test]
+    fn accepted_zones_paris_winter_clean() {
+        let p = parse_must_be_clean(
+            "  CLOCK: [2026-01-07 Wed 09:30 +0100]--[2026-01-07 Wed 11:45 +0100] =>  2:15",
+        );
+        assert!(check_accepted_zones(&p, &[paris()]).is_none());
+    }
+
+    #[test]
+    fn accepted_zones_shanghai_clean() {
+        let p = parse_must_be_clean(
+            "  CLOCK: [2025-03-26 Wed 15:00 +0800]--[2025-03-26 Wed 16:15 +0800] =>  1:15",
+        );
+        assert!(check_accepted_zones(&p, &[paris(), shanghai()]).is_none());
+    }
+
+    #[test]
+    fn accepted_zones_paris_summer_with_winter_offset_flagged() {
+        // 2025-06-06 in Europe/Paris is +0200 (CEST). The line
+        // claims +0100 — doesn't match Paris on that day, and
+        // Shanghai is +0800, also not +0100. Flag.
+        let p = parse_must_be_clean(
+            "  CLOCK: [2025-06-06 Fri 09:30 +0100]--[2025-06-06 Fri 11:45 +0100] =>  2:15",
+        );
+        let v = check_accepted_zones(&p, &[paris(), shanghai()]).expect("violation");
+        match v {
+            ClockViolation::UnacceptedTz {
+                tz_minutes,
+                configured,
+            } => {
+                assert_eq!(tz_minutes, 60);
+                assert_eq!(configured, vec!["Europe/Paris", "Asia/Shanghai"]);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn accepted_zones_paris_winter_with_summer_offset_flagged() {
+        // 2026-01-07 in Europe/Paris is +0100. The line claims
+        // +0200 — doesn't match. Shanghai is +0800. Flag.
+        let p = parse_must_be_clean(
+            "  CLOCK: [2026-01-07 Wed 09:30 +0200]--[2026-01-07 Wed 11:45 +0200] =>  2:15",
+        );
+        assert!(check_accepted_zones(&p, &[paris(), shanghai()]).is_some());
+    }
+
+    #[test]
+    fn accepted_zones_unrecognised_offset_flagged() {
+        // +0530 (India) matches neither Paris nor Shanghai.
+        let p = parse_must_be_clean(
+            "  CLOCK: [2025-06-06 Fri 09:30 +0530]--[2025-06-06 Fri 11:45 +0530] =>  2:15",
+        );
+        assert!(check_accepted_zones(&p, &[paris(), shanghai()]).is_some());
     }
 
     #[test]

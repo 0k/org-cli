@@ -9,8 +9,17 @@
 ** mixed-precision
   CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45:30 +0200] =>  2:15
 
-** weekday-mismatch (2025-06-06 was Fri, not Mon)
+** weekday-mismatch (2025-06-06 was Fri, not Mon) — both sides wrong
   CLOCK: [2025-06-06 Mon 09:30 +0200]--[2025-06-06 Mon 11:45 +0200] =>  2:15
 
 ** start-after-end
   CLOCK: [2025-06-06 Fri 12:00 +0200]--[2025-06-06 Fri 11:00 +0200] =>  -1:00
+
+** tz-mismatch (real-life-style)
+  CLOCK: [2016-08-10 Wed 12:30 +0800]--[2016-08-10 Wed 12:45 +0200] =>  0:15
+
+** duration-mismatch (true 2:15, but written 2:30)
+  CLOCK: [2025-06-07 Sat 09:30 +0200]--[2025-06-07 Sat 11:45 +0200] =>  2:30
+
+** spacing-mismatch (single-space single-digit)
+  CLOCK: [2022-06-04 Sat 15:00 +0200]--[2022-06-04 Sat 17:30 +0200] => 2:30

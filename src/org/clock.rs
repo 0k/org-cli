@@ -29,13 +29,31 @@ use std::sync::OnceLock;
 use chrono::{Datelike, NaiveDate, Weekday};
 use regex::Regex;
 
-/// One successfully-validated closed-range CLOCK line.
+/// One successfully-parsed closed-range CLOCK line.
+///
+/// "Parsed" only means the structural shape is recoverable
+/// (`[…]--[…] => …` with valid date/time/numerical-TZ on both
+/// sides). The line may still carry semantic violations; see
+/// [`ParsedClockLine`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClockLine {
     pub start: Timestamp,
     pub end: Timestamp,
     /// Whether both timestamps carry seconds.
     pub has_seconds: bool,
+}
+
+/// A parsed CLOCK line plus the list of semantic violations
+/// observed on it (possibly empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedClockLine {
+    pub line: ClockLine,
+    /// The exact suffix the line carries, starting at the `=>`
+    /// arrow and ending at end-of-line (trailing whitespace
+    /// stripped). Used to assess [`ClockViolation::SpacingMismatch`]
+    /// and [`ClockViolation::DurationMismatch`].
+    pub raw_duration_suffix: String,
+    pub violations: Vec<ClockViolation>,
 }
 
 /// One bracketed `[YYYY-MM-DD Day HH:MM[:SS] ±ZZZZ]` instant.
@@ -50,7 +68,10 @@ pub struct Timestamp {
     pub tz_minutes: i32,
 }
 
-/// What can be wrong with a closed-range CLOCK line.
+/// Structural error: the line cannot be parsed into a
+/// [`ClockLine`] at all. Once any of these is hit, no semantic
+/// invariants can be checked because the timestamps themselves
+/// are not recoverable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClockError {
     /// One of the bracketed timestamps has no `±HHMM` suffix.
@@ -60,17 +81,6 @@ pub enum ClockError {
     },
     /// A timezone is present but not numerical (e.g. `CEST`).
     NonNumericalTz { side: &'static str, token: String },
-    /// One side has seconds, the other does not.
-    MixedPrecision,
-    /// Weekday token disagrees with the date.
-    WeekdayMismatch {
-        side: &'static str,
-        date: NaiveDate,
-        token: String,
-        expected: String,
-    },
-    /// End instant strictly precedes start instant.
-    StartAfterEnd,
     /// Looks like a closed-range CLOCK but cannot be parsed.
     Unparseable { reason: String },
 }
@@ -81,9 +91,6 @@ impl ClockError {
         match self {
             ClockError::MissingTz { .. } => "missing-tz",
             ClockError::NonNumericalTz { .. } => "non-numerical-tz",
-            ClockError::MixedPrecision => "mixed-precision",
-            ClockError::WeekdayMismatch { .. } => "weekday-mismatch",
-            ClockError::StartAfterEnd => "start-after-end",
             ClockError::Unparseable { .. } => "unparseable",
         }
     }
@@ -100,21 +107,13 @@ impl ClockError {
                     side, token
                 )
             }
-            ClockError::MixedPrecision => {
-                "start and end use different precision (one HH:MM, the other HH:MM:SS)".into()
-            }
-            ClockError::WeekdayMismatch {
-                side,
-                date,
-                token,
-                expected,
-            } => format!(
-                "{} weekday token {:?} disagrees with {} (expected {:?})",
-                side, token, date, expected
-            ),
-            ClockError::StartAfterEnd => "end instant precedes start instant".into(),
             ClockError::Unparseable { reason } => format!("unparseable CLOCK line: {}", reason),
         }
+    }
+
+    /// Structural errors are never auto-fixable.
+    pub fn is_fixable(&self) -> bool {
+        false
     }
 }
 
@@ -126,21 +125,126 @@ impl fmt::Display for ClockError {
 
 impl std::error::Error for ClockError {}
 
-/// Parse and validate one line.
+/// Semantic violation: the line parses cleanly into a
+/// [`ClockLine`] but breaks one of the canonical invariants.
+/// A line may carry several of these at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClockViolation {
+    /// Weekday token disagrees with the date.
+    WeekdayMismatch {
+        side: &'static str,
+        date: NaiveDate,
+        token: String,
+        expected: String,
+    },
+    /// End instant strictly precedes start instant (UTC-wise).
+    StartAfterEnd,
+    /// One side has seconds, the other does not.
+    MixedPrecision,
+    /// Start and end carry different numerical timezones.
+    TzMismatch {
+        start_tz_minutes: i32,
+        end_tz_minutes: i32,
+    },
+    /// The `=> H:MM[:SS]` suffix's numeric value disagrees with
+    /// the (start,end) instants.
+    DurationMismatch { found: String, expected: String },
+    /// The spacing of the `=> H:MM[:SS]` suffix doesn't match
+    /// Emacs' canonical `printf("=> %2d:%02d")` form.
+    SpacingMismatch { found: String, expected: String },
+}
+
+impl ClockViolation {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            ClockViolation::WeekdayMismatch { .. } => "weekday-mismatch",
+            ClockViolation::StartAfterEnd => "start-after-end",
+            ClockViolation::MixedPrecision => "mixed-precision",
+            ClockViolation::TzMismatch { .. } => "tz-mismatch",
+            ClockViolation::DurationMismatch { .. } => "duration-mismatch",
+            ClockViolation::SpacingMismatch { .. } => "spacing-mismatch",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            ClockViolation::WeekdayMismatch {
+                side,
+                date,
+                token,
+                expected,
+            } => format!(
+                "{} weekday token {:?} disagrees with {} (expected {:?})",
+                side, token, date, expected
+            ),
+            ClockViolation::StartAfterEnd => "end instant precedes start instant".into(),
+            ClockViolation::MixedPrecision => {
+                "start and end use different precision (one HH:MM, the other HH:MM:SS)".into()
+            }
+            ClockViolation::TzMismatch {
+                start_tz_minutes,
+                end_tz_minutes,
+            } => format!(
+                "start and end timezones differ ({} vs {})",
+                format_tz_signed(*start_tz_minutes),
+                format_tz_signed(*end_tz_minutes),
+            ),
+            ClockViolation::DurationMismatch { found, expected } => format!(
+                "duration suffix {:?} disagrees with timestamps (expected {:?})",
+                found, expected
+            ),
+            ClockViolation::SpacingMismatch { found, expected } => format!(
+                "duration suffix has non-canonical spacing {:?} (expected {:?})",
+                found, expected
+            ),
+        }
+    }
+
+    /// Whether [`recompute_duration_in_line`] /
+    /// [`fix_weekday_in_line`] can heal this violation safely.
+    /// The fixer must refuse to mutate any line that carries a
+    /// non-fixable violation, even if other (fixable) violations
+    /// are also present — because we cannot tell which axis
+    /// carries the truth.
+    pub fn is_fixable(&self) -> bool {
+        matches!(
+            self,
+            ClockViolation::WeekdayMismatch { .. }
+                | ClockViolation::DurationMismatch { .. }
+                | ClockViolation::SpacingMismatch { .. }
+        )
+    }
+}
+
+impl fmt::Display for ClockViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+fn format_tz_signed(minutes: i32) -> String {
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let abs = minutes.abs();
+    format!("{}{:02}{:02}", sign, abs / 60, abs % 60)
+}
+
+/// Parse one line.
 ///
-/// Returns `Ok(None)` if the line is not a closed-range CLOCK
-/// (running clock, comment, body text mentioning `CLOCK:`, …).
-///
-/// Returns `Ok(Some(ClockLine))` on a fully valid line.
-///
-/// Returns `Err(_)` when the line *is* a closed-range CLOCK line
-/// but breaks one of the canonical-format invariants.
-pub fn parse_clock_line(line: &str) -> Result<Option<ClockLine>, ClockError> {
-    // Find the `CLOCK:` prefix anywhere on the line, accepting
-    // arbitrary leading whitespace (real-world LOGBOOK indentation
-    // varies between 1, 2, and 3 spaces). Anything before the
-    // prefix that isn't whitespace means the line is not a CLOCK
-    // line.
+/// * `Ok(None)` — the line is not a closed-range CLOCK (running
+///   clock, comment, body text mentioning `CLOCK:`, …); the
+///   caller should ignore it silently.
+/// * `Ok(Some(parsed))` — the line *is* a closed-range CLOCK and
+///   its structural shape is recoverable. `parsed.violations`
+///   may still be non-empty: any subset of
+///   `weekday-mismatch / mixed-precision / tz-mismatch /
+///   start-after-end / duration-mismatch / spacing-mismatch`.
+/// * `Err(_)` — the line cannot be parsed structurally
+///   (`missing-tz`, `non-numerical-tz`, `unparseable`). No
+///   timestamps are recoverable, so no semantic violations can
+///   be reported on the same line.
+pub fn parse_clock_line(line: &str) -> Result<Option<ParsedClockLine>, ClockError> {
+    // Find the `CLOCK:` prefix, accepting arbitrary leading
+    // whitespace (LOGBOOK indentation varies in real files).
     let trimmed = line.trim_start();
     let Some(rest) = trimmed.strip_prefix("CLOCK:") else {
         return Ok(None);
@@ -149,7 +253,6 @@ pub fn parse_clock_line(line: &str) -> Result<Option<ClockLine>, ClockError> {
 
     // Closed-range silhouette: must start with `[`.
     if !rest.starts_with('[') {
-        // Running clock or otherwise non-closed; not in scope.
         return Ok(None);
     }
 
@@ -158,38 +261,97 @@ pub fn parse_clock_line(line: &str) -> Result<Option<ClockLine>, ClockError> {
     let (start_inner, after_start) = bracketed(rest).ok_or(ClockError::Unparseable {
         reason: "missing closing bracket on start timestamp".into(),
     })?;
-    // No `--` after the first bracket → running clock, not in scope.
+    // No `--` after the first bracket → running clock.
     let Some(after_dashes) = after_start.strip_prefix("--") else {
         return Ok(None);
     };
     let (end_inner, after_end) = bracketed(after_dashes).ok_or(ClockError::Unparseable {
         reason: "missing closing bracket on end timestamp".into(),
     })?;
-    let after_end = after_end.trim_start();
-    if !after_end.starts_with("=>") {
+    let after_end_trim = after_end.trim_start();
+    if !after_end_trim.starts_with("=>") {
         return Err(ClockError::Unparseable {
             reason: "missing `=>` duration arrow".into(),
         });
     }
 
-    // Parse each bracketed timestamp.
-    let start = parse_timestamp(start_inner, "start")?;
-    let end = parse_timestamp(end_inner, "end")?;
+    // Capture the raw `=> …` suffix exactly as it appears so we
+    // can report SpacingMismatch / DurationMismatch precisely.
+    let raw_duration_suffix = line
+        .rfind("=>")
+        .map(|i| line[i..].trim_end().to_string())
+        .unwrap_or_default();
 
-    // Precision must match.
+    // Structural parse of both timestamps. Failures here are
+    // `ClockError` (return Err and bail; semantic checks impossible).
+    let (start, start_extras) = parse_timestamp(start_inner, "start")?;
+    let (end, end_extras) = parse_timestamp(end_inner, "end")?;
+
+    // Collect semantic violations.
+    let mut violations: Vec<ClockViolation> = Vec::new();
+    violations.extend(start_extras);
+    violations.extend(end_extras);
+
+    // Mixed precision.
     if start.second.is_some() != end.second.is_some() {
-        return Err(ClockError::MixedPrecision);
+        violations.push(ClockViolation::MixedPrecision);
     }
 
-    // Start must not strictly follow end.
+    // Mismatched timezones.
+    if start.tz_minutes != end.tz_minutes {
+        violations.push(ClockViolation::TzMismatch {
+            start_tz_minutes: start.tz_minutes,
+            end_tz_minutes: end.tz_minutes,
+        });
+    }
+
+    // Start after end (UTC-wise).
     if cmp_instants(&start, &end) == std::cmp::Ordering::Greater {
-        return Err(ClockError::StartAfterEnd);
+        violations.push(ClockViolation::StartAfterEnd);
     }
 
-    Ok(Some(ClockLine {
-        has_seconds: start.second.is_some(),
+    let clock = ClockLine {
+        has_seconds: start.second.is_some() && end.second.is_some(),
         start,
         end,
+    };
+
+    // Duration / spacing checks — only meaningful if start ≤ end
+    // and the precisions match (otherwise the canonical suffix
+    // is undefined).
+    let can_check_duration = !violations.iter().any(|v| {
+        matches!(
+            v,
+            ClockViolation::StartAfterEnd | ClockViolation::MixedPrecision
+        )
+    });
+    if can_check_duration {
+        let canonical = canonical_duration_suffix(&clock);
+        if raw_duration_suffix != canonical {
+            // Distinguish a pure-spacing diff from a numeric-value
+            // diff. Strip whitespace inside the suffix and compare
+            // the digit pattern: if the digits match, only the
+            // spacing differs.
+            let normalise_spacing =
+                |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+            if normalise_spacing(&raw_duration_suffix) == normalise_spacing(&canonical) {
+                violations.push(ClockViolation::SpacingMismatch {
+                    found: raw_duration_suffix.clone(),
+                    expected: canonical,
+                });
+            } else {
+                violations.push(ClockViolation::DurationMismatch {
+                    found: raw_duration_suffix.clone(),
+                    expected: canonical,
+                });
+            }
+        }
+    }
+
+    Ok(Some(ParsedClockLine {
+        line: clock,
+        raw_duration_suffix,
+        violations,
     }))
 }
 
@@ -203,8 +365,13 @@ fn bracketed(s: &str) -> Option<(&str, &str)> {
 
 /// Parse one bracketed `YYYY-MM-DD Day HH:MM[:SS] ±ZZZZ` token.
 ///
+/// Returns the timestamp plus any *semantic* violations
+/// observed on this side (currently: `WeekdayMismatch`).
 /// `side` is `"start"` or `"end"` for error reporting.
-fn parse_timestamp(inner: &str, side: &'static str) -> Result<Timestamp, ClockError> {
+fn parse_timestamp(
+    inner: &str,
+    side: &'static str,
+) -> Result<(Timestamp, Vec<ClockViolation>), ClockError> {
     let parts: Vec<&str> = inner.split_whitespace().collect();
     // 4 parts is the canonical shape: DATE DAY TIME TZ.
     // 3 parts means the TZ is missing. Anything else is unparseable.
@@ -245,10 +412,13 @@ fn parse_timestamp(inner: &str, side: &'static str) -> Result<Timestamp, ClockEr
         },
     };
 
-    // Weekday agreement.
+    // Weekday agreement — reported as a semantic violation, not a
+    // structural failure, so the rest of the line still gets
+    // analysed.
+    let mut violations = Vec::new();
     let expected = weekday_short(date.weekday());
     if day_s != expected {
-        return Err(ClockError::WeekdayMismatch {
+        violations.push(ClockViolation::WeekdayMismatch {
             side,
             date,
             token: day_s.to_string(),
@@ -256,14 +426,17 @@ fn parse_timestamp(inner: &str, side: &'static str) -> Result<Timestamp, ClockEr
         });
     }
 
-    Ok(Timestamp {
-        date,
-        weekday_token: day_s.to_string(),
-        hour,
-        minute,
-        second,
-        tz_minutes,
-    })
+    Ok((
+        Timestamp {
+            date,
+            weekday_token: day_s.to_string(),
+            hour,
+            minute,
+            second,
+            tz_minutes,
+        },
+        violations,
+    ))
 }
 
 fn parse_date(s: &str) -> Result<NaiveDate, String> {
@@ -362,22 +535,33 @@ pub struct WeekdayRewrite {
 /// `[YYYY-MM-DD Day ...]` weekday tokens to the English
 /// three-letter abbreviation that matches the date.
 ///
-/// Lines that don't match the closed-range silhouette are left
-/// alone (returned as-is with empty `rewrites`). Lines whose date
-/// cannot be parsed are also left alone.
+/// **Strict gate:** the line is only rewritten when it parses
+/// structurally AND every other violation it carries is itself
+/// auto-fixable. A line with `tz-mismatch`, `start-after-end`,
+/// `mixed-precision`, missing-tz, etc. is left untouched — even
+/// if its weekday is wrong — because the line as a whole is
+/// suspect and we cannot guarantee the date is the canonical
+/// axis.
 ///
-/// This function is deliberately simple: it does not look at the
-/// timezone, the precision, or the duration, so it can fix the
-/// weekday axis independently of the rest of the line. A line
-/// with both `missing-tz` and `weekday-mismatch` will get its
-/// weekday fixed; the missing-tz still needs a separate pass.
+/// Lines that don't match the closed-range silhouette are left
+/// alone (returned as-is with empty `rewrites`).
 pub fn fix_weekday_in_line(line: &str) -> WeekdayFix {
-    // Cheap pre-filter — we only care about closed-range CLOCKs.
     if !is_closed_range_clock(line) {
         return WeekdayFix {
             line: line.to_string(),
             rewrites: Vec::new(),
         };
+    }
+    // Strict gate: refuse to touch a line that has any
+    // non-fixable violation, or that fails structural parse.
+    match parse_clock_line(line) {
+        Ok(Some(p)) if !p.violations.iter().any(|v| !v.is_fixable()) => {}
+        _ => {
+            return WeekdayFix {
+                line: line.to_string(),
+                rewrites: Vec::new(),
+            };
+        }
     }
     let re = closed_range_token_regex();
     let mut rewrites = Vec::new();
@@ -445,17 +629,13 @@ pub struct DurationChange {
 /// always at least two characters wide, hence `=>  2:15` but
 /// `=> 12:30`).
 ///
-/// The line is only rewritten when:
-///
-/// - it parses as a closed-range CLOCK (so we know start, end,
-///   precision, and that both sides agree on TZ presence and
-///   precision), AND
-/// - the new suffix differs byte-for-byte from the old one.
-///
-/// Lines that fail to parse (missing TZ, mixed precision, named
-/// TZ, weekday mismatch, anything else) are returned untouched.
-/// Callers that need a multi-axis fix should run
-/// [`fix_weekday_in_line`] first, then re-parse.
+/// **Strict gate:** the line is only rewritten when *every*
+/// remaining violation it carries is itself auto-fixable
+/// ([`ClockViolation::is_fixable`]). A line that also has
+/// `tz-mismatch`, `start-after-end`, `mixed-precision`, or any
+/// structural error is left untouched — because we cannot tell
+/// which axis carries the truth on a line that is otherwise
+/// suspect.
 pub fn recompute_duration_in_line(line: &str) -> DurationFix {
     if !is_closed_range_clock(line) {
         return DurationFix {
@@ -464,7 +644,7 @@ pub fn recompute_duration_in_line(line: &str) -> DurationFix {
         };
     }
     let parsed = match parse_clock_line(line) {
-        Ok(Some(c)) => c,
+        Ok(Some(p)) => p,
         _ => {
             return DurationFix {
                 line: line.to_string(),
@@ -472,10 +652,14 @@ pub fn recompute_duration_in_line(line: &str) -> DurationFix {
             };
         }
     };
-    let new_suffix = canonical_duration_suffix(&parsed);
+    if parsed.violations.iter().any(|v| !v.is_fixable()) {
+        return DurationFix {
+            line: line.to_string(),
+            change: None,
+        };
+    }
+    let new_suffix = canonical_duration_suffix(&parsed.line);
 
-    // Locate the existing `=> ...` tail and replace it. Trailing
-    // whitespace after the digits is normalised away.
     let arrow = match line.rfind("=>") {
         Some(i) => i,
         None => {
@@ -556,32 +740,50 @@ mod tests {
 
     // ----- happy path ----------------------------------------------------
 
+    /// Helper: assert no violations on a parse.
+    fn parsed_clean(line: &str) -> ParsedClockLine {
+        let p = parse_clock_line(line).unwrap().expect("closed-range");
+        assert!(
+            p.violations.is_empty(),
+            "unexpected violations on line {:?}: {:?}",
+            line,
+            p.violations
+        );
+        p
+    }
+
+    /// Helper: collect violation tags.
+    fn tags_of(line: &str) -> Vec<&'static str> {
+        let p = parse_clock_line(line).unwrap().expect("closed-range");
+        p.violations.iter().map(|v| v.tag()).collect()
+    }
+
     #[test]
     fn parses_canonical_minute_precision() {
         let line = "  CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15";
-        let parsed = parse_clock_line(line).unwrap().unwrap();
-        assert!(!parsed.has_seconds);
-        assert_eq!(parsed.start.tz_minutes, 120);
-        assert_eq!(parsed.end.tz_minutes, 120);
-        assert_eq!(parsed.start.hour, 9);
-        assert_eq!(parsed.end.hour, 11);
+        let parsed = parsed_clean(line);
+        assert!(!parsed.line.has_seconds);
+        assert_eq!(parsed.line.start.tz_minutes, 120);
+        assert_eq!(parsed.line.end.tz_minutes, 120);
+        assert_eq!(parsed.line.start.hour, 9);
+        assert_eq!(parsed.line.end.hour, 11);
     }
 
     #[test]
     fn parses_canonical_second_precision() {
         let line =
             "CLOCK: [2026-01-07 Wed 09:57:20 +0100]--[2026-01-07 Wed 12:19:25 +0100] =>  2:22:05";
-        let parsed = parse_clock_line(line).unwrap().unwrap();
-        assert!(parsed.has_seconds);
-        assert_eq!(parsed.start.second, Some(20));
-        assert_eq!(parsed.end.second, Some(25));
+        let parsed = parsed_clean(line);
+        assert!(parsed.line.has_seconds);
+        assert_eq!(parsed.line.start.second, Some(20));
+        assert_eq!(parsed.line.end.second, Some(25));
     }
 
     #[test]
     fn parses_negative_tz() {
         let line = "CLOCK: [2025-12-15 Mon 09:00 -0500]--[2025-12-15 Mon 10:00 -0500] =>  1:00";
-        let parsed = parse_clock_line(line).unwrap().unwrap();
-        assert_eq!(parsed.start.tz_minutes, -300);
+        let parsed = parsed_clean(line);
+        assert_eq!(parsed.line.start.tz_minutes, -300);
     }
 
     // ----- non-clock lines are silently skipped --------------------------
@@ -605,7 +807,7 @@ mod tests {
         }
     }
 
-    // ----- violations ---------------------------------------------------
+    // ----- structural errors --------------------------------------------
 
     #[test]
     fn rejects_missing_tz_on_start() {
@@ -636,44 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mixed_precision() {
-        let line = "CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45:30 +0200] =>  2:15";
-        let err = parse_clock_line(line).unwrap_err();
-        assert_eq!(err.tag(), "mixed-precision");
-    }
-
-    #[test]
-    fn rejects_weekday_mismatch() {
-        // 2025-06-06 was a Friday, not a Monday.
-        let line = "CLOCK: [2025-06-06 Mon 09:30 +0200]--[2025-06-06 Mon 11:45 +0200] =>  2:15";
-        let err = parse_clock_line(line).unwrap_err();
-        assert_eq!(err.tag(), "weekday-mismatch");
-    }
-
-    #[test]
-    fn rejects_start_after_end() {
-        let line = "CLOCK: [2025-06-06 Fri 12:00 +0200]--[2025-06-06 Fri 11:00 +0200] =>  -1:00";
-        let err = parse_clock_line(line).unwrap_err();
-        assert_eq!(err.tag(), "start-after-end");
-    }
-
-    #[test]
-    fn equal_start_and_end_is_ok() {
-        let line = "CLOCK: [2025-06-06 Fri 12:00 +0200]--[2025-06-06 Fri 12:00 +0200] =>  0:00";
-        assert!(parse_clock_line(line).unwrap().is_some());
-    }
-
-    #[test]
-    fn cross_tz_ordering_uses_utc() {
-        // 09:00 +0200 = 07:00 UTC; 08:00 +0000 = 08:00 UTC. End > Start.
-        let line = "CLOCK: [2025-06-06 Fri 09:00 +0200]--[2025-06-06 Fri 08:00 +0000] =>  1:00";
-        assert!(parse_clock_line(line).unwrap().is_some());
-    }
-
-    #[test]
     fn rejects_unparseable() {
-        // Lines that *do* claim to be a closed range (have `--[…]`)
-        // but break in some way once we look closer.
         for line in [
             "CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200]",
             "CLOCK: [2025-13-40 Fri 09:30 +0200]--[2025-13-40 Fri 11:45 +0200] =>  0:00",
@@ -687,6 +852,89 @@ mod tests {
                 r
             );
         }
+    }
+
+    // ----- semantic violations -----------------------------------------
+
+    #[test]
+    fn flags_mixed_precision_as_violation() {
+        let line = "CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45:30 +0200] =>  2:15";
+        let tags = tags_of(line);
+        assert!(tags.contains(&"mixed-precision"), "got {:?}", tags);
+    }
+
+    #[test]
+    fn flags_weekday_mismatch_as_violation() {
+        // 2025-06-06 was a Friday, not Monday.
+        let line = "CLOCK: [2025-06-06 Mon 09:30 +0200]--[2025-06-06 Mon 11:45 +0200] =>  2:15";
+        let tags = tags_of(line);
+        // Both sides wrong → two weekday-mismatch entries.
+        assert_eq!(
+            tags.iter().filter(|t| **t == "weekday-mismatch").count(),
+            2,
+            "got {:?}",
+            tags
+        );
+    }
+
+    #[test]
+    fn flags_start_after_end_as_violation() {
+        let line = "CLOCK: [2025-06-06 Fri 12:00 +0200]--[2025-06-06 Fri 11:00 +0200] =>  -1:00";
+        let tags = tags_of(line);
+        assert!(tags.contains(&"start-after-end"), "got {:?}", tags);
+    }
+
+    #[test]
+    fn flags_tz_mismatch_as_violation() {
+        // The real-life case.
+        let line =
+            "     CLOCK: [2016-08-10 Wed 12:30 +0800]--[2016-08-10 Wed 12:45 +0200] =>  0:15";
+        let tags = tags_of(line);
+        assert!(tags.contains(&"tz-mismatch"), "got {:?}", tags);
+    }
+
+    #[test]
+    fn flags_duration_mismatch_as_violation() {
+        // 09:30..11:45 is 2:15, not 2:30.
+        let line = "CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:30";
+        let tags = tags_of(line);
+        assert!(tags.contains(&"duration-mismatch"), "got {:?}", tags);
+    }
+
+    #[test]
+    fn flags_spacing_mismatch_as_violation() {
+        // Single space + 1-digit hour: should be 2 spaces.
+        let line = "CLOCK: [2022-06-03 Fri 15:00 +0200]--[2022-06-03 Fri 17:30 +0200] => 2:30";
+        let tags = tags_of(line);
+        assert!(tags.contains(&"spacing-mismatch"), "got {:?}", tags);
+        // Spacing-only diff should NOT be reported as duration-mismatch.
+        assert!(!tags.contains(&"duration-mismatch"), "got {:?}", tags);
+    }
+
+    #[test]
+    fn two_digit_hour_uses_single_space() {
+        // 12:30 duration is canonical with 1 space.
+        let line = "CLOCK: [2026-04-28 Tue 02:00 +0200]--[2026-04-28 Tue 14:30 +0200] => 12:30";
+        let p = parsed_clean(line);
+        assert!(p.violations.is_empty(), "got {:?}", p.violations);
+    }
+
+    #[test]
+    fn equal_start_and_end_is_clean() {
+        let line = "CLOCK: [2025-06-06 Fri 12:00 +0200]--[2025-06-06 Fri 12:00 +0200] =>  0:00";
+        parsed_clean(line);
+    }
+
+    #[test]
+    fn cross_tz_ordering_uses_utc() {
+        // 09:00 +0200 = 07:00 UTC; 08:00 +0000 = 08:00 UTC.
+        // End > Start when TZs are honoured. Duration suffix matches.
+        let line = "CLOCK: [2025-06-06 Fri 09:00 +0200]--[2025-06-06 Fri 08:00 +0000] =>  1:00";
+        let tags = tags_of(line);
+        // tz-mismatch is now a violation, but no start-after-end
+        // (because UTC-wise the end is after the start).
+        assert!(tags.contains(&"tz-mismatch"), "got {:?}", tags);
+        assert!(!tags.contains(&"start-after-end"), "got {:?}", tags);
     }
 
     // ----- weekday rewriter --------------------------------------------
@@ -742,15 +990,35 @@ mod tests {
     }
 
     #[test]
-    fn fix_weekday_works_on_missing_tz_line() {
-        // Day rewrite is independent of the timezone axis.
+    fn fix_weekday_refuses_missing_tz_line() {
+        // Strict gate: missing-tz makes the line untouchable.
         let line = "  CLOCK: [2026-01-07 Tue 09:57:20]--[2026-01-07 Tue 12:19:25] =>  2:22:05";
         let r = fix_weekday_in_line(line);
-        assert_eq!(
-            r.line,
-            "  CLOCK: [2026-01-07 Wed 09:57:20]--[2026-01-07 Wed 12:19:25] =>  2:22:05"
-        );
-        assert_eq!(r.rewrites.len(), 2);
+        assert_eq!(r.line, line);
+        assert!(r.rewrites.is_empty());
+    }
+
+    #[test]
+    fn fix_weekday_refuses_tz_mismatch_line() {
+        // The real-life case: weekday axis would be "correct"
+        // here, but tz-mismatch makes the whole line suspect.
+        let line =
+            "     CLOCK: [2016-08-10 Wed 12:30 +0800]--[2016-08-10 Wed 12:45 +0200] =>  0:15";
+        let r = fix_weekday_in_line(line);
+        assert_eq!(r.line, line);
+        assert!(r.rewrites.is_empty());
+    }
+
+    #[test]
+    fn duration_refuses_tz_mismatch_line() {
+        // The actual real-life regression test: previously the
+        // fixer would silently rewrite the duration to the
+        // UTC-aware computation. With the strict gate, no.
+        let line =
+            "     CLOCK: [2016-08-10 Wed 12:30 +0800]--[2016-08-10 Wed 12:45 +0200] =>  0:15";
+        let r = recompute_duration_in_line(line);
+        assert_eq!(r.line, line);
+        assert!(r.change.is_none());
     }
 
     #[test]

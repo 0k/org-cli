@@ -52,20 +52,33 @@ fn check_dirty_fixture_returns_one_with_json() {
         let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON line");
         tags.push(v["tag"].as_str().unwrap().to_string());
     }
-    tags.sort();
-    // Each malformed line in dirty.org should be reported once.
-    let mut expected = vec![
-        "missing-tz",
-        "non-numerical-tz",
-        "mixed-precision",
-        "weekday-mismatch",
-        "start-after-end",
+    // Tally per-tag and assert each fixture entry produces the
+    // tag(s) we expect. The weekday-mismatch line has both sides
+    // wrong, so emits twice.
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for t in &tags {
+        *counts.entry(t.clone()).or_default() += 1;
+    }
+    let expected: BTreeMap<String, usize> = [
+        ("missing-tz", 1),
+        ("non-numerical-tz", 1),
+        ("mixed-precision", 1),
+        ("weekday-mismatch", 2),
+        ("start-after-end", 1),
+        ("tz-mismatch", 1),
+        // Two duration-mismatches: one is the dedicated
+        // fixture line; the other is the tz-mismatch line, whose
+        // naive HH:MM subtraction (0:15) disagrees with the
+        // UTC-aware canonical (6:15). Reporting both is
+        // intentional — the linter surfaces every axis.
+        ("duration-mismatch", 2),
+        ("spacing-mismatch", 1),
     ]
-    .into_iter()
-    .map(String::from)
-    .collect::<Vec<_>>();
-    expected.sort();
-    assert_eq!(tags, expected, "stdout was:\n{}", stdout);
+    .iter()
+    .map(|(k, v)| (k.to_string(), *v))
+    .collect();
+    assert_eq!(counts, expected, "stdout was:\n{}", stdout);
 }
 
 #[test]

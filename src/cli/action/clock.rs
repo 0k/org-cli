@@ -72,19 +72,31 @@ pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
             if !raw.contains("CLOCK:") {
                 continue;
             }
+            // Emit ONE violation record per axis. A line may carry
+            // several (e.g. weekday-mismatch + duration-mismatch).
+            let mut emit_one = |tag: &'static str, message: String| -> Result<bool, String> {
+                violation_count += 1;
+                let v = Violation {
+                    file: file.clone(),
+                    line: idx + 1,
+                    raw: raw.to_string(),
+                    tag,
+                    message,
+                };
+                writer.emit(&v).map_err(|e| e.to_string())?;
+                Ok(opts.first)
+            };
             match parse_clock_line(raw) {
-                Ok(_) => continue,
+                Ok(None) => continue,
+                Ok(Some(p)) => {
+                    for v in &p.violations {
+                        if emit_one(v.tag(), v.message())? {
+                            break 'files;
+                        }
+                    }
+                }
                 Err(err) => {
-                    violation_count += 1;
-                    let v = Violation {
-                        file: file.clone(),
-                        line: idx + 1,
-                        raw: raw.to_string(),
-                        tag: err.tag(),
-                        message: err.message(),
-                    };
-                    writer.emit(&v).map_err(|e| e.to_string())?;
-                    if opts.first {
+                    if emit_one(err.tag(), err.message())? {
                         break 'files;
                     }
                 }

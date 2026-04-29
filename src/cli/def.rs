@@ -111,4 +111,65 @@ pub enum Commands {
         #[arg(long = "directory-references-all-children")]
         directory_references_all_children: bool,
     },
+
+    /// Lint and format org-mode `CLOCK:` lines.
+    Clock {
+        #[command(subcommand)]
+        action: ClockCommands,
+    },
+}
+
+/// `org-cli clock <action>` sub-actions.
+#[derive(Subcommand, Debug)]
+pub enum ClockCommands {
+    /// Check that every closed-range CLOCK line follows the
+    /// canonical format (numerical timezone, consistent precision,
+    /// matching weekday, start ≤ end).
+    Check {
+        /// Files or directories to scan. When omitted, the agenda
+        /// set is read from
+        /// `~/.cache/emacs/org-collect/org-agenda-files.tmp`.
+        paths: Vec<std::path::PathBuf>,
+
+        /// Glob patterns matched against candidate file paths;
+        /// matching files are skipped. Repeatable. No defaults.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude_globs: Vec<String>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per violation).
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Stop at the first violation.
+        #[arg(short = '1', long)]
+        first: bool,
+    },
+
+    /// Print one canonical `CLOCK:` line on stdout.
+    Fmt {
+        /// Start time. Accepts `HH:MM`, `HH:MM:SS`,
+        /// `YYYY-MM-DD HH:MM`, or `YYYY-MM-DD HH:MM:SS`.
+        start: String,
+
+        /// End time, same accepted forms as START.
+        end: String,
+
+        /// Numerical zone like `+0200` or `-0500`. When omitted,
+        /// the system's current local zone is used.
+        #[arg(long, value_name = "±HHMM")]
+        tz: Option<String>,
+
+        /// Emit `HH:MM:SS` precision instead of `HH:MM`.
+        #[arg(long)]
+        seconds: bool,
+
+        /// Round each side to the nearest N-minute mark. 0 (default)
+        /// disables rounding. Mutually exclusive with --seconds.
+        #[arg(long, default_value_t = 0)]
+        grid: u32,
+    },
 }

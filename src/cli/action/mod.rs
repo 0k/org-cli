@@ -7,5 +7,6 @@
 //! sibling helper modules like [`walk`].
 
 pub mod check;
+pub mod clock;
 pub mod orphans;
 pub mod walk;

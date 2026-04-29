@@ -6,8 +6,10 @@ description = "CLI for querying and editing org-mode files"
 license = "MIT"
 
 [dependencies]
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 colored = "2"
+dirs = "5"
 fern = "0.6"
 glob = "0.3"
 log = "0.4"

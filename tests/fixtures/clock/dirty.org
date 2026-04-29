@@ -1,0 +1,16 @@
+* Various malformed CLOCK lines
+
+** missing-tz
+  CLOCK: [2026-01-07 Wed 09:57:20]--[2026-01-07 Wed 12:19:25] =>  2:22:05
+
+** non-numerical-tz
+  CLOCK: [2025-06-06 Fri 09:30 CEST]--[2025-06-06 Fri 11:45 CEST] =>  2:15
+
+** mixed-precision
+  CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45:30 +0200] =>  2:15
+
+** weekday-mismatch (2025-06-06 was Fri, not Mon)
+  CLOCK: [2025-06-06 Mon 09:30 +0200]--[2025-06-06 Mon 11:45 +0200] =>  2:15
+
+** start-after-end
+  CLOCK: [2025-06-06 Fri 12:00 +0200]--[2025-06-06 Fri 11:00 +0200] =>  -1:00

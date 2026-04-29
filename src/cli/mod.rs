@@ -83,5 +83,40 @@ pub fn run() -> Result<(), String> {
             }
             Ok(())
         }
+        Some(def::Commands::Clock { action: clock_cmd }) => match clock_cmd {
+            def::ClockCommands::Check {
+                paths,
+                exclude_globs,
+                nul,
+                json,
+                first,
+            } => {
+                let opts = action::clock::CheckOptions {
+                    paths,
+                    exclude_globs,
+                    nul,
+                    json,
+                    first,
+                };
+                let exit_code = action::clock::run_check(opts)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
+            def::ClockCommands::Fmt {
+                start,
+                end,
+                tz,
+                seconds,
+                grid,
+            } => action::clock::run_fmt(action::clock::FmtOptions {
+                start,
+                end,
+                tz,
+                seconds,
+                grid,
+            }),
+        },
     }
 }

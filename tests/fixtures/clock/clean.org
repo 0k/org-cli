@@ -1,0 +1,20 @@
+* Logs
+
+** WIP a task
+
+*** Logs
+
+**** session 1
+  :LOGBOOK:
+  CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15
+  :END:
+
+**** session 2 (second precision)
+  :LOGBOOK:
+  CLOCK: [2026-01-07 Wed 09:57:20 +0100]--[2026-01-07 Wed 12:19:25 +0100] =>  2:22:05
+  :END:
+
+**** running clock that we silently skip
+  :LOGBOOK:
+  CLOCK: [2025-06-06 Fri 14:00 +0200]
+  :END:

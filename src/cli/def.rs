@@ -180,6 +180,29 @@ pub enum ClockCommands {
         json: bool,
     },
 
+    /// Emit one NDJSON record per closed-range CLOCK line that
+    /// passes strict canonical validation. Lines that fail
+    /// validation are reported on stderr (one diagnostic per
+    /// violation), do NOT appear on stdout, and the command exits
+    /// with code 1.
+    ///
+    /// Use this as the input to one-off scripts that need a
+    /// trustworthy stream of (start, end, tz) triples — e.g.
+    /// timezone-vs-location sanity checks against your own
+    /// whereabout records.
+    List {
+        paths: Vec<std::path::PathBuf>,
+
+        /// Glob patterns matched against candidate file paths;
+        /// matching files are skipped. Repeatable.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude_globs: Vec<String>,
+
+        /// NDJSON output (currently the only supported shape).
+        #[arg(short = 'j', long, default_value_t = true)]
+        json: bool,
+    },
+
     /// Print one canonical `CLOCK:` line on stdout.
     Fmt {
         /// Start time. Accepts `HH:MM`, `HH:MM:SS`,

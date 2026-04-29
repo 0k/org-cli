@@ -122,6 +122,22 @@ pub fn run() -> Result<(), String> {
                 }
                 Ok(())
             }
+            def::ClockCommands::List {
+                paths,
+                exclude_globs,
+                json,
+            } => {
+                let opts = action::clock::ListOptions {
+                    paths,
+                    exclude_globs,
+                    json,
+                };
+                let exit_code = action::clock::run_list(opts)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
             def::ClockCommands::Fmt {
                 start,
                 end,

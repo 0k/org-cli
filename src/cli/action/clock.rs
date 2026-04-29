@@ -12,9 +12,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::{Local, NaiveDateTime, NaiveTime, Timelike};
 #[cfg(test)]
 use chrono::NaiveDate;
+use chrono::{Local, NaiveDateTime, NaiveTime, Timelike};
 use colored::*;
 use glob::Pattern;
 use log::{debug, warn};
@@ -428,6 +428,237 @@ fn resolve_input_files(
 }
 
 // =====================================================================
+// `clock list`
+// =====================================================================
+
+/// CLI options for `clock list`.
+#[derive(Debug, Clone)]
+pub struct ListOptions {
+    /// Files or directories to scan. Empty → agenda set.
+    pub paths: Vec<PathBuf>,
+    /// Glob patterns matched against candidate file paths;
+    /// matching files are skipped.
+    pub exclude_globs: Vec<String>,
+    /// NDJSON output (currently the only supported shape).
+    pub json: bool,
+}
+
+/// One emitted CLOCK record (clean lines only). All times are
+/// serialised as RFC3339 with the line's embedded numerical
+/// timezone preserved.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClockRecord {
+    pub file: PathBuf,
+    pub line: usize,
+    /// `YYYY-MM-DDTHH:MM:SS±HH:MM` (always second precision —
+    /// minute-precision lines are reported with `:00` seconds).
+    pub start: String,
+    pub end: String,
+    /// Numerical offset (signed minutes). Same on both sides
+    /// (lines that disagreed would have been rejected).
+    pub tz_minutes: i32,
+    /// Whether the source line carried second precision.
+    pub has_seconds: bool,
+    /// Duration in whole seconds (`end - start` in UTC terms).
+    pub duration_seconds: i64,
+    /// The original line, unmodified, including leading
+    /// whitespace.
+    pub raw: String,
+}
+
+/// One rejection diagnostic, written to stderr when a CLOCK line
+/// fails to pass strict canonical validation.
+#[derive(Debug, Clone)]
+struct ListReject {
+    file: PathBuf,
+    line: usize,
+    raw: String,
+    /// `"missing-tz"`, `"weekday-mismatch"`, … (matches the
+    /// taxonomy of `clock check`).
+    tag: &'static str,
+    message: String,
+}
+
+/// Run `clock list`.
+///
+/// Hard contract: the FIRST line that fails canonical validation
+/// (any structural error OR any semantic violation) is reported
+/// on stderr and the run exits with code 1 immediately. No
+/// further files are read, no further records are emitted. Use
+/// ``clock check`` when you want the full violation inventory.
+///
+/// Records on stdout are byte-faithful representations of source
+/// lines that pass strict validation. Because we abort on the
+/// first rejection, stdout is either complete (exit 0) or
+/// truncated mid-stream (exit 1) — callers should treat exit 1
+/// as "fix the rejected line then re-run, the inventory is
+/// incomplete".
+pub fn run_list(opts: ListOptions) -> Result<i32, String> {
+    let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
+    debug!("listing CLOCK lines from {} org file(s)", files.len());
+
+    let mut stdout = io::BufWriter::new(io::stdout());
+    let mut stderr = io::BufWriter::new(io::stderr());
+
+    for file in &files {
+        let content = match fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("cannot read {}: {}", file.display(), e);
+                continue;
+            }
+        };
+
+        for (idx, raw) in content.lines().enumerate() {
+            if !raw.contains("CLOCK:") {
+                continue;
+            }
+            match parse_clock_line(raw) {
+                Ok(None) => continue, // not a closed-range CLOCK
+                Ok(Some(p)) if p.violations.is_empty() => {
+                    let rec = build_clock_record(file, idx + 1, raw, &p);
+                    if opts.json {
+                        let line = serde_json::to_string(&rec)
+                            .map_err(|e| format!("serializing record: {}", e))?;
+                        writeln!(stdout, "{}", line).map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(Some(p)) => {
+                    // Hard fail on the FIRST semantic violation.
+                    // Emit one diagnostic and bail.
+                    let v = &p.violations[0];
+                    let rej = ListReject {
+                        file: file.clone(),
+                        line: idx + 1,
+                        raw: raw.to_string(),
+                        tag: v.tag(),
+                        message: v.message(),
+                    };
+                    return abort_list(&mut stdout, &mut stderr, &rej);
+                }
+                Err(err) => {
+                    let rej = ListReject {
+                        file: file.clone(),
+                        line: idx + 1,
+                        raw: raw.to_string(),
+                        tag: err.tag(),
+                        message: err.message(),
+                    };
+                    return abort_list(&mut stdout, &mut stderr, &rej);
+                }
+            }
+        }
+    }
+
+    stdout.flush().map_err(|e| e.to_string())?;
+    stderr.flush().map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
+/// Emit the rejection diagnostic, flush both streams, and
+/// return exit code 1.
+fn abort_list<W1: Write, W2: Write>(
+    stdout: &mut W1,
+    stderr: &mut W2,
+    rej: &ListReject,
+) -> Result<i32, String> {
+    stdout.flush().map_err(|e| e.to_string())?;
+    emit_reject(stderr, rej).map_err(|e| e.to_string())?;
+    writeln!(
+        stderr,
+        "\nstopped on first rejection. Use ``org-cli clock check`` \
+         for the complete inventory.",
+    )
+    .map_err(|e| e.to_string())?;
+    stderr.flush().map_err(|e| e.to_string())?;
+    Ok(1)
+}
+
+fn build_clock_record(
+    file: &Path,
+    line_no: usize,
+    raw: &str,
+    p: &crate::org::clock::ParsedClockLine,
+) -> ClockRecord {
+    let start_iso = format_iso(
+        p.line.start.date,
+        p.line.start.hour,
+        p.line.start.minute,
+        p.line.start.second.unwrap_or(0),
+        p.line.start.tz_minutes,
+    );
+    let end_iso = format_iso(
+        p.line.end.date,
+        p.line.end.hour,
+        p.line.end.minute,
+        p.line.end.second.unwrap_or(0),
+        p.line.end.tz_minutes,
+    );
+    let dur_seconds = duration_seconds_of(&p.line);
+    ClockRecord {
+        file: file.to_path_buf(),
+        line: line_no,
+        start: start_iso,
+        end: end_iso,
+        tz_minutes: p.line.start.tz_minutes,
+        has_seconds: p.line.has_seconds,
+        duration_seconds: dur_seconds,
+        raw: raw.to_string(),
+    }
+}
+
+/// Format an instant as `YYYY-MM-DDTHH:MM:SS±HH:MM`.
+fn format_iso(
+    date: chrono::NaiveDate,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    tz_minutes: i32,
+) -> String {
+    let sign = if tz_minutes < 0 { '-' } else { '+' };
+    let abs = tz_minutes.abs();
+    format!(
+        "{}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+        date,
+        hour,
+        minute,
+        second,
+        sign,
+        abs / 60,
+        abs % 60,
+    )
+}
+
+fn duration_seconds_of(line: &crate::org::clock::ClockLine) -> i64 {
+    use chrono::NaiveDateTime;
+    let to_naive = |t: &crate::org::clock::Timestamp| -> NaiveDateTime {
+        NaiveDateTime::new(
+            t.date,
+            chrono::NaiveTime::from_hms_opt(t.hour, t.minute, t.second.unwrap_or(0))
+                .expect("in-range time"),
+        )
+    };
+    let s = to_naive(&line.start);
+    let e = to_naive(&line.end);
+    // Both sides have the same TZ at this point (parser would
+    // have flagged otherwise), so naive subtraction yields the
+    // wall-clock delta which equals the UTC delta.
+    (e - s).num_seconds()
+}
+
+fn emit_reject<W: Write>(out: &mut W, r: &ListReject) -> io::Result<()> {
+    writeln!(
+        out,
+        "{}:{}: rejected ({}): {}\n    {}",
+        r.file.display(),
+        r.line,
+        r.tag,
+        r.message,
+        r.raw.trim(),
+    )
+}
+
+// =====================================================================
 // `clock fmt`
 // =====================================================================
 
@@ -828,6 +1059,91 @@ mod tests {
             run_check(opts_for(vec![td.path().to_path_buf()])).unwrap(),
             0
         );
+    }
+
+    // ----- list --------------------------------------------------------
+
+    fn list_opts(paths: Vec<PathBuf>) -> ListOptions {
+        ListOptions {
+            paths,
+            exclude_globs: Vec::new(),
+            json: true,
+        }
+    }
+
+    #[test]
+    fn list_emits_record_for_clean_line() {
+        let td = TempDir::new("list-clean");
+        write(
+            &td.path().join("a.org"),
+            "  CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15\n",
+        );
+        // run_list writes JSON to stdout via println; we only
+        // check exit code here (full stdout shape is exercised
+        // by the integration test).
+        let exit = run_list(list_opts(vec![td.path().to_path_buf()])).unwrap();
+        assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn list_rejects_missing_tz() {
+        let td = TempDir::new("list-missing-tz");
+        write(
+            &td.path().join("a.org"),
+            "  CLOCK: [2026-01-07 Wed 09:57]--[2026-01-07 Wed 12:19] =>  2:22\n",
+        );
+        let exit = run_list(list_opts(vec![td.path().to_path_buf()])).unwrap();
+        assert_eq!(exit, 1, "missing-tz must hard-fail");
+    }
+
+    #[test]
+    fn list_rejects_tz_mismatch() {
+        let td = TempDir::new("list-tz-mismatch");
+        write(
+            &td.path().join("a.org"),
+            "  CLOCK: [2016-08-10 Wed 12:30 +0800]--[2016-08-10 Wed 12:45 +0200] =>  0:15\n",
+        );
+        let exit = run_list(list_opts(vec![td.path().to_path_buf()])).unwrap();
+        assert_eq!(exit, 1, "tz-mismatch must hard-fail");
+    }
+
+    #[test]
+    fn list_aborts_on_first_rejection_no_subsequent_processing() {
+        // Two files: the first contains a clean CLOCK followed by
+        // a rejected one; the second contains another clean CLOCK.
+        // Hard-fail contract: the second file must NOT be reached.
+        let td = TempDir::new("list-abort");
+        // ``collect_org_files`` returns paths sorted alphabetically.
+        // ``a.org`` is processed before ``b.org``.
+        write(
+            &td.path().join("a.org"),
+            concat!(
+                "  CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15\n",
+                "  CLOCK: [2026-01-07 Wed 09:57]--[2026-01-07 Wed 12:19] =>  2:22\n",
+                "  CLOCK: [2025-06-07 Sat 09:00 +0200]--[2025-06-07 Sat 10:00 +0200] =>  1:00\n",
+            ),
+        );
+        write(
+            &td.path().join("b.org"),
+            "  CLOCK: [2025-06-08 Sun 09:00 +0200]--[2025-06-08 Sun 10:00 +0200] =>  1:00\n",
+        );
+        let exit = run_list(list_opts(vec![td.path().to_path_buf()])).unwrap();
+        assert_eq!(exit, 1, "first rejection must abort");
+        // The unit test cannot easily inspect stdout here (run_list
+        // writes via println-equivalent buffered IO). The integration
+        // test ``list_hard_fails_on_first_rejection`` covers stdout
+        // and stderr contents end-to-end.
+    }
+
+    #[test]
+    fn list_running_clocks_are_silently_skipped() {
+        let td = TempDir::new("list-running");
+        write(
+            &td.path().join("a.org"),
+            "  CLOCK: [2026-01-07 Wed 09:57 +0100]\n",
+        );
+        let exit = run_list(list_opts(vec![td.path().to_path_buf()])).unwrap();
+        assert_eq!(exit, 0);
     }
 
     // ----- agenda set loader --------------------------------------------

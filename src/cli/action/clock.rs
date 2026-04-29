@@ -12,14 +12,18 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{Local, NaiveDateTime, NaiveTime, Timelike};
+#[cfg(test)]
+use chrono::NaiveDate;
 use colored::*;
 use glob::Pattern;
 use log::{debug, warn};
 use serde::Serialize;
 
 use crate::cli::action::walk::collect_org_files;
-use crate::org::clock::{fix_weekday_in_line, parse_clock_line, recompute_duration_in_line};
+use crate::org::clock::{
+    fix_weekday_in_line, format_clock_line, parse_clock_line, recompute_duration_in_line,
+};
 
 // =====================================================================
 // `clock check`
@@ -560,68 +564,6 @@ fn round_to_grid(dt: NaiveDateTime, grid: u32) -> NaiveDateTime {
     let new_time = NaiveTime::from_hms_opt((new_total / 60) as u32, (new_total % 60) as u32, 0)
         .expect("rounded time in range");
     NaiveDateTime::new(new_date, new_time)
-}
-
-fn format_clock_line(start: NaiveDateTime, end: NaiveDateTime, tz: &str, seconds: bool) -> String {
-    let s_ts = format_timestamp(start, tz, seconds);
-    let e_ts = format_timestamp(end, tz, seconds);
-    let dur = format_duration(end - start, seconds);
-    format!("CLOCK: [{}]--[{}] {}", s_ts, e_ts, dur)
-}
-
-fn format_timestamp(dt: NaiveDateTime, tz: &str, seconds: bool) -> String {
-    let day = weekday_short(dt.date());
-    if seconds {
-        format!(
-            "{} {} {:02}:{:02}:{:02} {}",
-            dt.date(),
-            day,
-            dt.hour(),
-            dt.minute(),
-            dt.second(),
-            tz
-        )
-    } else {
-        format!(
-            "{} {} {:02}:{:02} {}",
-            dt.date(),
-            day,
-            dt.hour(),
-            dt.minute(),
-            tz
-        )
-    }
-}
-
-fn weekday_short(d: NaiveDate) -> &'static str {
-    use chrono::Weekday::*;
-    match d.weekday() {
-        Mon => "Mon",
-        Tue => "Tue",
-        Wed => "Wed",
-        Thu => "Thu",
-        Fri => "Fri",
-        Sat => "Sat",
-        Sun => "Sun",
-    }
-}
-
-/// Format a [`chrono::Duration`] as the canonical org-mode CLOCK
-/// suffix, including the leading `"=>"` arrow. Mirrors Emacs'
-/// `printf("=> %2d:%02d")`: a leading space pads single-digit
-/// hours so the hour field is always at least two characters
-/// wide — hence `=>  2:15` (single-digit) but `=> 12:30`
-/// (two-digit).
-fn format_duration(d: chrono::Duration, seconds: bool) -> String {
-    let secs = d.num_seconds().max(0);
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    if seconds {
-        format!("=> {:>2}:{:02}:{:02}", h, m, s)
-    } else {
-        format!("=> {:>2}:{:02}", h, m)
-    }
 }
 
 // =====================================================================

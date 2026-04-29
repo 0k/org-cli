@@ -499,6 +499,8 @@ fn parse_tz(s: &str) -> Option<i32> {
 }
 
 /// Three-letter English weekday short name as org-mode emits.
+/// Accepts a [`chrono::Weekday`] directly. Pair with
+/// `date.weekday()` to derive from a date.
 pub fn weekday_short(w: Weekday) -> &'static str {
     match w {
         Weekday::Mon => "Mon",
@@ -690,15 +692,89 @@ pub fn recompute_duration_in_line(line: &str) -> DurationFix {
 /// Build the canonical `"=> H:MM"` / `"=> H:MM:SS"` suffix for a
 /// parsed CLOCK line, applying the Emacs spacing rule.
 pub fn canonical_duration_suffix(c: &ClockLine) -> String {
-    let secs = duration_seconds(c).max(0);
+    format_duration_suffix(duration_seconds(c), c.has_seconds)
+}
+
+/// Format an arbitrary number of seconds as the canonical
+/// org-mode CLOCK duration suffix (`=> H:MM` or `=> H:MM:SS`),
+/// applying the Emacs `printf("=> %2d:%02d")` spacing rule.
+/// Negative durations are clamped to zero (a CLOCK line with a
+/// negative duration is meaningless).
+pub fn format_duration_suffix(secs: i64, with_seconds: bool) -> String {
+    let secs = secs.max(0);
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
-    if c.has_seconds {
+    if with_seconds {
         format!("=> {:>2}:{:02}:{:02}", h, m, s)
     } else {
         format!("=> {:>2}:{:02}", h, m)
     }
+}
+
+/// Format one bracketed `[YYYY-MM-DD Day HH:MM[:SS] tz]` token.
+///
+/// `dt` carries the date and time of day (in local wall-clock
+/// terms); `tz` is the numerical offset string (`"+0200"`,
+/// `"-0500"`, …) to embed verbatim. `with_seconds` controls
+/// whether the output uses second precision.
+pub fn format_timestamp(dt: chrono::NaiveDateTime, tz: &str, with_seconds: bool) -> String {
+    use chrono::Timelike;
+    let day = weekday_short(dt.date().weekday());
+    if with_seconds {
+        format!(
+            "{} {} {:02}:{:02}:{:02} {}",
+            dt.date(),
+            day,
+            dt.hour(),
+            dt.minute(),
+            dt.second(),
+            tz
+        )
+    } else {
+        format!(
+            "{} {} {:02}:{:02} {}",
+            dt.date(),
+            day,
+            dt.hour(),
+            dt.minute(),
+            tz
+        )
+    }
+}
+
+/// Build a complete canonical `CLOCK:` line from a (start, end)
+/// pair of [`chrono::NaiveDateTime`]s plus the numerical TZ
+/// string they share.
+///
+/// Both timestamps are emitted with the same `tz` string and the
+/// same precision (driven by `with_seconds`). The duration suffix
+/// is the UTC-aware delta between `end` and `start`, applying the
+/// canonical Emacs spacing rule.
+///
+/// Callers are expected to:
+///
+/// * pass `start ≤ end` (any midnight rollover should already
+///   have moved `end`'s date forward),
+/// * pass a `tz` that is the *correct numerical offset for the
+///   instant* (chrono's local zone at that date), so winter and
+///   summer dates produce winter and summer offsets respectively.
+///
+/// Output (no trailing newline):
+///
+/// ```text
+/// CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15
+/// ```
+pub fn format_clock_line(
+    start: chrono::NaiveDateTime,
+    end: chrono::NaiveDateTime,
+    tz: &str,
+    with_seconds: bool,
+) -> String {
+    let s_ts = format_timestamp(start, tz, with_seconds);
+    let e_ts = format_timestamp(end, tz, with_seconds);
+    let dur = format_duration_suffix((end - start).num_seconds(), with_seconds);
+    format!("CLOCK: [{}]--[{}] {}", s_ts, e_ts, dur)
 }
 
 /// `end - start` in whole seconds, taking each side's timezone

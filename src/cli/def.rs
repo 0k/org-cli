@@ -149,6 +149,37 @@ pub enum ClockCommands {
         first: bool,
     },
 
+    /// Apply mechanical fixes to CLOCK lines: rewrite the weekday
+    /// token from the date (normalising French abbreviations like
+    /// ``mer.`` to English ``Wed``), and recompute the
+    /// ``=> H:MM`` duration suffix from the start/end timestamps
+    /// using the canonical Emacs spacing rule.
+    ///
+    /// Only axes that can be derived from canonical inputs are
+    /// touched. Timezones and the timestamps themselves are
+    /// considered authored data and are NEVER modified.
+    ///
+    /// Defaults to dry-run; pass ``--write`` to apply changes.
+    /// When PATHS is omitted, the agenda set is used (same as
+    /// ``clock check``).
+    Fix {
+        paths: Vec<std::path::PathBuf>,
+
+        /// Glob patterns matched against candidate file paths;
+        /// matching files are skipped. Repeatable.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude_globs: Vec<String>,
+
+        /// Apply the rewrites in place. Without this flag the
+        /// command is a dry-run.
+        #[arg(long)]
+        write: bool,
+
+        /// NDJSON output (one JSON object per rewrite).
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
     /// Print one canonical `CLOCK:` line on stdout.
     Fmt {
         /// Start time. Accepts `HH:MM`, `HH:MM:SS`,

@@ -104,6 +104,24 @@ pub fn run() -> Result<(), String> {
                 }
                 Ok(())
             }
+            def::ClockCommands::Fix {
+                paths,
+                exclude_globs,
+                write,
+                json,
+            } => {
+                let opts = action::clock::FixOptions {
+                    paths,
+                    exclude_globs,
+                    write,
+                    json,
+                };
+                let exit_code = action::clock::run_fix(opts)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
             def::ClockCommands::Fmt {
                 start,
                 end,

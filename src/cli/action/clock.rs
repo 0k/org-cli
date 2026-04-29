@@ -19,7 +19,7 @@ use log::{debug, warn};
 use serde::Serialize;
 
 use crate::cli::action::walk::collect_org_files;
-use crate::org::clock::parse_clock_line;
+use crate::org::clock::{fix_weekday_in_line, parse_clock_line, recompute_duration_in_line};
 
 // =====================================================================
 // `clock check`
@@ -52,40 +52,7 @@ pub struct Violation {
 /// Run `clock check`. Returns 0 on a clean run, 1 when violations
 /// were reported, `Err` on usage / I/O errors.
 pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
-    let files = if opts.paths.is_empty() {
-        let path = default_agenda_set_path()?;
-        debug!("no PATHS given; using agenda set {}", path.display());
-        let listed = read_agenda_set(&path)?;
-        // Each entry in the agenda set is already a file. We still
-        // pipe through `collect_org_files` so the same walking
-        // semantics apply to any directories that may appear.
-        let inputs: Vec<PathBuf> = listed
-            .into_iter()
-            .filter(|p| {
-                if !p.exists() {
-                    warn!("agenda set entry not found, skipping: {}", p.display());
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-        if inputs.is_empty() {
-            return Err(format!(
-                "agenda set at {} resolved to zero existing paths",
-                path.display()
-            ));
-        }
-        collect_org_files(&inputs)?
-    } else {
-        collect_org_files(&opts.paths)?
-    };
-
-    let patterns = compile_globs(&opts.exclude_globs)?;
-    let files: Vec<PathBuf> = files
-        .into_iter()
-        .filter(|p| !path_excluded(p, &patterns))
-        .collect();
+    let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
     debug!("scanning {} org file(s)", files.len());
 
     let mut violation_count: usize = 0;
@@ -220,6 +187,228 @@ impl<'a> StdoutWriter<'a> {
         }
         self.stdout.flush()
     }
+}
+
+// =====================================================================
+// `clock fix`
+// =====================================================================
+//
+// Rewrites the axes of a CLOCK line that can be derived
+// mechanically from canonical inputs:
+//
+//   * weekday — from the date
+//   * duration suffix (and its Emacs spacing) — from start/end
+//
+// Axes that depend on human judgement (timezone, the timestamps
+// themselves) are NOT touched here. See the consolidation plan.
+
+/// CLI options for `clock fix`.
+#[derive(Debug, Clone)]
+pub struct FixOptions {
+    /// Files or directories to scan. Empty → agenda set.
+    pub paths: Vec<PathBuf>,
+    pub exclude_globs: Vec<String>,
+    /// When true, write changes back. Otherwise, dry-run
+    /// (default).
+    pub write: bool,
+    /// JSON output — one record per rewrite.
+    pub json: bool,
+}
+
+/// One rewrite record, format-agnostic. The `axis` field tells
+/// the consumer which fixer produced this change.
+#[derive(Debug, Clone, Serialize)]
+pub struct FixRecord {
+    pub file: PathBuf,
+    pub line: usize,
+    /// `"weekday"` or `"duration"`.
+    pub axis: &'static str,
+    /// For weekday rewrites: `Mon`, `mer.`, etc. For duration
+    /// rewrites: the old `=> …` suffix.
+    pub from: String,
+    /// The replacement token.
+    pub to: String,
+    pub before: String,
+    pub after: String,
+}
+
+/// Run `clock fix`. Exit 0 if there was nothing to change (or all
+/// changes were applied); 1 in dry-run mode when rewrites would
+/// happen.
+pub fn run_fix(opts: FixOptions) -> Result<i32, String> {
+    let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
+    debug!("scanning {} org file(s) for weekday-mismatch", files.len());
+
+    let mut total_rewrites: usize = 0;
+    let mut writer: io::BufWriter<io::Stdout> = io::BufWriter::new(io::stdout());
+
+    for file in &files {
+        let content = match fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("cannot read {}: {}", file.display(), e);
+                continue;
+            }
+        };
+
+        let mut new_content = String::with_capacity(content.len());
+        let mut file_records: Vec<FixRecord> = Vec::new();
+        // `split_inclusive` preserves each line's newline state so
+        // we can write the file back byte-faithfully.
+        for (idx, chunk) in content.split_inclusive('\n').enumerate() {
+            let (orig, eol) = match chunk.strip_suffix('\n') {
+                Some(stripped) => (stripped, "\n"),
+                None => (chunk, ""),
+            };
+            // Apply weekday fix first. The duration recompute
+            // uses the strict parser, which only succeeds on a
+            // line whose weekday already matches the date — so
+            // when both axes are wrong we must fix the weekday
+            // before the duration can be recomputed.
+            let after_weekday = fix_weekday_in_line(orig);
+            for rw in &after_weekday.rewrites {
+                file_records.push(FixRecord {
+                    file: file.clone(),
+                    line: idx + 1,
+                    axis: "weekday",
+                    from: rw.old.clone(),
+                    to: rw.new.to_string(),
+                    before: orig.to_string(),
+                    after: after_weekday.line.clone(),
+                });
+            }
+            let after_duration = recompute_duration_in_line(&after_weekday.line);
+            if let Some(ch) = &after_duration.change {
+                file_records.push(FixRecord {
+                    file: file.clone(),
+                    line: idx + 1,
+                    axis: "duration",
+                    from: ch.old.clone(),
+                    to: ch.new.clone(),
+                    before: after_weekday.line.clone(),
+                    after: after_duration.line.clone(),
+                });
+            }
+            new_content.push_str(&after_duration.line);
+            new_content.push_str(eol);
+        }
+
+        if file_records.is_empty() {
+            continue;
+        }
+
+        for rec in &file_records {
+            emit_fix_record(&mut writer, rec, opts.json, opts.write).map_err(|e| e.to_string())?;
+        }
+        total_rewrites += file_records.len();
+
+        if opts.write {
+            fs::write(file, &new_content)
+                .map_err(|e| format!("cannot write {}: {}", file.display(), e))?;
+        }
+    }
+
+    writer.flush().map_err(|e| e.to_string())?;
+
+    if !opts.json {
+        let mut tail = io::stdout();
+        if total_rewrites == 0 {
+            writeln!(tail, "{}", "No mechanical fixes to apply.".green())
+                .map_err(|e| e.to_string())?;
+        } else if opts.write {
+            writeln!(
+                tail,
+                "\n{} {}",
+                total_rewrites.to_string().bright_green(),
+                "rewrite(s) applied".bright_green(),
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            writeln!(
+                tail,
+                "\n{} {} (dry run; pass --write to apply)",
+                total_rewrites.to_string().bright_yellow(),
+                "rewrite(s) would be applied".bright_yellow(),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Exit code policy:
+    // - dry-run with rewrites: 1 (signals "work pending")
+    // - write with rewrites: 0 (work done)
+    // - no rewrites at all: 0
+    Ok(if total_rewrites > 0 && !opts.write {
+        1
+    } else {
+        0
+    })
+}
+
+fn emit_fix_record(
+    out: &mut io::BufWriter<io::Stdout>,
+    rec: &FixRecord,
+    json: bool,
+    write_mode: bool,
+) -> io::Result<()> {
+    if json {
+        let line = serde_json::to_string(rec).map_err(|e| io::Error::other(e.to_string()))?;
+        writeln!(out, "{}", line)
+    } else {
+        let verb = if write_mode {
+            "rewrote"
+        } else {
+            "would rewrite"
+        };
+        writeln!(
+            out,
+            "{}:{}: [{}] {} {:?} → {:?}",
+            rec.file.display().to_string().bright_blue(),
+            rec.line,
+            rec.axis.cyan(),
+            verb,
+            rec.from,
+            rec.to,
+        )
+    }
+}
+
+/// Shared input resolver used by `check` and `fix`.
+fn resolve_input_files(
+    paths: &[PathBuf],
+    exclude_globs: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    let raw = if paths.is_empty() {
+        let agenda = default_agenda_set_path()?;
+        debug!("no PATHS given; using agenda set {}", agenda.display());
+        let listed = read_agenda_set(&agenda)?;
+        let inputs: Vec<PathBuf> = listed
+            .into_iter()
+            .filter(|p| {
+                if !p.exists() {
+                    warn!("agenda set entry not found, skipping: {}", p.display());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if inputs.is_empty() {
+            return Err(format!(
+                "agenda set at {} resolved to zero existing paths",
+                agenda.display()
+            ));
+        }
+        collect_org_files(&inputs)?
+    } else {
+        collect_org_files(paths)?
+    };
+
+    let patterns = compile_globs(exclude_globs)?;
+    Ok(raw
+        .into_iter()
+        .filter(|p| !path_excluded(p, &patterns))
+        .collect())
 }
 
 // =====================================================================
@@ -365,7 +554,7 @@ fn format_clock_line(start: NaiveDateTime, end: NaiveDateTime, tz: &str, seconds
     let s_ts = format_timestamp(start, tz, seconds);
     let e_ts = format_timestamp(end, tz, seconds);
     let dur = format_duration(end - start, seconds);
-    format!("CLOCK: [{}]--[{}] => {}", s_ts, e_ts, dur)
+    format!("CLOCK: [{}]--[{}] {}", s_ts, e_ts, dur)
 }
 
 fn format_timestamp(dt: NaiveDateTime, tz: &str, seconds: bool) -> String {
@@ -405,20 +594,21 @@ fn weekday_short(d: NaiveDate) -> &'static str {
     }
 }
 
-/// Format a [`chrono::Duration`] as the standard org-mode CLOCK
-/// suffix. With seconds: `H:MM:SS` zero-padded on minute and
-/// second; without: `H:MM`. The leading hour count is right-padded
-/// to one or two digits for visual alignment with org's typical
-/// `=> ` followed by two leading spaces.
+/// Format a [`chrono::Duration`] as the canonical org-mode CLOCK
+/// suffix, including the leading `"=>"` arrow. Mirrors Emacs'
+/// `printf("=> %2d:%02d")`: a leading space pads single-digit
+/// hours so the hour field is always at least two characters
+/// wide — hence `=>  2:15` (single-digit) but `=> 12:30`
+/// (two-digit).
 fn format_duration(d: chrono::Duration, seconds: bool) -> String {
     let secs = d.num_seconds().max(0);
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
     if seconds {
-        format!(" {}:{:02}:{:02}", h, m, s)
+        format!("=> {:>2}:{:02}:{:02}", h, m, s)
     } else {
-        format!(" {}:{:02}", h, m)
+        format!("=> {:>2}:{:02}", h, m)
     }
 }
 
@@ -522,6 +712,155 @@ mod tests {
         let mut o = opts_for(vec![td.path().to_path_buf()]);
         o.exclude_globs.push(format!("{}/**", td.path().display()));
         assert_eq!(run_check(o).unwrap(), 0);
+    }
+
+    // ----- fix --------------------------------------------------
+
+    fn fix_opts(paths: Vec<PathBuf>, write: bool) -> FixOptions {
+        FixOptions {
+            paths,
+            exclude_globs: Vec::new(),
+            write,
+            json: true,
+        }
+    }
+
+    #[test]
+    fn fix_dry_run_does_not_mutate_file() {
+        let td = TempDir::new("fix-dry");
+        // 2024-04-16 was a Tuesday, not Monday → two rewrites on
+        // this single line.
+        write(
+            &td.path().join("a.org"),
+            "  CLOCK: [2024-04-16 Mon 14:15 +0200]--[2024-04-16 Mon 14:30 +0200] =>  0:15\n",
+        );
+        let exit = run_fix(fix_opts(vec![td.path().to_path_buf()], false)).unwrap();
+        assert_eq!(exit, 1, "dry-run with rewrites must exit 1");
+        let after = fs::read_to_string(td.path().join("a.org")).unwrap();
+        assert!(
+            after.contains("Mon") && !after.contains("Tue"),
+            "file was mutated in dry-run: {}",
+            after
+        );
+    }
+
+    #[test]
+    fn fix_weekday_applied_with_write() {
+        let td = TempDir::new("fix-weekday-write");
+        write(
+            &td.path().join("a.org"),
+            "  CLOCK: [2024-04-16 Mon 14:15 +0200]--[2024-04-16 Mon 14:30 +0200] =>  0:15\n",
+        );
+        let exit = run_fix(fix_opts(vec![td.path().to_path_buf()], true)).unwrap();
+        assert_eq!(exit, 0);
+        let after = fs::read_to_string(td.path().join("a.org")).unwrap();
+        assert_eq!(
+            after,
+            "  CLOCK: [2024-04-16 Tue 14:15 +0200]--[2024-04-16 Tue 14:30 +0200] =>  0:15\n"
+        );
+    }
+
+    #[test]
+    fn fix_normalises_french_abbreviations() {
+        let td = TempDir::new("fix-french");
+        write(
+            &td.path().join("a.org"),
+            "   CLOCK: [2022-05-25 mer. 08:15 +0200]--[2022-05-25 Wed 10:30 +0200] =>  2:15\n",
+        );
+        let exit = run_fix(fix_opts(vec![td.path().to_path_buf()], true)).unwrap();
+        assert_eq!(exit, 0);
+        let after = fs::read_to_string(td.path().join("a.org")).unwrap();
+        assert!(after.contains("[2022-05-25 Wed 08:15"), "got: {}", after);
+        assert!(!after.contains("mer."), "french token survived: {}", after);
+    }
+
+    #[test]
+    fn fix_recomputes_corrupted_duration() {
+        let td = TempDir::new("fix-duration");
+        // 720:45 must collapse back to 0:45 (15:00..15:45).
+        write(
+            &td.path().join("a.org"),
+            "  CLOCK: [2024-11-13 Wed 15:00 +0100]--[2024-11-13 Wed 15:45 +0100] => 720:45\n",
+        );
+        let exit = run_fix(fix_opts(vec![td.path().to_path_buf()], true)).unwrap();
+        assert_eq!(exit, 0);
+        let after = fs::read_to_string(td.path().join("a.org")).unwrap();
+        assert_eq!(
+            after,
+            "  CLOCK: [2024-11-13 Wed 15:00 +0100]--[2024-11-13 Wed 15:45 +0100] =>  0:45\n"
+        );
+    }
+
+    #[test]
+    fn fix_normalises_emacs_spacing() {
+        let td = TempDir::new("fix-spacing");
+        // Single-digit hour, only one space between => and digits.
+        write(
+            &td.path().join("a.org"),
+            "  CLOCK: [2022-06-03 Fri 15:00 +0200]--[2022-06-03 Fri 17:30 +0200] => 2:30\n",
+        );
+        let exit = run_fix(fix_opts(vec![td.path().to_path_buf()], true)).unwrap();
+        assert_eq!(exit, 0);
+        let after = fs::read_to_string(td.path().join("a.org")).unwrap();
+        assert!(after.contains("=>  2:30"), "got: {}", after);
+    }
+
+    #[test]
+    fn fix_combines_weekday_then_duration_in_one_pass() {
+        let td = TempDir::new("fix-both");
+        // 2024-11-13 is a Wed; line says Mon AND duration 720:45.
+        // After one fix run we expect: weekday rewrite + duration
+        // rewrite both applied.
+        write(
+            &td.path().join("a.org"),
+            "  CLOCK: [2024-11-13 Mon 15:00 +0100]--[2024-11-13 Mon 15:45 +0100] => 720:45\n",
+        );
+        let exit = run_fix(fix_opts(vec![td.path().to_path_buf()], true)).unwrap();
+        assert_eq!(exit, 0);
+        let after = fs::read_to_string(td.path().join("a.org")).unwrap();
+        assert_eq!(
+            after,
+            "  CLOCK: [2024-11-13 Wed 15:00 +0100]--[2024-11-13 Wed 15:45 +0100] =>  0:45\n"
+        );
+    }
+
+    #[test]
+    fn fix_clean_file_is_noop() {
+        let td = TempDir::new("fix-clean");
+        let original =
+            "  CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15\n";
+        write(&td.path().join("a.org"), original);
+        let exit = run_fix(fix_opts(vec![td.path().to_path_buf()], true)).unwrap();
+        assert_eq!(exit, 0);
+        let after = fs::read_to_string(td.path().join("a.org")).unwrap();
+        assert_eq!(after, original);
+    }
+
+    #[test]
+    fn fix_preserves_unrelated_lines_byte_for_byte() {
+        let td = TempDir::new("fix-preserve");
+        let original = "line one\n\n* heading\n  :LOGBOOK:\n  CLOCK: [2024-04-16 Mon 14:15 +0200]--[2024-04-16 Mon 14:30 +0200] =>  0:15\n  :END:\nfinal line without newline";
+        write(&td.path().join("a.org"), original);
+        let exit = run_fix(fix_opts(vec![td.path().to_path_buf()], true)).unwrap();
+        assert_eq!(exit, 0);
+        let after = fs::read_to_string(td.path().join("a.org")).unwrap();
+        // Only the day tokens changed; everything else byte-identical.
+        let expected = original.replacen("Mon", "Tue", 2);
+        assert_eq!(after, expected);
+    }
+
+    #[test]
+    fn fix_skips_unparseable_lines_for_duration() {
+        let td = TempDir::new("fix-unparseable");
+        // Missing TZ: weekday is fine, duration suffix bogus.
+        // Duration recomputer must NOT touch this (no TZ → cannot
+        // compute reliably). Line stays unchanged.
+        let original = "  CLOCK: [2026-01-07 Wed 09:57]--[2026-01-07 Wed 12:19] => 9999:99\n";
+        write(&td.path().join("a.org"), original);
+        let exit = run_fix(fix_opts(vec![td.path().to_path_buf()], true)).unwrap();
+        assert_eq!(exit, 0, "nothing to fix mechanically");
+        let after = fs::read_to_string(td.path().join("a.org")).unwrap();
+        assert_eq!(after, original);
     }
 
     #[test]

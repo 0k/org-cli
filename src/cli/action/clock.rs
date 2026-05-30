@@ -8,6 +8,7 @@
 //! `--exclude` globs, formats violations, and prints the canonical
 //! line for `fmt`.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ use chrono::{Local, NaiveDateTime, NaiveTime, Timelike};
 use colored::*;
 use glob::Pattern;
 use log::{debug, warn};
+use regex::RegexBuilder;
 use serde::Serialize;
 
 use crate::cli::action::walk::collect_org_files;
@@ -27,6 +29,8 @@ use crate::org::clock::{
     recompute_duration_in_line,
 };
 use crate::org::clock_add::{HeadingQuery, apply_add};
+use crate::org::filter::FilterOptions;
+use crate::org::heading::{Heading, heading_for_line};
 
 // =====================================================================
 // `clock check`
@@ -423,7 +427,7 @@ fn emit_fix_record(
 }
 
 /// Shared input resolver used by `check` and `fix`.
-fn resolve_input_files(
+pub(crate) fn resolve_input_files(
     paths: &[PathBuf],
     exclude_globs: &[String],
 ) -> Result<Vec<PathBuf>, String> {
@@ -472,8 +476,35 @@ pub struct ListOptions {
     /// Glob patterns matched against candidate file paths;
     /// matching files are skipped.
     pub exclude_globs: Vec<String>,
+    /// Match enclosing heading title against regex.
+    pub filter: Option<String>,
+    /// Case-insensitive enclosing heading title regex.
+    pub ignore_case: bool,
+    /// Keep only CLOCKs whose enclosing heading has all these properties.
+    pub has_property: Vec<String>,
     /// NDJSON output (currently the only supported shape).
     pub json: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HeadingSummary {
+    pub level: u32,
+    pub line: usize,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub properties: BTreeMap<String, String>,
+}
+
+impl From<&Heading> for HeadingSummary {
+    fn from(value: &Heading) -> Self {
+        Self {
+            level: value.level,
+            line: value.line,
+            title: value.title.clone(),
+            tags: value.tags.clone(),
+            properties: value.properties.clone(),
+        }
+    }
 }
 
 /// One emitted CLOCK record (clean lines only). All times are
@@ -497,6 +528,8 @@ pub struct ClockRecord {
     /// The original line, unmodified, including leading
     /// whitespace.
     pub raw: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heading: Option<HeadingSummary>,
 }
 
 /// One rejection diagnostic, written to stderr when a CLOCK line
@@ -532,11 +565,24 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
 
     let cfg = Config::load_default()?;
     let zones = cfg.clock.resolve_zones()?;
+    let heading_filter = build_heading_filter(&opts)?;
 
+    if heading_filter.is_empty() {
+        return run_list_unfiltered(&files, &zones, opts.json);
+    }
+
+    run_list_filtered(&files, &zones, opts.json, &heading_filter)
+}
+
+fn run_list_unfiltered(
+    files: &[PathBuf],
+    zones: &[chrono_tz::Tz],
+    json: bool,
+) -> Result<i32, String> {
     let mut stdout = io::BufWriter::new(io::stdout());
     let mut stderr = io::BufWriter::new(io::stderr());
 
-    for file in &files {
+    for file in files {
         let content = match fs::read_to_string(file) {
             Ok(c) => c,
             Err(e) => {
@@ -550,9 +596,9 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
                 continue;
             }
             match parse_clock_line(raw) {
-                Ok(None) => continue, // not a closed-range CLOCK
+                Ok(None) => continue,
                 Ok(Some(p)) if p.violations.is_empty() => {
-                    if let Some(v) = check_accepted_zones(&p, &zones) {
+                    if let Some(v) = check_accepted_zones(&p, zones) {
                         let rej = ListReject {
                             file: file.clone(),
                             line: idx + 1,
@@ -562,16 +608,14 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
                         };
                         return abort_list(&mut stdout, &mut stderr, &rej);
                     }
-                    let rec = build_clock_record(file, idx + 1, raw, &p);
-                    if opts.json {
+                    let rec = build_clock_record(file, idx + 1, raw, &p, None);
+                    if json {
                         let line = serde_json::to_string(&rec)
                             .map_err(|e| format!("serializing record: {}", e))?;
                         writeln!(stdout, "{}", line).map_err(|e| e.to_string())?;
                     }
                 }
                 Ok(Some(p)) => {
-                    // Hard fail on the FIRST semantic violation.
-                    // Emit one diagnostic and bail.
                     let v = &p.violations[0];
                     let rej = ListReject {
                         file: file.clone(),
@@ -601,6 +645,118 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
     Ok(0)
 }
 
+fn run_list_filtered(
+    files: &[PathBuf],
+    zones: &[chrono_tz::Tz],
+    json: bool,
+    heading_filter: &FilterOptions,
+) -> Result<i32, String> {
+    let mut stdout = io::BufWriter::new(io::stdout());
+    let mut stderr = io::BufWriter::new(io::stderr());
+
+    for file in files {
+        let content = match fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("cannot read {}: {}", file.display(), e);
+                continue;
+            }
+        };
+
+        let records = match collect_filtered_clock_records(file, &content, zones, heading_filter) {
+            Ok(records) => records,
+            Err(rej) => return abort_list(&mut stdout, &mut stderr, &rej),
+        };
+
+        if json {
+            for rec in records {
+                let line = serde_json::to_string(&rec)
+                    .map_err(|e| format!("serializing record: {}", e))?;
+                writeln!(stdout, "{}", line).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    stdout.flush().map_err(|e| e.to_string())?;
+    stderr.flush().map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
+fn collect_filtered_clock_records(
+    file: &Path,
+    content: &str,
+    zones: &[chrono_tz::Tz],
+    heading_filter: &FilterOptions,
+) -> Result<Vec<ClockRecord>, ListReject> {
+    let mut records = Vec::new();
+
+    for (idx, raw) in content.lines().enumerate() {
+        if !raw.contains("CLOCK:") {
+            continue;
+        }
+        match parse_clock_line(raw) {
+            Ok(None) => continue,
+            Ok(Some(p)) if p.violations.is_empty() => {
+                if let Some(v) = check_accepted_zones(&p, zones) {
+                    return Err(ListReject {
+                        file: file.to_path_buf(),
+                        line: idx + 1,
+                        raw: raw.to_string(),
+                        tag: v.tag(),
+                        message: v.message(),
+                    });
+                }
+                let Some(heading) = heading_for_line(content, idx + 1) else {
+                    continue;
+                };
+                if !heading_filter.matches(&heading) {
+                    continue;
+                }
+                records.push(build_clock_record(file, idx + 1, raw, &p, Some(&heading)));
+            }
+            Ok(Some(p)) => {
+                let v = &p.violations[0];
+                return Err(ListReject {
+                    file: file.to_path_buf(),
+                    line: idx + 1,
+                    raw: raw.to_string(),
+                    tag: v.tag(),
+                    message: v.message(),
+                });
+            }
+            Err(err) => {
+                return Err(ListReject {
+                    file: file.to_path_buf(),
+                    line: idx + 1,
+                    raw: raw.to_string(),
+                    tag: err.tag(),
+                    message: err.message(),
+                });
+            }
+        }
+    }
+
+    Ok(records)
+}
+
+fn build_heading_filter(opts: &ListOptions) -> Result<FilterOptions, String> {
+    let pattern = match &opts.filter {
+        Some(pattern) => Some(
+            RegexBuilder::new(pattern)
+                .case_insensitive(opts.ignore_case)
+                .build()
+                .map_err(|e| format!("invalid --filter regex {:?}: {}", pattern, e))?,
+        ),
+        None => None,
+    };
+
+    Ok(FilterOptions {
+        pattern,
+        ignore_case: opts.ignore_case,
+        has_properties: opts.has_property.clone(),
+    })
+}
+
 /// Emit the rejection diagnostic, flush both streams, and
 /// return exit code 1.
 fn abort_list<W1: Write, W2: Write>(
@@ -625,6 +781,7 @@ fn build_clock_record(
     line_no: usize,
     raw: &str,
     p: &crate::org::clock::ParsedClockLine,
+    heading: Option<&Heading>,
 ) -> ClockRecord {
     let start_iso = format_iso(
         p.line.start.date,
@@ -650,6 +807,7 @@ fn build_clock_record(
         has_seconds: p.line.has_seconds,
         duration_seconds: dur_seconds,
         raw: raw.to_string(),
+        heading: heading.map(HeadingSummary::from),
     }
 }
 
@@ -1020,6 +1178,7 @@ fn round_to_grid(dt: NaiveDateTime, grid: u32) -> NaiveDateTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
     use std::fs;
 
     /// Minimal tempdir helper, mirrors the existing `check.rs` one.
@@ -1283,6 +1442,27 @@ mod tests {
         ListOptions {
             paths,
             exclude_globs: Vec::new(),
+            filter: None,
+            ignore_case: false,
+            has_property: Vec::new(),
+            json: true,
+        }
+    }
+
+    fn list_opts_with_filter(
+        filter: Option<&str>,
+        ignore_case: bool,
+        has_property: &[&str],
+    ) -> ListOptions {
+        ListOptions {
+            paths: Vec::new(),
+            exclude_globs: Vec::new(),
+            filter: filter.map(str::to_string),
+            ignore_case,
+            has_property: has_property
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             json: true,
         }
     }
@@ -1360,6 +1540,100 @@ mod tests {
         );
         let exit = run_list(list_opts(vec![td.path().to_path_buf()])).unwrap();
         assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn filtered_list_emits_heading_summary() {
+        let content = indoc! {"
+            * Billing task
+            :PROPERTIES:
+            :TASK_REF: 248
+            :END:
+            CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15
+        "};
+        let filter =
+            build_heading_filter(&list_opts_with_filter(None, false, &["TASK_REF"])).unwrap();
+
+        let records =
+            collect_filtered_clock_records(Path::new("a.org"), content, &[], &filter).unwrap();
+
+        assert_eq!(records.len(), 1);
+        let heading = records[0].heading.as_ref().expect("heading summary");
+        assert_eq!(heading.level, 1);
+        assert_eq!(heading.line, 1);
+        assert_eq!(heading.title, "Billing task");
+        assert_eq!(heading.properties.get("TASK_REF"), Some(&"248".to_string()));
+    }
+
+    #[test]
+    fn filtered_list_applies_and_semantics_for_regex_and_property() {
+        let content = indoc! {"
+            * Billing task
+            :PROPERTIES:
+            :TASK_REF: 248
+            :END:
+            CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15
+            * Notes
+            :PROPERTIES:
+            :TASK_REF: 314
+            :END:
+            CLOCK: [2025-06-06 Fri 12:00 +0200]--[2025-06-06 Fri 12:30 +0200] =>  0:30
+        "};
+        let filter =
+            build_heading_filter(&list_opts_with_filter(Some("billing"), true, &["TASK_REF"]))
+                .unwrap();
+
+        let records =
+            collect_filtered_clock_records(Path::new("a.org"), content, &[], &filter).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].line, 5);
+        assert_eq!(
+            records[0].heading.as_ref().map(|h| h.title.as_str()),
+            Some("Billing task")
+        );
+    }
+
+    #[test]
+    fn filtered_list_skips_headings_missing_property() {
+        let content = indoc! {"
+            * Billing task
+            CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15
+            * Tracked task
+            :PROPERTIES:
+            :TASK_REF: 314
+            :END:
+            CLOCK: [2025-06-06 Fri 12:00 +0200]--[2025-06-06 Fri 12:30 +0200] =>  0:30
+        "};
+        let filter =
+            build_heading_filter(&list_opts_with_filter(None, false, &["TASK_REF"])).unwrap();
+
+        let records =
+            collect_filtered_clock_records(Path::new("a.org"), content, &[], &filter).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].line, 7);
+        assert_eq!(
+            records[0].heading.as_ref().map(|h| h.title.as_str()),
+            Some("Tracked task")
+        );
+    }
+
+    #[test]
+    fn filtered_list_drops_clocks_outside_any_heading() {
+        let content = indoc! {"
+            CLOCK: [2025-06-06 Fri 08:00 +0200]--[2025-06-06 Fri 08:30 +0200] =>  0:30
+            * Billing task
+            CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15
+        "};
+        let filter =
+            build_heading_filter(&list_opts_with_filter(Some("billing"), true, &[])).unwrap();
+
+        let records =
+            collect_filtered_clock_records(Path::new("a.org"), content, &[], &filter).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].line, 3);
     }
 
     // ----- add ----------------------------------------------------------

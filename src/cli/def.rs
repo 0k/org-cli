@@ -112,6 +112,39 @@ pub enum Commands {
         directory_references_all_children: bool,
     },
 
+    /// List headings across org files with optional title/property filters.
+    Headings {
+        /// Files or directories to scan. When omitted, the agenda
+        /// set is read from
+        /// `~/.cache/emacs/org-collect/org-agenda-files.tmp`.
+        paths: Vec<std::path::PathBuf>,
+
+        /// Glob patterns matched against candidate file paths;
+        /// matching files are skipped. Repeatable. No defaults.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude: Vec<String>,
+
+        /// Match heading title against regex.
+        #[arg(short = 'f', long = "filter", value_name = "REGEX")]
+        filter: Option<String>,
+
+        /// Case-insensitive title regex.
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+
+        /// Keep only headings that have the given property name.
+        #[arg(long = "has-property", value_name = "NAME")]
+        has_property: Vec<String>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per heading).
+        #[arg(short = 'j', long, conflicts_with = "nul")]
+        json: bool,
+    },
+
     /// Lint and format org-mode `CLOCK:` lines.
     Clock {
         #[command(subcommand)]
@@ -197,6 +230,18 @@ pub enum ClockCommands {
         /// matching files are skipped. Repeatable.
         #[arg(long = "exclude", value_name = "GLOB")]
         exclude_globs: Vec<String>,
+
+        /// Match enclosing heading title against regex.
+        #[arg(short = 'f', long = "filter", value_name = "REGEX")]
+        filter: Option<String>,
+
+        /// Case-insensitive enclosing heading title regex.
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+
+        /// Keep only CLOCKs whose enclosing heading has the given property name.
+        #[arg(long = "has-property", value_name = "NAME")]
+        has_property: Vec<String>,
 
         /// NDJSON output (currently the only supported shape).
         #[arg(short = 'j', long, default_value_t = true)]

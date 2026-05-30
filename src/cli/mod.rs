@@ -83,6 +83,30 @@ pub fn run() -> Result<(), String> {
             }
             Ok(())
         }
+        Some(def::Commands::Headings {
+            paths,
+            exclude,
+            filter,
+            ignore_case,
+            has_property,
+            nul,
+            json,
+        }) => {
+            let opts = action::headings::HeadingsOptions {
+                paths,
+                exclude_globs: exclude,
+                filter,
+                ignore_case,
+                has_property,
+                nul,
+                json,
+            };
+            let exit_code = action::headings::run(opts)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Some(def::Commands::Clock { action: clock_cmd }) => match clock_cmd {
             def::ClockCommands::Check {
                 paths,
@@ -125,11 +149,17 @@ pub fn run() -> Result<(), String> {
             def::ClockCommands::List {
                 paths,
                 exclude_globs,
+                filter,
+                ignore_case,
+                has_property,
                 json,
             } => {
                 let opts = action::clock::ListOptions {
                     paths,
                     exclude_globs,
+                    filter,
+                    ignore_case,
+                    has_property,
                     json,
                 };
                 let exit_code = action::clock::run_list(opts)?;

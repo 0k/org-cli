@@ -1,0 +1,29 @@
+* TODO TODO Billing task :urgent:
+:PROPERTIES:
+:TASK_REF: 248
+:CUSTOM_ID: bill-248
+:END:
+:LOGBOOK:
+CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15
+:END:
+
+* Notes heading
+:LOGBOOK:
+CLOCK: [2025-06-06 Fri 12:00 +0200]--[2025-06-06 Fri 12:30 +0200] =>  0:30
+:END:
+
+** TODO TODO Nested task
+:PROPERTIES:
+:TASK_REF: 314
+:END:
+:LOGBOOK:
+CLOCK: [2025-06-06 Fri 13:00 +0200]--[2025-06-06 Fri 14:00 +0200] =>  1:00
+:END:
+
+* done admin :ops:
+:PROPERTIES:
+:OWNER: val
+:END:
+:LOGBOOK:
+CLOCK: [2025-06-06 Fri 15:00 +0200]--[2025-06-06 Fri 15:15 +0200] =>  0:15
+:END:

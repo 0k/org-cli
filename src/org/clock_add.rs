@@ -26,6 +26,8 @@
 
 use serde::Serialize;
 
+use crate::org::heading::{Heading, iter_headings};
+
 /// What to look up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadingQuery {
@@ -101,66 +103,53 @@ impl std::error::Error for FindError {}
 /// multiple matches surface as `Ambiguous`.
 pub fn find_heading(content: &str, query: &HeadingQuery) -> Result<HeadingHit, FindError> {
     match query {
-        HeadingQuery::TaskRef(n) => find_by_task_ref(content, *n),
-        HeadingQuery::Substring(s) => find_by_substring(content, s),
-    }
-}
-
-/// True for lines like `:TASK_REF: 248`.
-fn task_ref_match(line: &str, n: u64) -> bool {
-    let t = line.trim();
-    let Some(rest) = t.strip_prefix(":TASK_REF:") else {
-        return false;
-    };
-    let rest = rest.trim();
-    rest.parse::<u64>().map(|m| m == n).unwrap_or(false)
-}
-
-fn find_by_task_ref(content: &str, n: u64) -> Result<HeadingHit, FindError> {
-    let lines: Vec<&str> = content.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        if !task_ref_match(line, n) {
-            continue;
-        }
-        // Walk back to the nearest preceding heading.
-        for j in (0..=i).rev() {
-            if let Some(h) = parse_heading_line(lines[j], j + 1) {
-                return Ok(h);
+        HeadingQuery::TaskRef(n) => iter_headings(content)
+            .find(|heading| task_ref_matches(heading, *n))
+            .and_then(|heading| heading_hit(content, &heading))
+            .ok_or_else(|| FindError::NotFound {
+                what: format!(":TASK_REF: {}", n),
+            }),
+        HeadingQuery::Substring(needle) => {
+            let lower = needle.to_lowercase();
+            let hits = iter_headings(content)
+                .filter(|heading| heading.title.to_lowercase().contains(&lower))
+                .filter_map(|heading| heading_hit(content, &heading))
+                .collect::<Vec<_>>();
+            match hits.len() {
+                0 => Err(FindError::NotFound {
+                    what: needle.to_string(),
+                }),
+                1 => Ok(hits.into_iter().next().ok_or_else(|| FindError::NotFound {
+                    what: needle.to_string(),
+                })?),
+                _ => Err(FindError::Ambiguous {
+                    what: needle.to_string(),
+                    hits,
+                }),
             }
         }
-        // Property without a heading above it is malformed; we
-        // treat it as "not found" rather than panic.
-        break;
     }
-    Err(FindError::NotFound {
-        what: format!(":TASK_REF: {}", n),
-    })
 }
 
-fn find_by_substring(content: &str, needle: &str) -> Result<HeadingHit, FindError> {
-    let lower = needle.to_lowercase();
-    let mut hits = Vec::new();
-    for (i, line) in content.lines().enumerate() {
-        let Some(h) = parse_heading_line(line, i + 1) else {
-            continue;
-        };
-        if heading_title(&h.raw, h.level)
-            .to_lowercase()
-            .contains(&lower)
-        {
-            hits.push(h);
-        }
-    }
-    match hits.len() {
-        0 => Err(FindError::NotFound {
-            what: needle.to_string(),
-        }),
-        1 => Ok(hits.into_iter().next().unwrap()),
-        _ => Err(FindError::Ambiguous {
-            what: needle.to_string(),
-            hits,
-        }),
-    }
+fn task_ref_matches(heading: &Heading, n: u64) -> bool {
+    heading
+        .properties
+        .get("TASK_REF")
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value == n)
+        .unwrap_or(false)
+}
+
+fn heading_hit(content: &str, heading: &Heading) -> Option<HeadingHit> {
+    let line_index = heading.line.checked_sub(1)?;
+    let level = usize::try_from(heading.level).ok()?;
+    let raw = content.lines().nth(line_index)?.to_string();
+
+    Some(HeadingHit {
+        line: heading.line,
+        raw,
+        level,
+    })
 }
 
 /// Parse a single line as a heading. Returns `None` for non-headings.
@@ -182,53 +171,6 @@ fn parse_heading_line(line: &str, line_no: usize) -> Option<HeadingHit> {
         raw: line.to_string(),
         level,
     })
-}
-
-/// Extract the title text from a heading line, stripping the
-/// leading stars + space, the TODO keyword (if any), and the
-/// trailing `:tag:tag:` block (if any).
-fn heading_title(raw: &str, level: usize) -> String {
-    // Strip the leading "*** " (level + 1 chars).
-    let after_stars = &raw[(level + 1).min(raw.len())..];
-    // Optional TODO keyword: a leading word made of uppercase
-    // ASCII followed by a space.
-    let after_todo = match after_stars.split_once(' ') {
-        Some((kw, rest))
-            if !kw.is_empty()
-                && kw
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c == '-' || c == '_') =>
-        {
-            // Only treat as TODO keyword if it looks like one
-            // (heuristic — Emacs doesn't ship a fixed list).
-            // Pure single-uppercase words are accepted; longer
-            // titles starting with an all-caps acronym would
-            // also be treated as TODO, which is acceptable false
-            // positive (caller would then pass a more specific
-            // substring).
-            rest
-        }
-        _ => after_stars,
-    };
-    // Trailing tags block: " :tag1:tag2:" anchored to end.
-    let trimmed = after_todo.trim_end();
-    let title = if let Some(idx) = trimmed.rfind(' ') {
-        let possible_tags = &trimmed[idx + 1..];
-        if possible_tags.starts_with(':')
-            && possible_tags.ends_with(':')
-            && possible_tags.len() >= 2
-            && possible_tags[1..possible_tags.len() - 1]
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '@' || c == ':')
-        {
-            trimmed[..idx].trim_end()
-        } else {
-            trimmed
-        }
-    } else {
-        trimmed
-    };
-    title.to_string()
 }
 
 /// What [`find_logbook`] returns when the heading already has a

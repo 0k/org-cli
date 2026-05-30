@@ -33,6 +33,62 @@ cargo build --release
 org-cli --help
 #+end_src
 
+* Commands
+
+** =headings= — list headings, optionally filtered
+
+List headings from one or more org files. Without filters, prints every
+heading; with filters, prints only those that match. When no path is
+given, reads the agenda set from
+=~/.cache/emacs/org-collect/org-agenda-files.tmp=.
+
+#+begin_src bash
+# List every heading (human-readable, with line numbers)
+org-cli headings path/to/file.org
+
+# Only headings carrying a :TASK_REF: property (repeatable, AND)
+org-cli headings --has-property TASK_REF path/
+
+# Title regex with case-insensitive match
+org-cli headings -f "billing" -i path/
+
+# Combine filters (AND); emit NDJSON for downstream tools
+org-cli headings -f "billing" -i --has-property TASK_REF -j path/
+
+# Exclude files by glob (repeatable)
+org-cli headings --exclude '**/archive/**' path/
+#+end_src
+
+NDJSON records carry =file=, =level=, =line=, =title=, =tags=,
+=properties= (full property map). NUL records use the fixed-field
+layout =level\0line\0file\0title\0tags\0\0=.
+
+** =clock list= — list CLOCK lines, optionally filtered by parent heading
+
+In its default form, =clock list= is a flat scanner emitting every
+valid CLOCK line. When any heading filter is set (=--has-property=,
+=-f= / =--filter=, =-i= / =--ignore-case=), traversal becomes
+heading-aware: only CLOCKs whose enclosing heading matches are kept,
+and each emitted NDJSON record gains a =heading= field with the
+parent's =level=, =line=, =title=, =tags=, =properties=.
+
+#+begin_src bash
+# Every CLOCK line (unchanged behavior)
+org-cli clock list path/
+
+# Only CLOCKs under :TASK_REF: headings (with parent heading embedded)
+org-cli clock list --has-property TASK_REF -j path/
+
+# Only CLOCKs under headings whose title matches "billing" (case-insensitive)
+org-cli clock list -f "billing" -i -j path/
+
+# Combine filters (AND)
+org-cli clock list -f "billing" -i --has-property TASK_REF -j path/
+#+end_src
+
+With no heading filter, NDJSON output is byte-identical to the
+pre-filter shape — existing consumers are unaffected.
+
 * Development
 
 See [[file:AGENTS.md][AGENTS.md]] for development guidelines.

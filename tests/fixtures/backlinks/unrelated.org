@@ -1,0 +1,3 @@
+* Unrelated
+This file links elsewhere: [[file:source-a.org][a]] and a web
+link [[https://example.com][example]]. It does NOT link target.org.

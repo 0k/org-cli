@@ -6,6 +6,7 @@
 //! Cross-subcommand utilities (filesystem traversal, …) live in
 //! sibling helper modules like [`walk`].
 
+pub mod backlinks;
 pub mod check;
 pub mod clock;
 pub mod headings;

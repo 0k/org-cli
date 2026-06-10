@@ -112,6 +112,45 @@ pub enum Commands {
         directory_references_all_children: bool,
     },
 
+    /// Find every org file that links to TARGET via a
+    /// `[[file:...]]` reference (reverse link-graph query /
+    /// "backlinks").
+    ///
+    /// TARGET and every scanned link are canonicalized the same
+    /// way, so a link written `[[file:../target.org]]` from a
+    /// nested directory matches a TARGET given as `target.org` from
+    /// the root — something a naive `grep` cannot do.
+    ///
+    /// Exits 0 when at least one backlink is found, 1 when none are
+    /// (the inverse of `check`/`orphans`: here "no backlinks" is the
+    /// notable result, useful for asserting a file *is* referenced
+    /// before deleting it).
+    ///
+    /// v1 considers only `[[file:...]]` links; content references
+    /// (`#+INCLUDE:`, `id:` links, raw text) are out of scope.
+    Backlinks {
+        /// The file to find backlinks for.
+        target: std::path::PathBuf,
+
+        /// Files or directories giving the link-graph scope (which
+        /// org files to scan for links). Directories are walked
+        /// recursively; only `*.org` files are inspected.
+        #[arg(default_value = ".")]
+        paths: Vec<std::path::PathBuf>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per backlink).
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Stop at the first backlink found.
+        #[arg(short = '1', long)]
+        first: bool,
+    },
+
     /// List headings across org files with optional title/property filters.
     Headings {
         /// Files or directories to scan. When omitted, the agenda

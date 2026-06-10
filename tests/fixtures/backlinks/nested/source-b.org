@@ -1,0 +1,3 @@
+* Source B
+A relative reference up one level:
+[[file:../target.org::*Target][target heading]].

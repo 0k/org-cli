@@ -1,0 +1,2 @@
+* Source A
+See [[file:target.org][the target]] for the details.

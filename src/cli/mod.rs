@@ -83,6 +83,26 @@ pub fn run() -> Result<(), String> {
             }
             Ok(())
         }
+        Some(def::Commands::Backlinks {
+            target,
+            paths,
+            nul,
+            json,
+            first,
+        }) => {
+            let opts = action::backlinks::BacklinksOptions {
+                target,
+                paths,
+                nul,
+                json,
+                first,
+            };
+            let exit_code = action::backlinks::run(opts)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Some(def::Commands::Headings {
             paths,
             exclude,

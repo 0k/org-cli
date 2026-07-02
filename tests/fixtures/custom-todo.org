@@ -1,0 +1,6 @@
+#+TODO: TODO WIP | DONE CANCELED
+
+* TODO Plan the sprint
+* WIP Implement feature
+* CANCELED Abandoned idea
+* Plain heading without keyword

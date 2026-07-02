@@ -183,6 +183,14 @@ pub enum Commands {
         #[arg(long)]
         todo: bool,
 
+        /// Space-separated TODO keyword spec applied to files without an
+        /// in-buffer ``#+TODO:`` declaration, e.g.
+        /// ``"TODO WIP | DONE CANCELED"``. Words before ``|`` are active
+        /// states, after are done states; without ``|`` the last word is
+        /// the done state.
+        #[arg(long = "todo-keywords", value_name = "SPEC")]
+        todo_keywords: Option<String>,
+
         /// NUL-separated record output (for safe shell piping).
         #[arg(short = '0', conflicts_with = "json")]
         nul: bool,

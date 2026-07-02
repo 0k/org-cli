@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 
 use orgize::{
-    Org,
+    ParseConfig,
     ast::Headline as OrgHeadline,
     rowan::{TextSize, ast::AstNode},
 };
+
+use crate::org::todo_keywords::TodoKeywords;
 
 /// A heading extracted from an org-mode file, including its property drawer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,8 +15,12 @@ pub struct Heading {
     pub line: usize,
     /// The org-mode TODO keyword (e.g. `TODO`, `DONE`), if present.
     ///
-    /// Only the keywords recognized by orgize's default `ParseConfig`
-    /// (namely `TODO` and `DONE`) are extracted; `None` otherwise.
+    /// Which words count as keywords depends on the [`TodoKeywords`] set
+    /// passed to [`iter_headings_with`]. The plain [`iter_headings`]
+    /// wrapper uses the default set (`TODO`/`DONE`); a custom set — from
+    /// an in-buffer `#+TODO:` declaration or a CLI spec — extends this to
+    /// recognize words like `WIP` or `CANCELED`. `None` when the heading
+    /// carries no recognized keyword.
     pub keyword: Option<String>,
     pub title: String,
     pub tags: Vec<String>,
@@ -63,8 +69,29 @@ impl LineIndex {
 /// Property keys are preserved exactly as written. Lookups against
 /// `Heading::properties` are therefore case-sensitive, matching orgize's
 /// `Headline::properties().get(key)` behavior.
+///
+/// Uses the default TODO keyword set (`TODO`/`DONE`). Call
+/// [`iter_headings_with`] to recognize custom keywords.
 pub fn iter_headings(content: &str) -> impl Iterator<Item = Heading> + '_ {
-    let org = Org::parse(content);
+    iter_headings_with(content, &TodoKeywords::default())
+}
+
+/// Walk every heading in `content`, recognizing `keywords` as TODO
+/// states.
+///
+/// Behaves like [`iter_headings`] but builds a [`ParseConfig`] whose
+/// `todo_keywords` are taken from `keywords`, so custom active/done
+/// words (e.g. `WIP`, `CANCELED`) populate [`Heading::keyword`] instead
+/// of being folded into the title.
+pub fn iter_headings_with<'a>(
+    content: &'a str,
+    keywords: &TodoKeywords,
+) -> impl Iterator<Item = Heading> + use<'a> {
+    let config = ParseConfig {
+        todo_keywords: (keywords.active.clone(), keywords.done.clone()),
+        ..Default::default()
+    };
+    let org = config.parse(content);
     let line_index = LineIndex::new(content);
     org.document()
         .syntax()
@@ -141,7 +168,8 @@ fn byte_offset(content: &str, offset: TextSize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Heading, LineIndex, heading_for_line, iter_headings};
+    use super::{Heading, LineIndex, heading_for_line, iter_headings, iter_headings_with};
+    use crate::org::todo_keywords::TodoKeywords;
     use indoc::indoc;
     use std::collections::BTreeMap;
 
@@ -272,6 +300,28 @@ mod tests {
                     properties: BTreeMap::new(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn iter_headings_with_custom_set_extracts_wip_and_canceled() {
+        let content = indoc! {"
+            * WIP Working task
+            * CANCELED Dropped task
+            * Plain heading
+        "};
+        let keywords = TodoKeywords {
+            active: vec!["TODO".to_string(), "WIP".to_string()],
+            done: vec!["DONE".to_string(), "CANCELED".to_string()],
+        };
+
+        let keywords_seen: Vec<Option<String>> = iter_headings_with(content, &keywords)
+            .map(|heading| heading.keyword)
+            .collect();
+
+        assert_eq!(
+            keywords_seen,
+            vec![Some("WIP".to_string()), Some("CANCELED".to_string()), None,]
         );
     }
 

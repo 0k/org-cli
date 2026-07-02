@@ -9,7 +9,8 @@ use serde::Serialize;
 
 use crate::cli::action::clock::resolve_input_files;
 use crate::org::filter::FilterOptions;
-use crate::org::heading::iter_headings;
+use crate::org::heading::iter_headings_with;
+use crate::org::todo_keywords::{TodoKeywords, parse_spec, scan_buffer};
 
 #[derive(Debug, Clone)]
 pub struct HeadingsOptions {
@@ -22,6 +23,9 @@ pub struct HeadingsOptions {
     pub keyword: Vec<String>,
     /// Keep only headings that carry any TODO keyword (`--todo`).
     pub todo: bool,
+    /// Raw `--todo-keywords` spec string applied to files that lack an
+    /// in-buffer `#+TODO:` declaration. `None` uses the default set.
+    pub todo_keywords: Option<String>,
     pub nul: bool,
     pub json: bool,
 }
@@ -33,6 +37,9 @@ struct HeadingRecord {
     line: usize,
     /// The org-mode TODO keyword, if any (serialized as `null` when absent).
     keyword: Option<String>,
+    /// Whether `keyword` is a *done* (terminal) state for the file's
+    /// effective keyword set. `None` when the heading carries no keyword.
+    done: Option<bool>,
     title: String,
     tags: Vec<String>,
     properties: BTreeMap<String, String>,
@@ -41,6 +48,7 @@ struct HeadingRecord {
 pub fn run(opts: HeadingsOptions) -> Result<i32, String> {
     let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
     let filter = build_filter(&opts)?;
+    let cli_keywords = resolve_cli_keywords(&opts)?;
     let mut stdout = io::BufWriter::new(io::stdout());
 
     let mut records = Vec::new();
@@ -52,17 +60,27 @@ pub fn run(opts: HeadingsOptions) -> Result<i32, String> {
                 continue;
             }
         };
+        // Per-file resolution: an in-buffer declaration overrides the
+        // CLI value, which overrides the default set (Emacs semantics).
+        let keywords = scan_buffer(&content).unwrap_or_else(|| cli_keywords.clone());
         records.extend(
-            iter_headings(&content)
+            iter_headings_with(&content, &keywords)
                 .filter(|heading| filter.matches(heading))
-                .map(|heading| HeadingRecord {
-                    file: file.clone(),
-                    level: heading.level,
-                    line: heading.line,
-                    keyword: heading.keyword,
-                    title: heading.title,
-                    tags: heading.tags,
-                    properties: heading.properties,
+                .map(|heading| {
+                    let done = heading
+                        .keyword
+                        .as_ref()
+                        .map(|kw| keywords.done.contains(kw));
+                    HeadingRecord {
+                        file: file.clone(),
+                        level: heading.level,
+                        line: heading.line,
+                        keyword: heading.keyword,
+                        done,
+                        title: heading.title,
+                        tags: heading.tags,
+                        properties: heading.properties,
+                    }
                 }),
         );
     }
@@ -70,6 +88,18 @@ pub fn run(opts: HeadingsOptions) -> Result<i32, String> {
     write_records(&mut stdout, &records, &opts)?;
     stdout.flush().map_err(|e| e.to_string())?;
     Ok(0)
+}
+
+/// Resolve the CLI-provided `--todo-keywords` spec into a
+/// [`TodoKeywords`], falling back to the default set when unset.
+///
+/// This is the file-independent baseline; an in-buffer `#+TODO:`
+/// declaration takes precedence over it per file (see [`run`]).
+fn resolve_cli_keywords(opts: &HeadingsOptions) -> Result<TodoKeywords, String> {
+    match &opts.todo_keywords {
+        Some(spec) => parse_spec(spec),
+        None => Ok(TodoKeywords::default()),
+    }
 }
 
 fn build_filter(opts: &HeadingsOptions) -> Result<FilterOptions, String> {
@@ -119,13 +149,20 @@ fn write_nul<W: Write>(out: &mut W, records: &[HeadingRecord]) -> Result<(), Str
     for record in records {
         let tags = record.tags.join(",");
         let keyword = record.keyword.as_deref().unwrap_or("");
+        // `done`: `1`/`0` when a keyword is present, empty otherwise.
+        let done = match record.done {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "",
+        };
         write!(
             out,
-            "{}\0{}\0{}\0{}\0{}\0{}\0\0",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0\0",
             record.level,
             record.line,
             record.file.display(),
             keyword,
+            done,
             record.title,
             tags,
         )
@@ -202,7 +239,7 @@ mod tests {
         tags: &[&str],
         properties: &[(&str, &str)],
     ) -> HeadingRecord {
-        record_kw(file, level, line, None, title, tags, properties)
+        record_kw(file, level, line, None, None, title, tags, properties)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -211,6 +248,7 @@ mod tests {
         level: u32,
         line: usize,
         keyword: Option<&str>,
+        done: Option<bool>,
         title: &str,
         tags: &[&str],
         properties: &[(&str, &str)],
@@ -220,6 +258,7 @@ mod tests {
             level,
             line,
             keyword: keyword.map(str::to_string),
+            done,
             title: title.to_string(),
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             properties: properties
@@ -238,6 +277,7 @@ mod tests {
             has_property: Vec::new(),
             keyword: Vec::new(),
             todo: false,
+            todo_keywords: None,
             nul,
             json,
         }
@@ -276,8 +316,26 @@ mod tests {
     #[test]
     fn human_formatter_renders_keyword_between_stars_and_title() {
         let records = vec![
-            record_kw("/tmp/a.org", 1, 1, Some("TODO"), "Buy milk", &["home"], &[]),
-            record_kw("/tmp/a.org", 1, 2, Some("DONE"), "Ship it", &[], &[]),
+            record_kw(
+                "/tmp/a.org",
+                1,
+                1,
+                Some("TODO"),
+                Some(false),
+                "Buy milk",
+                &["home"],
+                &[],
+            ),
+            record_kw(
+                "/tmp/a.org",
+                1,
+                2,
+                Some("DONE"),
+                Some(true),
+                "Ship it",
+                &[],
+                &[],
+            ),
             record("/tmp/a.org", 1, 3, "Plain", &[], &[]),
         ];
         let mut out = Vec::new();
@@ -310,7 +368,7 @@ mod tests {
 
         assert_eq!(
             out,
-            b"2\x0017\x00/tmp/a.org\x00\x00Nested\x00ops,low\x00\x00"
+            b"2\x0017\x00/tmp/a.org\x00\x00\x00Nested\x00ops,low\x00\x00"
         );
     }
 
@@ -321,6 +379,7 @@ mod tests {
             1,
             1,
             Some("TODO"),
+            Some(false),
             "Buy milk",
             &["home"],
             &[],
@@ -331,7 +390,7 @@ mod tests {
 
         assert_eq!(
             out,
-            b"1\x001\x00/tmp/a.org\x00TODO\x00Buy milk\x00home\x00\x00"
+            b"1\x001\x00/tmp/a.org\x00TODO\x000\x00Buy milk\x00home\x00\x00"
         );
     }
 
@@ -350,7 +409,7 @@ mod tests {
         write_records(&mut out, &records, &opts(false, true)).unwrap();
 
         let actual = String::from_utf8(out).unwrap();
-        let expected = "{\"file\":\"/tmp/a.org\",\"level\":2,\"line\":17,\"keyword\":null,\"title\":\"Nested\",\"tags\":[\"ops\"],\"properties\":{\"CUSTOM_ID\":\"cid\",\"TASK_REF\":\"248\"}}\n";
+        let expected = "{\"file\":\"/tmp/a.org\",\"level\":2,\"line\":17,\"keyword\":null,\"done\":null,\"title\":\"Nested\",\"tags\":[\"ops\"],\"properties\":{\"CUSTOM_ID\":\"cid\",\"TASK_REF\":\"248\"}}\n";
         assert_output_eq(&actual, expected);
     }
 
@@ -361,6 +420,7 @@ mod tests {
             1,
             1,
             Some("TODO"),
+            Some(false),
             "Buy milk",
             &[],
             &[],
@@ -370,7 +430,7 @@ mod tests {
         write_records(&mut out, &records, &opts(false, true)).unwrap();
 
         let actual = String::from_utf8(out).unwrap();
-        let expected = "{\"file\":\"/tmp/a.org\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"title\":\"Buy milk\",\"tags\":[],\"properties\":{}}\n";
+        let expected = "{\"file\":\"/tmp/a.org\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"done\":false,\"title\":\"Buy milk\",\"tags\":[],\"properties\":{}}\n";
         assert_output_eq(&actual, expected);
     }
 
@@ -393,6 +453,7 @@ mod tests {
             has_property: vec!["TASK_REF".to_string()],
             keyword: Vec::new(),
             todo: false,
+            todo_keywords: None,
             nul: false,
             json: false,
         };
@@ -418,6 +479,7 @@ mod tests {
             has_property: Vec::new(),
             keyword: Vec::new(),
             todo: false,
+            todo_keywords: None,
             nul: false,
             json: false,
         };

@@ -111,6 +111,7 @@ pub fn run() -> Result<(), String> {
             has_property,
             keyword,
             todo,
+            todo_keywords,
             nul,
             json,
         }) => {
@@ -122,6 +123,7 @@ pub fn run() -> Result<(), String> {
                 has_property,
                 keyword,
                 todo,
+                todo_keywords,
                 nul,
                 json,
             };

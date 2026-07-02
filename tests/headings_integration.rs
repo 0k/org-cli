@@ -12,6 +12,26 @@ fn fixture_path() -> PathBuf {
         .join("task-ref.org")
 }
 
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
+
+/// Collect the `title` field of every NDJSON record on stdout.
+fn titles_of(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["title"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
 #[test]
 fn headings_has_property_returns_expected_set() {
     let fixture = fixture_path();
@@ -145,8 +165,8 @@ fn headings_json_output_matches_expected_bytes() {
     let actual = String::from_utf8(out.stdout).unwrap();
     let expected = format!(
         concat!(
-            "{{\"file\":\"{}\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"title\":\"TODO Billing task\",\"tags\":[\"urgent\"],\"properties\":{{\"CUSTOM_ID\":\"bill-248\",\"TASK_REF\":\"248\"}}}}\n",
-            "{{\"file\":\"{}\",\"level\":2,\"line\":15,\"keyword\":\"TODO\",\"title\":\"TODO Nested task\",\"tags\":[],\"properties\":{{\"TASK_REF\":\"314\"}}}}\n"
+            "{{\"file\":\"{}\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"done\":false,\"title\":\"TODO Billing task\",\"tags\":[\"urgent\"],\"properties\":{{\"CUSTOM_ID\":\"bill-248\",\"TASK_REF\":\"248\"}}}}\n",
+            "{{\"file\":\"{}\",\"level\":2,\"line\":15,\"keyword\":\"TODO\",\"done\":false,\"title\":\"TODO Nested task\",\"tags\":[],\"properties\":{{\"TASK_REF\":\"314\"}}}}\n"
         ),
         fixture.display(),
         fixture.display()
@@ -258,7 +278,7 @@ fn headings_nul_output_matches_expected_bytes() {
 
     assert_eq!(out.status.code(), Some(0));
     let expected = format!(
-        "1\0{}\0{}\0TODO\0TODO Billing task\0urgent\0\02\0{}\0{}\0TODO\0TODO Nested task\0\0\0",
+        "1\0{}\0{}\0TODO\00\0TODO Billing task\0urgent\0\02\0{}\0{}\0TODO\00\0TODO Nested task\0\0\0",
         1,
         fixture.display(),
         15,
@@ -266,6 +286,157 @@ fn headings_nul_output_matches_expected_bytes() {
     )
     .into_bytes();
     assert_eq!(out.stdout, expected);
+}
+
+#[test]
+fn headings_in_buffer_declaration_recognizes_custom_keywords() {
+    let file = fixture("custom-todo.org");
+    let out = Command::new(bin_path())
+        .arg("headings")
+        .arg("--todo")
+        .arg("-j")
+        .arg(&file)
+        .output()
+        .expect("spawn org-cli");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    // --todo keeps only the three keyworded headings (WIP/CANCELED are
+    // now recognized thanks to the in-buffer #+TODO: declaration).
+    let keywords: Vec<&str> = records
+        .iter()
+        .map(|r| r["keyword"].as_str().unwrap())
+        .collect();
+    assert_eq!(keywords, vec!["TODO", "WIP", "CANCELED"]);
+
+    // done reflects the file's effective done set (DONE, CANCELED).
+    let by_keyword = |kw: &str| -> &serde_json::Value {
+        records
+            .iter()
+            .find(|r| r["keyword"] == kw)
+            .unwrap_or_else(|| panic!("no record with keyword {kw}"))
+    };
+    assert_eq!(by_keyword("WIP")["done"], serde_json::json!(false));
+    assert_eq!(by_keyword("CANCELED")["done"], serde_json::json!(true));
+    assert_eq!(by_keyword("TODO")["done"], serde_json::json!(false));
+}
+
+#[test]
+fn headings_keyword_flag_exact_matches_custom_keyword() {
+    let file = fixture("custom-todo.org");
+    let out = Command::new(bin_path())
+        .arg("headings")
+        .arg("--keyword")
+        .arg("WIP")
+        .arg("-j")
+        .arg(&file)
+        .output()
+        .expect("spawn org-cli");
+
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "stdout was:\n{}", stdout);
+    let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(record["keyword"], "WIP");
+    assert_eq!(record["title"], "Implement feature");
+    assert_eq!(record["done"], serde_json::json!(false));
+}
+
+#[test]
+fn headings_todo_keywords_flag_recognizes_custom_keyword() {
+    let file = fixture("no-todo-decl.org");
+    let out = Command::new(bin_path())
+        .arg("headings")
+        .arg("--todo-keywords")
+        .arg("TODO WIP | DONE")
+        .arg("--todo")
+        .arg("-j")
+        .arg(&file)
+        .output()
+        .expect("spawn org-cli");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        titles_of(&stdout),
+        vec![
+            "Plan the sprint".to_string(),
+            "Implement feature".to_string()
+        ]
+    );
+}
+
+#[test]
+fn headings_without_declaration_or_flag_keeps_wip_in_title() {
+    let file = fixture("no-todo-decl.org");
+    let out = Command::new(bin_path())
+        .arg("headings")
+        .arg("-j")
+        .arg(&file)
+        .output()
+        .expect("spawn org-cli");
+
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    // WIP is NOT a default keyword: it stays folded into the title.
+    let wip = records
+        .iter()
+        .find(|r| r["title"] == "WIP Implement feature")
+        .expect("WIP heading should keep keyword in title");
+    assert_eq!(wip["keyword"], serde_json::Value::Null);
+    assert_eq!(wip["done"], serde_json::Value::Null);
+}
+
+#[test]
+fn headings_in_buffer_declaration_wins_over_flag() {
+    // File declares TODO WIP | DONE CANCELED. A conflicting flag that
+    // omits WIP must be ignored: the in-buffer declaration wins, so WIP
+    // is still recognized as a keyword.
+    let file = fixture("custom-todo.org");
+    let out = Command::new(bin_path())
+        .arg("headings")
+        .arg("--todo-keywords")
+        .arg("TODO | DONE")
+        .arg("--keyword")
+        .arg("WIP")
+        .arg("-j")
+        .arg(&file)
+        .output()
+        .expect("spawn org-cli");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "stdout was:\n{}", stdout);
+    let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(record["keyword"], "WIP");
+    assert_eq!(record["title"], "Implement feature");
 }
 
 #[test]

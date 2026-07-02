@@ -1,0 +1,3 @@
+* TODO Plan the sprint
+* WIP Implement feature
+* Plain heading without keyword

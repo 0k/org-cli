@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use log::warn;
 use regex::RegexBuilder;
 use serde::Serialize;
 
@@ -44,8 +45,13 @@ pub fn run(opts: HeadingsOptions) -> Result<i32, String> {
 
     let mut records = Vec::new();
     for file in &files {
-        let content = fs::read_to_string(file)
-            .map_err(|e| format!("cannot read {}: {}", file.display(), e))?;
+        let content = match fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("cannot read {}: {}", file.display(), e);
+                continue;
+            }
+        };
         records.extend(
             iter_headings(&content)
                 .filter(|heading| filter.matches(heading))

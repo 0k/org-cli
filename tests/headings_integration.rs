@@ -267,3 +267,68 @@ fn headings_nul_output_matches_expected_bytes() {
     .into_bytes();
     assert_eq!(out.stdout, expected);
 }
+
+#[test]
+fn headings_skips_unreadable_file_and_continues() {
+    // A directory containing one valid org file and one non-UTF-8
+    // file. The run must skip the unreadable file with a warning
+    // instead of aborting: exit 0, valid heading present, invalid
+    // file's content absent.
+    let dir = std::env::temp_dir().join(format!(
+        "org-cli-headings-skip-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let good = dir.join("good.org");
+    std::fs::write(&good, "* Valid heading\n").unwrap();
+
+    // Non-UTF-8 bytes: 0xE9 is `é` in ISO-8859-1, invalid UTF-8.
+    let bad = dir.join("bad.org");
+    std::fs::write(&bad, b"* Caf\xe9\n").unwrap();
+
+    let out = Command::new(bin_path())
+        .arg("headings")
+        .arg("-j")
+        .arg(&dir)
+        .output()
+        .expect("spawn org-cli");
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "run must not abort; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        stdout
+    );
+
+    let titles: Vec<String> = stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["title"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(
+        titles,
+        vec!["Valid heading".to_string()],
+        "only the valid file's heading must appear; stdout={}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("Caf"),
+        "the unreadable file's headings must be absent; stdout={}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

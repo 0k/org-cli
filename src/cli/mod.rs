@@ -109,6 +109,8 @@ pub fn run() -> Result<(), String> {
             filter,
             ignore_case,
             has_property,
+            keyword,
+            todo,
             nul,
             json,
         }) => {
@@ -118,6 +120,8 @@ pub fn run() -> Result<(), String> {
                 filter,
                 ignore_case,
                 has_property,
+                keyword,
+                todo,
                 nul,
                 json,
             };

@@ -145,13 +145,103 @@ fn headings_json_output_matches_expected_bytes() {
     let actual = String::from_utf8(out.stdout).unwrap();
     let expected = format!(
         concat!(
-            "{{\"file\":\"{}\",\"level\":1,\"line\":1,\"title\":\"TODO Billing task\",\"tags\":[\"urgent\"],\"properties\":{{\"CUSTOM_ID\":\"bill-248\",\"TASK_REF\":\"248\"}}}}\n",
-            "{{\"file\":\"{}\",\"level\":2,\"line\":15,\"title\":\"TODO Nested task\",\"tags\":[],\"properties\":{{\"TASK_REF\":\"314\"}}}}\n"
+            "{{\"file\":\"{}\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"title\":\"TODO Billing task\",\"tags\":[\"urgent\"],\"properties\":{{\"CUSTOM_ID\":\"bill-248\",\"TASK_REF\":\"248\"}}}}\n",
+            "{{\"file\":\"{}\",\"level\":2,\"line\":15,\"keyword\":\"TODO\",\"title\":\"TODO Nested task\",\"tags\":[],\"properties\":{{\"TASK_REF\":\"314\"}}}}\n"
         ),
         fixture.display(),
         fixture.display()
     );
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn headings_todo_flag_keeps_only_keyworded_headings() {
+    let fixture = fixture_path();
+    let out = Command::new(bin_path())
+        .arg("headings")
+        .arg("--todo")
+        .arg("-j")
+        .arg(&fixture)
+        .output()
+        .expect("spawn org-cli");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let keywords: Vec<String> = stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["keyword"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        keywords,
+        vec!["TODO".to_string(), "TODO".to_string(), "DONE".to_string()]
+    );
+}
+
+#[test]
+fn headings_keyword_flag_exact_matches_only() {
+    let fixture = fixture_path();
+    let out = Command::new(bin_path())
+        .arg("headings")
+        .arg("--keyword")
+        .arg("DONE")
+        .arg("-j")
+        .arg(&fixture)
+        .output()
+        .expect("spawn org-cli");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "stdout was:\n{}", stdout);
+    let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(record["keyword"], "DONE");
+    assert_eq!(record["title"], "Archived task");
+}
+
+#[test]
+fn headings_keyword_flag_is_repeatable() {
+    let fixture = fixture_path();
+    let out = Command::new(bin_path())
+        .arg("headings")
+        .arg("--keyword")
+        .arg("TODO")
+        .arg("--keyword")
+        .arg("DONE")
+        .arg("-j")
+        .arg(&fixture)
+        .output()
+        .expect("spawn org-cli");
+
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let keywords: Vec<String> = stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["keyword"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        keywords,
+        vec!["TODO".to_string(), "TODO".to_string(), "DONE".to_string()]
+    );
 }
 
 #[test]
@@ -168,7 +258,7 @@ fn headings_nul_output_matches_expected_bytes() {
 
     assert_eq!(out.status.code(), Some(0));
     let expected = format!(
-        "1\0{}\0{}\0TODO Billing task\0urgent\0\02\0{}\0{}\0TODO Nested task\0\0\0",
+        "1\0{}\0{}\0TODO\0TODO Billing task\0urgent\0\02\0{}\0{}\0TODO\0TODO Nested task\0\0\0",
         1,
         fixture.display(),
         15,

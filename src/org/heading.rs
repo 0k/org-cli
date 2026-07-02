@@ -11,6 +11,11 @@ use orgize::{
 pub struct Heading {
     pub level: u32,
     pub line: usize,
+    /// The org-mode TODO keyword (e.g. `TODO`, `DONE`), if present.
+    ///
+    /// Only the keywords recognized by orgize's default `ParseConfig`
+    /// (namely `TODO` and `DONE`) are extracted; `None` otherwise.
+    pub keyword: Option<String>,
     pub title: String,
     pub tags: Vec<String>,
     pub properties: BTreeMap<String, String>,
@@ -62,6 +67,7 @@ pub fn heading_for_line(content: &str, line: usize) -> Option<Heading> {
 fn build_heading(content: &str, headline: OrgHeadline) -> Option<Heading> {
     let level = u32::try_from(headline.level()).ok()?;
     let line = line_number(content, headline.start());
+    let keyword = headline.todo_keyword().map(|token| token.to_string());
     let title = headline.title_raw().trim().to_string();
     let tags = headline.tags().map(|tag| tag.to_string()).collect();
     let properties = headline
@@ -77,6 +83,7 @@ fn build_heading(content: &str, headline: OrgHeadline) -> Option<Heading> {
     Some(Heading {
         level,
         line,
+        keyword,
         title,
         tags,
         properties,
@@ -117,6 +124,7 @@ mod tests {
             Parent body.
             ** Child heading
             Child body.
+            * DONE Finished sibling
             * Sibling
         "};
 
@@ -127,6 +135,7 @@ mod tests {
                 Heading {
                     level: 1,
                     line: 1,
+                    keyword: Some("TODO".to_string()),
                     title: "Parent heading".to_string(),
                     tags: vec!["work".to_string(), "client".to_string()],
                     properties: props(&[("CUSTOM_ID", "parent-id"), ("TASK_REF", "248")]),
@@ -134,6 +143,7 @@ mod tests {
                 Heading {
                     level: 2,
                     line: 7,
+                    keyword: None,
                     title: "Child heading".to_string(),
                     tags: vec![],
                     properties: BTreeMap::new(),
@@ -141,6 +151,15 @@ mod tests {
                 Heading {
                     level: 1,
                     line: 9,
+                    keyword: Some("DONE".to_string()),
+                    title: "Finished sibling".to_string(),
+                    tags: vec![],
+                    properties: BTreeMap::new(),
+                },
+                Heading {
+                    level: 1,
+                    line: 10,
+                    keyword: None,
                     title: "Sibling".to_string(),
                     tags: vec![],
                     properties: BTreeMap::new(),

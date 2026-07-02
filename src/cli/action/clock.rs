@@ -754,6 +754,8 @@ fn build_heading_filter(opts: &ListOptions) -> Result<FilterOptions, String> {
         pattern,
         ignore_case: opts.ignore_case,
         has_properties: opts.has_property.clone(),
+        keywords: Vec::new(),
+        todo_only: false,
     })
 }
 

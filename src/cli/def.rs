@@ -175,6 +175,14 @@ pub enum Commands {
         #[arg(long = "has-property", value_name = "NAME")]
         has_property: Vec<String>,
 
+        /// Keep only headings whose TODO keyword matches exactly. Repeatable.
+        #[arg(short = 'k', long = "keyword", value_name = "KEYWORD")]
+        keyword: Vec<String>,
+
+        /// Keep only headings that carry any TODO keyword.
+        #[arg(long)]
+        todo: bool,
+
         /// NUL-separated record output (for safe shell piping).
         #[arg(short = '0', conflicts_with = "json")]
         nul: bool,

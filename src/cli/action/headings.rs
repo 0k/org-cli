@@ -17,6 +17,10 @@ pub struct HeadingsOptions {
     pub filter: Option<String>,
     pub ignore_case: bool,
     pub has_property: Vec<String>,
+    /// Exact-match TODO keyword filter (repeatable `--keyword`).
+    pub keyword: Vec<String>,
+    /// Keep only headings that carry any TODO keyword (`--todo`).
+    pub todo: bool,
     pub nul: bool,
     pub json: bool,
 }
@@ -26,6 +30,8 @@ struct HeadingRecord {
     file: PathBuf,
     level: u32,
     line: usize,
+    /// The org-mode TODO keyword, if any (serialized as `null` when absent).
+    keyword: Option<String>,
     title: String,
     tags: Vec<String>,
     properties: BTreeMap<String, String>,
@@ -47,6 +53,7 @@ pub fn run(opts: HeadingsOptions) -> Result<i32, String> {
                     file: file.clone(),
                     level: heading.level,
                     line: heading.line,
+                    keyword: heading.keyword,
                     title: heading.title,
                     tags: heading.tags,
                     properties: heading.properties,
@@ -74,6 +81,8 @@ fn build_filter(opts: &HeadingsOptions) -> Result<FilterOptions, String> {
         pattern,
         ignore_case: opts.ignore_case,
         has_properties: opts.has_property.clone(),
+        keywords: opts.keyword.clone(),
+        todo_only: opts.todo,
     })
 }
 
@@ -103,12 +112,14 @@ fn write_json<W: Write>(out: &mut W, records: &[HeadingRecord]) -> Result<(), St
 fn write_nul<W: Write>(out: &mut W, records: &[HeadingRecord]) -> Result<(), String> {
     for record in records {
         let tags = record.tags.join(",");
+        let keyword = record.keyword.as_deref().unwrap_or("");
         write!(
             out,
-            "{}\0{}\0{}\0{}\0{}\0\0",
+            "{}\0{}\0{}\0{}\0{}\0{}\0\0",
             record.level,
             record.line,
             record.file.display(),
+            keyword,
             record.title,
             tags,
         )
@@ -135,12 +146,12 @@ fn write_human<W: Write>(out: &mut W, records: &[HeadingRecord]) -> Result<(), S
         } else {
             format!(" :{}:", record.tags.join(":"))
         };
-        writeln!(
-            out,
-            "{:>4}: {} {}{}",
-            record.line, stars, record.title, tags
-        )
-        .map_err(|e| e.to_string())?;
+        let title = match &record.keyword {
+            Some(keyword) => format!("{} {}", keyword, record.title),
+            None => record.title.clone(),
+        };
+        writeln!(out, "{:>4}: {} {}{}", record.line, stars, title, tags)
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -185,10 +196,24 @@ mod tests {
         tags: &[&str],
         properties: &[(&str, &str)],
     ) -> HeadingRecord {
+        record_kw(file, level, line, None, title, tags, properties)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_kw(
+        file: &str,
+        level: u32,
+        line: usize,
+        keyword: Option<&str>,
+        title: &str,
+        tags: &[&str],
+        properties: &[(&str, &str)],
+    ) -> HeadingRecord {
         HeadingRecord {
             file: PathBuf::from(file),
             level,
             line,
+            keyword: keyword.map(str::to_string),
             title: title.to_string(),
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             properties: properties
@@ -205,6 +230,8 @@ mod tests {
             filter: None,
             ignore_case: false,
             has_property: Vec::new(),
+            keyword: Vec::new(),
+            todo: false,
             nul,
             json,
         }
@@ -241,6 +268,27 @@ mod tests {
     }
 
     #[test]
+    fn human_formatter_renders_keyword_between_stars_and_title() {
+        let records = vec![
+            record_kw("/tmp/a.org", 1, 1, Some("TODO"), "Buy milk", &["home"], &[]),
+            record_kw("/tmp/a.org", 1, 2, Some("DONE"), "Ship it", &[], &[]),
+            record("/tmp/a.org", 1, 3, "Plain", &[], &[]),
+        ];
+        let mut out = Vec::new();
+
+        write_records(&mut out, &records, &opts(false, false)).unwrap();
+
+        let actual = String::from_utf8(out).unwrap();
+        let expected = indoc! {"
+            /tmp/a.org:
+               1: * TODO Buy milk :home:
+               2: * DONE Ship it
+               3: * Plain
+        "};
+        assert_output_eq(&actual, expected);
+    }
+
+    #[test]
     fn nul_formatter_renders_expected_bytes() {
         let records = vec![record(
             "/tmp/a.org",
@@ -254,7 +302,31 @@ mod tests {
 
         write_records(&mut out, &records, &opts(true, false)).unwrap();
 
-        assert_eq!(out, b"2\x0017\x00/tmp/a.org\x00Nested\x00ops,low\x00\x00");
+        assert_eq!(
+            out,
+            b"2\x0017\x00/tmp/a.org\x00\x00Nested\x00ops,low\x00\x00"
+        );
+    }
+
+    #[test]
+    fn nul_formatter_renders_keyword_field_when_present() {
+        let records = vec![record_kw(
+            "/tmp/a.org",
+            1,
+            1,
+            Some("TODO"),
+            "Buy milk",
+            &["home"],
+            &[],
+        )];
+        let mut out = Vec::new();
+
+        write_records(&mut out, &records, &opts(true, false)).unwrap();
+
+        assert_eq!(
+            out,
+            b"1\x001\x00/tmp/a.org\x00TODO\x00Buy milk\x00home\x00\x00"
+        );
     }
 
     #[test]
@@ -272,7 +344,27 @@ mod tests {
         write_records(&mut out, &records, &opts(false, true)).unwrap();
 
         let actual = String::from_utf8(out).unwrap();
-        let expected = "{\"file\":\"/tmp/a.org\",\"level\":2,\"line\":17,\"title\":\"Nested\",\"tags\":[\"ops\"],\"properties\":{\"CUSTOM_ID\":\"cid\",\"TASK_REF\":\"248\"}}\n";
+        let expected = "{\"file\":\"/tmp/a.org\",\"level\":2,\"line\":17,\"keyword\":null,\"title\":\"Nested\",\"tags\":[\"ops\"],\"properties\":{\"CUSTOM_ID\":\"cid\",\"TASK_REF\":\"248\"}}\n";
+        assert_output_eq(&actual, expected);
+    }
+
+    #[test]
+    fn ndjson_formatter_renders_keyword_field_when_present() {
+        let records = vec![record_kw(
+            "/tmp/a.org",
+            1,
+            1,
+            Some("TODO"),
+            "Buy milk",
+            &[],
+            &[],
+        )];
+        let mut out = Vec::new();
+
+        write_records(&mut out, &records, &opts(false, true)).unwrap();
+
+        let actual = String::from_utf8(out).unwrap();
+        let expected = "{\"file\":\"/tmp/a.org\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"title\":\"Buy milk\",\"tags\":[],\"properties\":{}}\n";
         assert_output_eq(&actual, expected);
     }
 
@@ -293,6 +385,8 @@ mod tests {
             filter: Some("todo".to_string()),
             ignore_case: true,
             has_property: vec!["TASK_REF".to_string()],
+            keyword: Vec::new(),
+            todo: false,
             nul: false,
             json: false,
         };
@@ -316,6 +410,8 @@ mod tests {
             filter: Some("(".to_string()),
             ignore_case: false,
             has_property: Vec::new(),
+            keyword: Vec::new(),
+            todo: false,
             nul: false,
             json: false,
         };

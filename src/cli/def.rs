@@ -244,6 +244,33 @@ pub enum Commands {
         #[command(subcommand)]
         action: ClockCommands,
     },
+
+    /// Run the long-lived TODO index daemon: watch org files, keep the
+    /// sqlite index in sync, and serve an HTTP snapshot + SSE push
+    /// stream (`GET /api/todos`, `GET /sse/todos`).
+    ///
+    /// When PATHS is omitted, the agenda set is read from
+    /// `~/.cache/emacs/org-collect/org-agenda-files.tmp` and the
+    /// agenda file itself is watched for membership changes. Runs
+    /// until interrupted (Ctrl-C).
+    #[cfg(feature = "server")]
+    Daemon {
+        /// Files or directories to watch. When omitted, the agenda
+        /// set is used.
+        paths: Vec<std::path::PathBuf>,
+
+        /// TCP address to bind. Overrides the config
+        /// `todos: serve-addr:` and the built-in default
+        /// (`127.0.0.1:7480`).
+        #[arg(long = "addr", value_name = "ADDR")]
+        addr: Option<String>,
+
+        /// Path to the sqlite index. Overrides the config
+        /// `todos: db-path:` and the built-in default
+        /// (`~/.cache/org-cli/todos.sqlite`).
+        #[arg(long = "db", value_name = "PATH")]
+        db: Option<std::path::PathBuf>,
+    },
 }
 
 /// `org-cli clock <action>` sub-actions.

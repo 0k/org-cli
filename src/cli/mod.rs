@@ -260,5 +260,15 @@ pub fn run() -> Result<(), String> {
                 grid,
             }),
         },
+
+        #[cfg(feature = "server")]
+        Some(def::Commands::Daemon { paths, addr, db }) => {
+            let opts = action::daemon::DaemonOptions { paths, addr, db };
+            let exit_code = action::daemon::run(opts)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
     }
 }

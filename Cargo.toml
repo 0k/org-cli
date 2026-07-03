@@ -5,7 +5,18 @@ edition = "2024"
 description = "CLI for querying and editing org-mode files"
 license = "MIT"
 
+[features]
+# `server` (in default) compiles the daemon: the tokio/axum/kal-sse
+# HTTP+SSE serving layer plus the `daemon` subcommand. Building with
+# `--no-default-features` strips all three heavy dependencies and the
+# `daemon` action, leaving the pure-sync core (index + watch) intact —
+# the strippability requirement of plan 09 (see `src/serve` and
+# `src/watch` module docs).
+default = ["server"]
+server = ["dep:tokio", "dep:axum", "dep:kal-sse"]
+
 [dependencies]
+axum = { version = "0.8", optional = true }
 chrono = "0.4"
 chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
@@ -13,7 +24,9 @@ colored = "2"
 dirs = "5"
 fern = "0.6"
 glob = "0.3"
+kal-sse = { git = "https://github.com/0k/kal-sse", rev = "30b279606e505892ad46e097b17a713b6235dd30", features = ["axum"], optional = true }
 log = "0.4"
+notify = "6"
 orgize = "0.10.0-alpha.10"
 percent-encoding = "2"
 regex = "1"
@@ -22,8 +35,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 time = { version = "0.3", features = ["std", "local-offset", "formatting"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "signal",
+], optional = true }
 walkdir = "2"
 
 [dev-dependencies]
 indoc = "2"
+reqwest = { version = "0.12", features = ["blocking"] }
 similar = "2"

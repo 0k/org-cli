@@ -7,5 +7,6 @@ pub mod clock;
 pub mod clock_add;
 pub mod filter;
 pub mod heading;
+pub mod heading_edit;
 pub mod link;
 pub mod todo_keywords;

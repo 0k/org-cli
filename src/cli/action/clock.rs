@@ -17,12 +17,11 @@ use std::path::{Path, PathBuf};
 use chrono::NaiveDate;
 use chrono::{Local, NaiveDateTime, NaiveTime, Timelike};
 use colored::*;
-use glob::Pattern;
 use log::{debug, warn};
 use regex::RegexBuilder;
 use serde::Serialize;
 
-use crate::cli::action::walk::collect_org_files;
+use crate::cli::action::walk::resolve_input_files;
 use crate::config::Config;
 use crate::org::clock::{
     check_accepted_zones, fix_weekday_in_line, format_clock_line, parse_clock_line,
@@ -131,39 +130,6 @@ pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
 
     writer.finish(violation_count).map_err(|e| e.to_string())?;
     Ok(if violation_count == 0 { 0 } else { 1 })
-}
-
-/// Default location of the agenda-set file (the org-collect output).
-fn default_agenda_set_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("cannot determine home directory")?;
-    Ok(home.join(".cache/emacs/org-collect/org-agenda-files.tmp"))
-}
-
-/// Read an agenda-set file: one absolute path per line, blank lines
-/// and lines beginning with `#` are ignored.
-pub fn read_agenda_set(p: &Path) -> Result<Vec<PathBuf>, String> {
-    let content = fs::read_to_string(p)
-        .map_err(|e| format!("cannot read agenda set {}: {}", p.display(), e))?;
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let s = line.trim();
-        if s.is_empty() || s.starts_with('#') {
-            continue;
-        }
-        out.push(PathBuf::from(s));
-    }
-    Ok(out)
-}
-
-fn compile_globs(raw: &[String]) -> Result<Vec<Pattern>, String> {
-    raw.iter()
-        .map(|g| Pattern::new(g).map_err(|e| format!("invalid --exclude glob {:?}: {}", g, e)))
-        .collect()
-}
-
-fn path_excluded(p: &Path, patterns: &[Pattern]) -> bool {
-    let s = p.to_string_lossy();
-    patterns.iter().any(|pat| pat.matches(&s))
 }
 
 /// Wraps stdout and selects the right serializer per CLI flags.
@@ -424,44 +390,6 @@ fn emit_fix_record(
             rec.to,
         )
     }
-}
-
-/// Shared input resolver used by `check` and `fix`.
-pub(crate) fn resolve_input_files(
-    paths: &[PathBuf],
-    exclude_globs: &[String],
-) -> Result<Vec<PathBuf>, String> {
-    let raw = if paths.is_empty() {
-        let agenda = default_agenda_set_path()?;
-        debug!("no PATHS given; using agenda set {}", agenda.display());
-        let listed = read_agenda_set(&agenda)?;
-        let inputs: Vec<PathBuf> = listed
-            .into_iter()
-            .filter(|p| {
-                if !p.exists() {
-                    warn!("agenda set entry not found, skipping: {}", p.display());
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-        if inputs.is_empty() {
-            return Err(format!(
-                "agenda set at {} resolved to zero existing paths",
-                agenda.display()
-            ));
-        }
-        collect_org_files(&inputs)?
-    } else {
-        collect_org_files(paths)?
-    };
-
-    let patterns = compile_globs(exclude_globs)?;
-    Ok(raw
-        .into_iter()
-        .filter(|p| !path_excluded(p, &patterns))
-        .collect())
 }
 
 // =====================================================================
@@ -1787,28 +1715,6 @@ mod tests {
             "Asia/Shanghai".parse().unwrap(),
         ];
         assert!(guard_accepted_zone_at(dt, 330, &zones).is_err());
-    }
-
-    // ----- agenda set loader --------------------------------------------
-
-    #[test]
-    fn read_agenda_set_skips_blank_and_comments() {
-        let td = TempDir::new("agenda");
-        let f = td.path().join("agenda.tmp");
-        write(&f, "/tmp/one.org\n\n# a comment\n/tmp/two.org\n   \n");
-        let v = read_agenda_set(&f).unwrap();
-        assert_eq!(
-            v,
-            vec![PathBuf::from("/tmp/one.org"), PathBuf::from("/tmp/two.org")]
-        );
-    }
-
-    #[test]
-    fn read_agenda_set_errors_on_missing_file() {
-        let td = TempDir::new("agenda-missing");
-        let bogus = td.path().join("nope.tmp");
-        let err = read_agenda_set(&bogus).unwrap_err();
-        assert!(err.contains("cannot read"), "got: {}", err);
     }
 
     // ----- fmt ----------------------------------------------------------

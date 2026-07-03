@@ -7,7 +7,7 @@ use log::warn;
 use regex::RegexBuilder;
 use serde::Serialize;
 
-use crate::cli::action::clock::resolve_input_files;
+use crate::cli::action::walk::resolve_input_files;
 use crate::org::filter::FilterOptions;
 use crate::org::heading::iter_headings_with;
 use crate::org::todo_keywords::{TodoKeywords, parse_spec, scan_buffer};

@@ -11,4 +11,5 @@ pub mod check;
 pub mod clock;
 pub mod headings;
 pub mod orphans;
+pub mod todos;
 pub mod walk;

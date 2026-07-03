@@ -200,6 +200,45 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Sync org-mode TODO headings into a fast sqlite index, then
+    /// list/query them.
+    ///
+    /// When PATHS is omitted, the agenda set is read from
+    /// `~/.cache/emacs/org-collect/org-agenda-files.tmp`. The index
+    /// is refreshed incrementally (only changed files are reparsed)
+    /// before the query runs, unless `--no-sync` is given.
+    Todos {
+        /// Files or directories to scan. When omitted, the agenda
+        /// set is used.
+        paths: Vec<std::path::PathBuf>,
+
+        /// Case-insensitive substring match against the heading title.
+        #[arg(long = "search", value_name = "STR")]
+        search: Option<String>,
+
+        /// Keep only TODOs whose keyword matches exactly.
+        #[arg(short = 'k', long = "keyword", value_name = "KW")]
+        keyword: Option<String>,
+
+        /// Skip the incremental sync; query the index as-is.
+        #[arg(long = "no-sync")]
+        no_sync: bool,
+
+        /// Path to the sqlite index. Overrides the config
+        /// `todos: db-path:` and the built-in default
+        /// (`~/.cache/org-cli/todos.sqlite`).
+        #[arg(long = "db", value_name = "PATH")]
+        db: Option<std::path::PathBuf>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', long = "nul", conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per TODO).
+        #[arg(short = 'j', long, conflicts_with = "nul")]
+        json: bool,
+    },
+
     /// Lint and format org-mode `CLOCK:` lines.
     Clock {
         #[command(subcommand)]

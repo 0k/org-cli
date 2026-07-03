@@ -133,6 +133,30 @@ pub fn run() -> Result<(), String> {
             }
             Ok(())
         }
+        Some(def::Commands::Todos {
+            paths,
+            search,
+            keyword,
+            no_sync,
+            db,
+            nul,
+            json,
+        }) => {
+            let opts = action::todos::TodosOptions {
+                paths,
+                search,
+                keyword,
+                no_sync,
+                db,
+                nul,
+                json,
+            };
+            let exit_code = action::todos::run(opts)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Some(def::Commands::Clock { action: clock_cmd }) => match clock_cmd {
             def::ClockCommands::Check {
                 paths,

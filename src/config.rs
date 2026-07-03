@@ -10,6 +10,9 @@
 //!   accepted-zones:
 //!     - Europe/Paris
 //!     - Asia/Shanghai
+//! todos:
+//!   db-path: ~/.cache/org-cli/todos.sqlite
+//!   serve-addr: 127.0.0.1:7480
 //! ```
 //!
 //! When the file or any key is missing, the corresponding check
@@ -26,6 +29,8 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub clock: ClockConfig,
+    #[serde(default)]
+    pub todos: TodosConfig,
 }
 
 /// `clock:` sub-section of the config.
@@ -50,6 +55,51 @@ impl ClockConfig {
             })
             .collect()
     }
+}
+
+/// `todos:` sub-section of the config.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TodosConfig {
+    /// Where the sqlite index lives. When unset, callers fall back
+    /// to [`default_todos_db_path`].
+    #[serde(default, rename = "db-path")]
+    pub db_path: Option<PathBuf>,
+    /// TCP address the `daemon` HTTP+SSE server binds to. When unset,
+    /// callers fall back to [`DEFAULT_SERVE_ADDR`].
+    #[serde(default, rename = "serve-addr")]
+    pub serve_addr: Option<String>,
+}
+
+/// Built-in default bind address for `org-cli daemon`.
+pub const DEFAULT_SERVE_ADDR: &str = "127.0.0.1:7480";
+
+impl TodosConfig {
+    /// Resolve the effective sqlite index path: the configured
+    /// `db-path` when set, else the built-in default under the user
+    /// cache directory.
+    pub fn resolve_db_path(&self) -> Result<PathBuf, String> {
+        match &self.db_path {
+            Some(p) => Ok(p.clone()),
+            None => default_todos_db_path(),
+        }
+    }
+
+    /// Resolve the effective daemon bind address: the configured
+    /// `serve-addr` when set, else [`DEFAULT_SERVE_ADDR`].
+    pub fn resolve_serve_addr(&self) -> String {
+        self.serve_addr
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SERVE_ADDR.to_string())
+    }
+}
+
+/// The built-in default index location:
+/// `$XDG_CACHE_HOME/org-cli/todos.sqlite`
+/// (or `~/.cache/org-cli/todos.sqlite` if XDG is unset).
+pub fn default_todos_db_path() -> Result<PathBuf, String> {
+    dirs::cache_dir()
+        .map(|d| d.join("org-cli").join("todos.sqlite"))
+        .ok_or_else(|| "cannot determine cache directory".to_string())
 }
 
 impl Config {
@@ -173,6 +223,54 @@ mod tests {
     fn invalid_yaml_is_a_hard_error() {
         let p = write_temp("bad", "clock: {accepted-zones: [unclosed\n");
         assert!(Config::load_from(&p).is_err());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn parses_dash_cased_todos_db_path() {
+        let p = write_temp("todos-db", "todos:\n  db-path: /custom/todos.sqlite\n");
+        let c = Config::load_from(&p).unwrap();
+        assert_eq!(c.todos.db_path, Some(PathBuf::from("/custom/todos.sqlite")));
+        assert_eq!(
+            c.todos.resolve_db_path().unwrap(),
+            PathBuf::from("/custom/todos.sqlite")
+        );
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn todos_db_path_defaults_when_unset() {
+        let c = TodosConfig::default();
+        let resolved = c.resolve_db_path().unwrap();
+        assert!(
+            resolved.ends_with("org-cli/todos.sqlite"),
+            "got {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn parses_dash_cased_serve_addr() {
+        let p = write_temp("serve-addr", "todos:\n  serve-addr: 0.0.0.0:9999\n");
+        let c = Config::load_from(&p).unwrap();
+        assert_eq!(c.todos.serve_addr.as_deref(), Some("0.0.0.0:9999"));
+        assert_eq!(c.todos.resolve_serve_addr(), "0.0.0.0:9999");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn serve_addr_defaults_when_unset() {
+        let c = TodosConfig::default();
+        assert_eq!(c.resolve_serve_addr(), "127.0.0.1:7480");
+    }
+
+    #[test]
+    fn rejects_underscore_todos_key() {
+        // ``db_path`` (underscored) must be ignored; the schema
+        // demands ``db-path`` (dash-cased).
+        let p = write_temp("todos-underscore", "todos:\n  db_path: /x.sqlite\n");
+        let c = Config::load_from(&p).unwrap();
+        assert!(c.todos.db_path.is_none());
         std::fs::remove_file(p).ok();
     }
 }

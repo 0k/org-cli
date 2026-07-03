@@ -11,6 +11,7 @@ pub mod check;
 pub mod clock;
 #[cfg(feature = "server")]
 pub mod daemon;
+pub mod heading;
 pub mod headings;
 pub mod orphans;
 pub mod todos;

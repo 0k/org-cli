@@ -261,6 +261,16 @@ pub fn run() -> Result<(), String> {
             }),
         },
 
+        Some(def::Commands::Heading {
+            action: heading_cmd,
+        }) => {
+            let exit_code = dispatch_heading(heading_cmd)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
+
         #[cfg(feature = "server")]
         Some(def::Commands::Daemon { paths, addr, db }) => {
             let opts = action::daemon::DaemonOptions { paths, addr, db };
@@ -270,5 +280,113 @@ pub fn run() -> Result<(), String> {
             }
             Ok(())
         }
+    }
+}
+
+/// Dispatch the `heading` sub-actions to their orchestration functions.
+/// Factored out of [`run`] because `heading` has four subcommands, each
+/// with a wide option set.
+fn dispatch_heading(cmd: def::HeadingCommands) -> Result<i32, String> {
+    match cmd {
+        def::HeadingCommands::Set {
+            file,
+            path,
+            line,
+            keyword,
+            no_keyword,
+            title,
+            add_tag,
+            remove_tag,
+            set_tags,
+            property,
+            unset_property,
+            content,
+            content_file,
+            write,
+            json,
+            nul,
+        } => action::heading::run_set(action::heading::SetOptions {
+            file,
+            path,
+            line,
+            keyword,
+            no_keyword,
+            title,
+            add_tag,
+            remove_tag,
+            set_tags,
+            property,
+            unset_property,
+            content,
+            content_file,
+            write,
+            json,
+            nul,
+        }),
+        def::HeadingCommands::Add {
+            file,
+            under,
+            position,
+            keyword,
+            title,
+            tag,
+            property,
+            content,
+            content_file,
+            write,
+            json,
+            nul,
+        } => action::heading::run_add(action::heading::AddOptions {
+            file,
+            under,
+            position,
+            keyword,
+            title,
+            tag,
+            property,
+            content,
+            content_file,
+            write,
+            json,
+            nul,
+        }),
+        def::HeadingCommands::Delete {
+            file,
+            path,
+            line,
+            write,
+            json,
+            nul,
+        } => action::heading::run_delete(action::heading::DeleteOptions {
+            file,
+            path,
+            line,
+            write,
+            json,
+            nul,
+        }),
+        def::HeadingCommands::Move {
+            file,
+            path,
+            line,
+            to_file,
+            under,
+            top_level,
+            position,
+            write,
+            json,
+            nul,
+        } => action::heading::run_move(action::heading::MoveOptions {
+            file,
+            path,
+            line,
+            to_file,
+            under,
+            top_level,
+            position,
+            write,
+            json,
+            nul,
+        }),
     }
 }

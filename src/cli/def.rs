@@ -245,6 +245,18 @@ pub enum Commands {
         action: ClockCommands,
     },
 
+    /// Edit org-mode headings: change keyword/title/tags/properties/
+    /// content, add a heading, delete a subtree, or move a subtree
+    /// within or across files.
+    ///
+    /// Dry-run by default (prints a unified diff); pass `--write` to
+    /// apply the change atomically. `-j` emits one NDJSON `EditRecord`
+    /// per applied op, `-0` NUL-separated records.
+    Heading {
+        #[command(subcommand)]
+        action: HeadingCommands,
+    },
+
     /// Run the long-lived TODO index daemon: watch org files, keep the
     /// sqlite index in sync, and serve an HTTP snapshot + SSE push
     /// stream (`GET /api/todos`, `GET /sse/todos`).
@@ -443,5 +455,218 @@ pub enum ClockCommands {
         /// disables rounding. Mutually exclusive with --seconds.
         #[arg(long, default_value_t = 0)]
         grid: u32,
+    },
+}
+
+/// `org-cli heading <action>` sub-actions.
+#[derive(Subcommand, Debug)]
+pub enum HeadingCommands {
+    /// Edit fields of one existing heading, addressed by PATH or
+    /// `--line N`. Field edits are applied in a fixed order (keyword,
+    /// title, tags, properties, content). At least one edit flag is
+    /// required.
+    Set {
+        /// Target org file.
+        file: std::path::PathBuf,
+
+        /// Heading path (`A/B/C`; `\/` escapes a literal slash in a
+        /// title). Mutually exclusive with `--line`.
+        #[arg(value_name = "PATH", conflicts_with = "line")]
+        path: Option<String>,
+
+        /// Target the heading on this 1-based line number instead of
+        /// a path.
+        #[arg(long, value_name = "N")]
+        line: Option<usize>,
+
+        /// Set the TODO keyword (validated against the file's keyword
+        /// set). Mutually exclusive with `--no-keyword`.
+        #[arg(long, value_name = "KW", conflicts_with = "no_keyword")]
+        keyword: Option<String>,
+
+        /// Remove the TODO keyword.
+        #[arg(long)]
+        no_keyword: bool,
+
+        /// Replace the title text.
+        #[arg(long, value_name = "T")]
+        title: Option<String>,
+
+        /// Add a tag (merged with existing tags). Repeatable.
+        /// Mutually exclusive with `--set-tags`.
+        #[arg(long = "add-tag", value_name = "T", conflicts_with = "set_tags")]
+        add_tag: Vec<String>,
+
+        /// Remove a tag (from existing tags). Repeatable. Mutually
+        /// exclusive with `--set-tags`.
+        #[arg(long = "remove-tag", value_name = "T", conflicts_with = "set_tags")]
+        remove_tag: Vec<String>,
+
+        /// Replace ALL tags with this comma-separated list. Pass an
+        /// empty string to remove all tags. Mutually exclusive with
+        /// `--add-tag`/`--remove-tag`.
+        #[arg(long = "set-tags", value_name = "T,T")]
+        set_tags: Option<String>,
+
+        /// Set a property `KEY=VALUE`. Repeatable.
+        #[arg(long = "property", value_name = "K=V")]
+        property: Vec<String>,
+
+        /// Remove a property by key. Repeatable.
+        #[arg(long = "unset-property", value_name = "K")]
+        unset_property: Vec<String>,
+
+        /// Replace the section body with STR (`-` reads stdin).
+        /// Mutually exclusive with `--content-file`.
+        #[arg(long, value_name = "STR", conflicts_with = "content_file")]
+        content: Option<String>,
+
+        /// Replace the section body with the contents of a file.
+        #[arg(long = "content-file", value_name = "F")]
+        content_file: Option<std::path::PathBuf>,
+
+        /// Apply the edit in place (atomic write). Without this flag
+        /// the command is a dry-run and prints a unified diff.
+        #[arg(long)]
+        write: bool,
+
+        /// NDJSON output (one `EditRecord` per applied op).
+        #[arg(short = 'j', long, conflicts_with = "nul")]
+        json: bool,
+
+        /// NUL-separated record output.
+        #[arg(short = '0', long = "nul", conflicts_with = "json")]
+        nul: bool,
+    },
+
+    /// Add a new heading under an optional parent PATH at a chosen
+    /// position among its direct children.
+    Add {
+        /// Target org file.
+        file: std::path::PathBuf,
+
+        /// Parent heading path. When omitted, the heading is added at
+        /// the top level.
+        #[arg(long = "under", value_name = "PATH")]
+        under: Option<String>,
+
+        /// Position among the parent's direct children:
+        /// `first`, `last`, `before=N`, or `after=N` (1-based).
+        /// Defaults to `last`.
+        #[arg(long, value_name = "POS", default_value = "last")]
+        position: String,
+
+        /// TODO keyword for the new heading.
+        #[arg(long, value_name = "KW")]
+        keyword: Option<String>,
+
+        /// Title of the new heading (required).
+        #[arg(long, value_name = "T")]
+        title: String,
+
+        /// Tag for the new heading. Repeatable.
+        #[arg(long = "tag", value_name = "T")]
+        tag: Vec<String>,
+
+        /// Property `KEY=VALUE` for the new heading. Repeatable.
+        #[arg(long = "property", value_name = "K=V")]
+        property: Vec<String>,
+
+        /// Section body for the new heading (`-` reads stdin).
+        /// Mutually exclusive with `--content-file`.
+        #[arg(long, value_name = "STR", conflicts_with = "content_file")]
+        content: Option<String>,
+
+        /// Section body from a file.
+        #[arg(long = "content-file", value_name = "F")]
+        content_file: Option<std::path::PathBuf>,
+
+        /// Apply the edit in place (atomic write). Without this flag
+        /// the command is a dry-run and prints a unified diff.
+        #[arg(long)]
+        write: bool,
+
+        /// NDJSON output.
+        #[arg(short = 'j', long, conflicts_with = "nul")]
+        json: bool,
+
+        /// NUL-separated record output.
+        #[arg(short = '0', long = "nul", conflicts_with = "json")]
+        nul: bool,
+    },
+
+    /// Delete a heading and its full subtree, addressed by PATH or
+    /// `--line N`.
+    Delete {
+        /// Target org file.
+        file: std::path::PathBuf,
+
+        /// Heading path. Mutually exclusive with `--line`.
+        #[arg(value_name = "PATH", conflicts_with = "line")]
+        path: Option<String>,
+
+        /// Target the heading on this 1-based line number.
+        #[arg(long, value_name = "N")]
+        line: Option<usize>,
+
+        /// Apply the edit in place (atomic write). Without this flag
+        /// the command is a dry-run and prints a unified diff.
+        #[arg(long)]
+        write: bool,
+
+        /// NDJSON output.
+        #[arg(short = 'j', long, conflicts_with = "nul")]
+        json: bool,
+
+        /// NUL-separated record output.
+        #[arg(short = '0', long = "nul", conflicts_with = "json")]
+        nul: bool,
+    },
+
+    /// Move a heading (and its subtree) within the file or to another
+    /// file, re-leveling to the destination depth.
+    Move {
+        /// Source org file.
+        file: std::path::PathBuf,
+
+        /// Source heading path. Mutually exclusive with `--line`.
+        #[arg(value_name = "PATH", conflicts_with = "line")]
+        path: Option<String>,
+
+        /// Source heading 1-based line number.
+        #[arg(long, value_name = "N")]
+        line: Option<usize>,
+
+        /// Destination file. Defaults to the source file.
+        #[arg(long = "to-file", value_name = "FILE2")]
+        to_file: Option<std::path::PathBuf>,
+
+        /// Destination parent path (resolved in the destination file).
+        /// Mutually exclusive with `--top-level`.
+        #[arg(long = "under", value_name = "PATH2", conflicts_with = "top_level")]
+        under: Option<String>,
+
+        /// Move to the destination file's top level.
+        #[arg(long = "top-level")]
+        top_level: bool,
+
+        /// Position among the destination parent's direct children:
+        /// `first`, `last`, `before=N`, or `after=N`. Defaults to
+        /// `last`.
+        #[arg(long, value_name = "POS", default_value = "last")]
+        position: String,
+
+        /// Apply the edit in place (atomic write). Without this flag
+        /// the command is a dry-run and prints a unified diff.
+        #[arg(long)]
+        write: bool,
+
+        /// NDJSON output.
+        #[arg(short = 'j', long, conflicts_with = "nul")]
+        json: bool,
+
+        /// NUL-separated record output.
+        #[arg(short = '0', long = "nul", conflicts_with = "json")]
+        nul: bool,
     },
 }

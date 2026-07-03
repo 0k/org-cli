@@ -89,6 +89,44 @@ org-cli clock list -f "billing" -i --has-property TASK_REF -j path/
 With no heading filter, NDJSON output is byte-identical to the
 pre-filter shape — existing consumers are unaffected.
 
+** =heading= — edit headings (set / add / delete / move)
+
+Edit org-mode headings in place. A target heading is addressed either
+by a =/=-separated title path (=A/B/C=; write =\/= for a literal slash
+in a title) or by =--line N=. Every command is a *dry-run by default*,
+printing a unified diff; pass =--write= to apply the change atomically
+(temp file + rename in the same directory). =-j= emits one NDJSON
+=EditRecord= per applied op (with =file= and =dry_run= fields), =-0=
+NUL-separated =file\0op\0line\0\0= records. The rest of the file stays
+byte-for-byte untouched.
+
+#+begin_src bash
+# Set fields (applied in order: keyword, title, tags, properties, content)
+org-cli heading set file.org "Parent/Child" --keyword TODO --title "New title" --write
+org-cli heading set file.org --line 12 --add-tag urgent --remove-tag draft --write
+org-cli heading set file.org --line 12 --set-tags "a,b"        # "" removes all tags
+org-cli heading set file.org "Task" --property TASK_REF=248 --write
+org-cli heading set file.org "Task" --content - --write < body.txt   # or --content-file F
+
+# Add a heading under a parent at a position (first|last|before=N|after=N)
+org-cli heading add file.org --under "Parent" --position last --title "New child" --write
+org-cli heading add file.org --keyword TODO --title "Top level" --tag x --tag y --write
+
+# Delete a subtree
+org-cli heading delete file.org "Parent/Child" --write
+
+# Move a subtree within a file, or to another file (re-leveled to depth)
+org-cli heading move file.org "A/B" --under "A" --position after=2 --write
+org-cli heading move file.org "Moving" --to-file other.org --under "Dest" --write
+#+end_src
+
+The keyword set honours an in-buffer =#+TODO:= declaration (falling
+back to =TODO=/=DONE=); =--keyword= must name a keyword from that set.
+For =move=, positions are relative to the destination *after* the
+source subtree is removed. Cross-file moves write the destination
+first, then the source, so a crash between the two writes duplicates
+the subtree rather than losing it.
+
 * Development
 
 See [[file:AGENTS.md][AGENTS.md]] for development guidelines.

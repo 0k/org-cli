@@ -25,6 +25,19 @@
 //! file inside `foo/` (recursively) is treated as referenced. This
 //! is the "folder-as-citation-unit" mode useful for media folders
 //! and visit dossiers; off by default to avoid hiding real orphans.
+//!
+//! ## Why metadata links are deliberately excluded
+//!
+//! Unlike [`crate::cli::action::check`], this command counts only
+//! [`crate::org::link::LinkOrigin::Body`] links
+//! ([`crate::org::link::OriginPolicy::BodyOnly`]). The asymmetry is
+//! intentional and follows from the direction of the error: an extra
+//! edge here can only ever *suppress* an orphan report, never raise
+//! one. A link inside a `:LOGBOOK:` note recording that a document was
+//! superseded would, if counted, silently reclassify a genuinely
+//! forgotten file as referenced — turning a warning the user wants into
+//! a clean run. The same reasoning already governs the
+//! directory-reference flag being off by default.
 
 use std::collections::HashSet;
 use std::fs;
@@ -38,7 +51,7 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::cli::action::walk::collect_org_files;
-use crate::org::link::{ResolvedTarget, collect_referenced_paths};
+use crate::org::link::{OriginPolicy, ResolvedTarget, collect_referenced_paths};
 
 /// CLI options for the `orphans` subcommand.
 #[derive(Debug, Clone)]
@@ -83,8 +96,9 @@ pub fn run(opts: OrphansOptions) -> Result<i32, String> {
     debug!("scanning {} org file(s) for links", org_files.len());
 
     // Step 2: build the referenced set (resolved `[[file:...]]`
-    // targets from those org files).
-    let referenced = collect_referenced_paths(&org_files);
+    // targets from those org files). Body links only — see the
+    // module docs for why widening this set is unsafe here.
+    let referenced = collect_referenced_paths(&org_files, OriginPolicy::BodyOnly);
     debug!("found {} unique referenced target(s)", referenced.len());
 
     // Step 3: compile excludes once.
@@ -483,6 +497,62 @@ mod tests {
         // hub.org is itself unreferenced, plus orphan.org is too.
         // So we expect 2 orphans (hub + orphan); just assert exit=1.
         assert_eq!(run(opts_for(vec![td.path().to_path_buf()])).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_run_metadata_links_do_not_rescue_an_orphan() {
+        // The whole point of this command is to surface forgotten
+        // files. A property pointer or a drawer note must NOT silently
+        // mark a file as referenced, because that converts a warning
+        // the user wants into a clean run.
+        let td = TempDir::new("metadata-no-rescue");
+        write(&td.path().join("only-in-property.org"), "* H\n");
+        write(&td.path().join("only-in-drawer.org"), "* H\n");
+        write(
+            &td.path().join("hub.org"),
+            indoc::indoc! {"
+                * Visit
+                :PROPERTIES:
+                :PREDECESSOR: [[file:only-in-property.org][p]]
+                :END:
+                :LOGBOOK:
+                - note [[file:only-in-drawer.org][d]]
+                :END:
+            "},
+        );
+
+        let mut opts = opts_for(vec![td.path().to_path_buf()]);
+        opts.json = true;
+        assert_eq!(
+            run(opts).unwrap(),
+            1,
+            "both metadata-only targets stay orphans"
+        );
+
+        // And prove which files are orphans, not merely that some are.
+        let org_files = collect_org_files(&[td.path().to_path_buf()]).unwrap();
+        let referenced = collect_referenced_paths(&org_files, OriginPolicy::BodyOnly);
+        assert!(
+            referenced.is_empty(),
+            "no body link exists, so nothing is referenced: {:?}",
+            referenced
+        );
+    }
+
+    #[test]
+    fn test_run_body_link_still_rescues_a_file() {
+        // Guards the negative test above from passing vacuously.
+        let td = TempDir::new("body-rescues");
+        write(&td.path().join("linked.org"), "* H\n");
+        write(
+            &td.path().join("hub.org"),
+            "[[file:linked.org][l]] [[file:hub.org][h]]\n",
+        );
+        assert_eq!(
+            run(opts_for(vec![td.path().to_path_buf()])).unwrap(),
+            0,
+            "a body link marks its target referenced"
+        );
     }
 
     #[test]

@@ -24,6 +24,24 @@
 //! matches a target given as `target.org` from the root. This is the
 //! property a naive `grep` cannot provide.
 //!
+//! ## Which links count as a backlink
+//!
+//! Body links, plus a node-property value that is *nothing but* a link
+//! ([`crate::org::link::OriginPolicy::BodyAndPurePointers`]).
+//!
+//! The split follows this command's promise of *meaningful reverse
+//! navigation*. A property such as `:PREDECESSOR: [[file:prev.org]]`
+//! asserts a relation between two documents and is exactly what a
+//! reverse query should surface. A link buried inside a long narrative
+//! property value — a note observing that some report failed to mention
+//! a topic — is a citation inside prose; promoting it to an edge would
+//! inflate the reverse index with references the author never meant as
+//! navigation. Free-form drawer text is excluded for the same reason.
+//!
+//! [`crate::cli::action::check`] deliberately takes a wider view: it
+//! validates every followable link, including those narrative ones,
+//! because a broken pointer is a defect wherever it sits.
+//!
 //! ## v1 scope
 //!
 //! Only `[[file:...]]` links are considered (the same subset
@@ -40,7 +58,13 @@ use log::{debug, warn};
 use serde::Serialize;
 
 use crate::cli::action::walk::collect_org_files;
-use crate::org::link::{extract_file_links, resolve_target};
+use crate::org::link::{OriginPolicy, extract_file_links, resolve_target};
+
+/// Which links count as backlinks.
+///
+/// Body links, plus property values that are *nothing but* a link. See
+/// the module docs for the rationale.
+const POLICY: OriginPolicy = OriginPolicy::BodyAndPurePointers;
 
 /// CLI options received from `Commands::Backlinks`.
 #[derive(Debug, Clone)]
@@ -107,6 +131,9 @@ pub fn run(opts: BacklinksOptions) -> Result<i32, String> {
             .unwrap_or_else(|| PathBuf::from("."));
 
         for link in extract_file_links(&content) {
+            if !POLICY.admits(&link.origin) {
+                continue;
+            }
             let resolved = resolve_target(&source_dir, &link).path;
             if resolved != target {
                 continue;
@@ -329,6 +356,98 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(exit, 1, "only links to decoy.org → target has no backlinks");
+    }
+
+    // -----------------------------------------------------------------
+    // Metadata links: a pure-pointer property is a relation worth
+    // surfacing; a link inside narrative prose is not.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_run_detects_backlink_from_pure_pointer_property() {
+        let td = TempDir::new("pure-pointer");
+        write(&td.path().join("target.org"), "* H\n");
+        write(
+            &td.path().join("source.org"),
+            indoc::indoc! {"
+                * Visit
+                :PROPERTIES:
+                :PREDECESSOR: [[file:target.org][t]]
+                :END:
+            "},
+        );
+        let exit = run(opts_for(
+            td.path().join("target.org"),
+            vec![td.path().to_path_buf()],
+        ))
+        .unwrap();
+        assert_eq!(exit, 0, ":PREDECESSOR: asserts a relation → backlink");
+    }
+
+    #[test]
+    fn test_run_ignores_backlink_buried_in_narrative_property_value() {
+        let td = TempDir::new("narrative-prop");
+        write(&td.path().join("target.org"), "* H\n");
+        write(
+            &td.path().join("source.org"),
+            indoc::indoc! {"
+                * Visit
+                :PROPERTIES:
+                :TIMESTAMP_NOTE: le bilan cite [[file:target.org][t]] sans conclure
+                :END:
+            "},
+        );
+        let exit = run(opts_for(
+            td.path().join("target.org"),
+            vec![td.path().to_path_buf()],
+        ))
+        .unwrap();
+        assert_eq!(exit, 1, "a citation inside prose is not reverse navigation");
+    }
+
+    #[test]
+    fn test_run_ignores_backlink_in_free_form_drawer_text() {
+        let td = TempDir::new("drawer-text");
+        write(&td.path().join("target.org"), "* H\n");
+        write(
+            &td.path().join("source.org"),
+            indoc::indoc! {"
+                * Visit
+                :LOGBOOK:
+                - Note taken on [2026-08-17 Mon] see [[file:target.org][t]]
+                :END:
+            "},
+        );
+        let exit = run(opts_for(
+            td.path().join("target.org"),
+            vec![td.path().to_path_buf()],
+        ))
+        .unwrap();
+        assert_eq!(exit, 1, "free-form drawer notes are not relations");
+    }
+
+    #[test]
+    fn test_run_matches_tilde_prefixed_property_pointer() {
+        // Combines both fixes: a `~/`-prefixed pure pointer must
+        // resolve to the home directory and count as a backlink.
+        let home = dirs::home_dir().expect("home dir required");
+        let probe = home.join(".org-cli-backlinks-tilde-probe.org");
+        fs::write(&probe, "* H\n").expect("write probe in home");
+
+        let td = TempDir::new("tilde-pointer");
+        write(
+            &td.path().join("source.org"),
+            indoc::indoc! {"
+                * Visit
+                :PROPERTIES:
+                :PREDECESSOR: [[file:~/.org-cli-backlinks-tilde-probe.org][p]]
+                :END:
+            "},
+        );
+        let exit = run(opts_for(probe.clone(), vec![td.path().to_path_buf()])).unwrap();
+        let _ = fs::remove_file(&probe);
+
+        assert_eq!(exit, 0, "~/ pointer must resolve and match");
     }
 
     #[test]

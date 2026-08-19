@@ -3,11 +3,16 @@
 //! Spawns the actual `org-cli` binary against the fixture tree at
 //! `tests/fixtures/backlinks/` and asserts:
 //!
-//! - querying backlinks to `target.org` finds exactly the two
-//!   sources that link it (`source-a.org` directly and
-//!   `nested/source-b.org` via `../target.org`), proving the
-//!   canonicalization makes relative paths match,
-//! - `unrelated.org` (which links elsewhere) is NOT reported,
+//! - querying backlinks to `target.org` finds exactly the three
+//!   sources that link it (`source-a.org` directly,
+//!   `nested/source-b.org` via `../target.org`, and
+//!   `metadata-source.org` via a pure-pointer `:PREDECESSOR:`
+//!   property), proving the canonicalization makes relative paths
+//!   match and that a property whose value IS a link counts as a
+//!   relation,
+//! - `unrelated.org` is NOT reported even though `metadata-source.org`
+//!   mentions it inside a narrative property value and a `:LOGBOOK:`
+//!   note — those are citations, not reverse navigation,
 //! - exit code is 0 when backlinks are found,
 //! - exit code is 1 when a target has no backlinks.
 //!
@@ -45,6 +50,23 @@ fn parse_source_file(line: &str) -> String {
         .to_string()
 }
 
+/// The set of `source_file` values reported for `target`.
+fn backlink_sources(target: &Path) -> BTreeSet<String> {
+    let output = Command::new(bin_path())
+        .arg("backlinks")
+        .arg("-j")
+        .arg(target)
+        .arg(fixture_root())
+        .output()
+        .expect("failed to spawn org-cli");
+    String::from_utf8(output.stdout)
+        .expect("stdout not UTF-8")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(parse_source_file)
+        .collect()
+}
+
 #[test]
 fn test_backlinks_finds_both_referencing_sources() {
     let fixture = fixture_root();
@@ -75,6 +97,7 @@ fn test_backlinks_finds_both_referencing_sources() {
     let expected: BTreeSet<String> = [
         fixture.join("source-a.org"),
         fixture.join("nested").join("source-b.org"),
+        fixture.join("metadata-source.org"),
     ]
     .iter()
     .map(|p| {
@@ -89,10 +112,38 @@ fn test_backlinks_finds_both_referencing_sources() {
 }
 
 #[test]
+fn test_backlinks_reports_pure_pointer_property_but_not_prose_or_drawer_text() {
+    let fixture = fixture_root();
+
+    // `metadata-source.org` reaches `target.org` only through its
+    // pure-pointer `:PREDECESSOR:` property.
+    let to_target = backlink_sources(&fixture.join("target.org"));
+    let metadata_source = std::fs::canonicalize(fixture.join("metadata-source.org"))
+        .expect("canonicalize metadata-source.org")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        to_target.contains(&metadata_source),
+        "a property whose value IS a link is a relation; got {to_target:?}"
+    );
+
+    // The very same file also mentions `unrelated.org` twice — once
+    // inside a narrative property value, once in a `:LOGBOOK:` note.
+    // Neither is reverse navigation, so the same source file that WAS
+    // reported above must NOT be reported here. Holding the source
+    // file fixed isolates the origin as the only variable.
+    let to_unrelated = backlink_sources(&fixture.join("unrelated.org"));
+    assert!(
+        !to_unrelated.contains(&metadata_source),
+        "prose citations and drawer notes must not inflate the reverse index; got {to_unrelated:?}"
+    );
+}
+
+#[test]
 fn test_backlinks_target_with_no_backlinks_exits_one() {
     let fixture = fixture_root();
-    // unrelated.org is linked by nobody in the tree.
-    let target = fixture.join("unrelated.org");
+    // nested/source-b.org is linked by nobody in the tree.
+    let target = fixture.join("nested").join("source-b.org");
     let output = Command::new(bin_path())
         .arg("backlinks")
         .arg("-j")

@@ -8,6 +8,24 @@
 //! This module is the *orchestration* layer. The link domain logic
 //! (parsing, anchor classification, anchor index) lives in
 //! [`crate::org::link`].
+//!
+//! ## Which links are validated
+//!
+//! Every link the user can follow
+//! ([`crate::org::link::OriginPolicy::AllFollowable`]): body text,
+//! free-form drawer notes, and node-property values alike. Emacs opens
+//! a link written in a `:PROPERTIES:` value, so a broken one is a real
+//! defect a user can hit — and a checker that silently skipped it would
+//! report a clean run over an archive containing a dead metadata
+//! pointer.
+//!
+//! This is wider than the other two link-graph commands on purpose.
+//! Here an extra link can only ever *add* a warning, so erring towards
+//! inclusion is safe; for [`crate::cli::action::orphans`] the same edge
+//! would remove one. Each broken link reports its
+//! [`crate::org::link::LinkOrigin`], so a consumer can tell a broken
+//! prose link from a broken `:SOURCE_AUDIO:` pointer and treat them at
+//! different severities.
 
 use std::fs;
 use std::io::{self, Write};
@@ -19,8 +37,14 @@ use serde::Serialize;
 
 use crate::cli::action::walk::collect_org_files;
 use crate::org::link::{
-    Anchor, AnchorIndex, BreakReason, Link, extract_file_links, resolve_target,
+    Anchor, AnchorIndex, BreakReason, Link, LinkOrigin, OriginPolicy, extract_file_links,
+    resolve_target,
 };
+
+/// Which links this command validates.
+///
+/// Everything a user can follow — see the module docs.
+const POLICY: OriginPolicy = OriginPolicy::AllFollowable;
 
 /// CLI options received from `Commands::Check`.
 #[derive(Debug, Clone)]
@@ -49,6 +73,32 @@ pub struct BrokenLink {
     pub resolved_target: PathBuf,
     pub reason_tag: &'static str,
     pub reason_message: String,
+    /// Where the link was found: `"body"`, `"drawer"`, or
+    /// `"property"`. Lets a consumer treat a broken metadata pointer
+    /// at a different severity from a broken prose link.
+    pub origin_tag: &'static str,
+    /// Drawer the link was found in, upper-cased (e.g. `"PROPERTIES"`,
+    /// `"LOGBOOK"`). `None` for body links.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_drawer: Option<String>,
+    /// Property key whose value held the link, exactly as written.
+    /// `None` unless `origin_tag` is `"property"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_property: Option<String>,
+}
+
+impl BrokenLink {
+    /// Split a [`LinkOrigin`] into the flat fields carried by every
+    /// output format.
+    fn origin_fields(origin: &LinkOrigin) -> (&'static str, Option<String>, Option<String>) {
+        match origin {
+            LinkOrigin::Body => (origin.tag(), None, None),
+            LinkOrigin::Drawer { drawer } => (origin.tag(), Some(drawer.clone()), None),
+            LinkOrigin::Property { drawer, key, .. } => {
+                (origin.tag(), Some(drawer.clone()), Some(key.clone()))
+            }
+        }
+    }
 }
 
 /// Entry point invoked by the dispatcher. Returns Ok(0) on clean run,
@@ -80,6 +130,9 @@ pub fn run(opts: CheckOptions) -> Result<i32, String> {
             .unwrap_or_else(|| PathBuf::from("."));
 
         for link in extract_file_links(&content) {
+            if !POLICY.admits(&link.origin) {
+                continue;
+            }
             let resolved = resolve_target(&source_dir, &link).path;
 
             let break_reason = match validate_link(
@@ -94,6 +147,8 @@ pub fn run(opts: CheckOptions) -> Result<i32, String> {
             };
 
             broken_count += 1;
+            let (origin_tag, origin_drawer, origin_property) =
+                BrokenLink::origin_fields(&link.origin);
             let record = BrokenLink {
                 source_file: source_file.clone(),
                 line: link.line,
@@ -102,6 +157,9 @@ pub fn run(opts: CheckOptions) -> Result<i32, String> {
                 resolved_target: resolved,
                 reason_tag: break_reason.tag(),
                 reason_message: break_reason.message(),
+                origin_tag,
+                origin_drawer,
+                origin_property,
             };
             writer.emit(&record).map_err(|e| e.to_string())?;
 
@@ -236,6 +294,36 @@ fn ensure_index<'a>(
 // Output formatting
 // ---------------------------------------------------------------------
 
+/// Single-field origin for NUL output: `"body"`, `"drawer:LOGBOOK"`,
+/// or `"property:PROPERTIES:SOURCE_AUDIO"`.
+///
+/// The origin is one field rather than three because a record is
+/// terminated by `\0\0`: trailing *empty* fields would emit a second
+/// consecutive NUL and make the terminator ambiguous for readers
+/// splitting on it. Colons are safe separators here — a drawer name is
+/// delimited by colons in org syntax and so cannot contain one.
+fn nul_origin(b: &BrokenLink) -> String {
+    match (b.origin_drawer.as_deref(), b.origin_property.as_deref()) {
+        (Some(drawer), Some(key)) => format!("{}:{}:{}", b.origin_tag, drawer, key),
+        (Some(drawer), None) => format!("{}:{}", b.origin_tag, drawer),
+        _ => b.origin_tag.to_string(),
+    }
+}
+
+/// Human-readable origin suffix appended after the raw link, e.g.
+/// `" in :PROPERTIES: drawer, property :SOURCE_AUDIO:"`.
+///
+/// Empty for body links, whose line and column already locate them
+/// unambiguously — this keeps the historical output byte-identical for
+/// the links `check` already reported.
+fn human_origin(b: &BrokenLink) -> String {
+    match (b.origin_drawer.as_deref(), b.origin_property.as_deref()) {
+        (Some(drawer), Some(key)) => format!(" in :{}: drawer, property :{}:", drawer, key),
+        (Some(drawer), None) => format!(" in :{}: drawer", drawer),
+        _ => String::new(),
+    }
+}
+
 /// Wraps stdout and selects the right serializer per CLI flags.
 /// Inline here on purpose — Plan 03 will lift the `output/` module
 /// for `headings`, and `check` will be retrofitted at that point.
@@ -257,22 +345,29 @@ impl<'a> StdoutWriter<'a> {
             let line = serde_json::to_string(b).map_err(|e| io::Error::other(e.to_string()))?;
             writeln!(self.stdout, "{}", line)
         } else if self.opts.nul {
-            // <source>\0<line>\0<column>\0<reason_tag>\0<resolved>\0<raw>\0\0
+            // <source>\0<line>\0<column>\0<reason_tag>\0<resolved>\0<raw>
+            //   \0<origin>\0\0
+            //
+            // `origin` is appended after the historical six fields, so
+            // a reader that consumes the first six keeps working.
             write!(
                 self.stdout,
-                "{}\0{}\0{}\0{}\0{}\0{}\0\0",
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}\0\0",
                 b.source_file.display(),
                 b.line,
                 b.column,
                 b.reason_tag,
                 b.resolved_target.display(),
                 b.raw,
+                nul_origin(b),
             )
         } else {
-            // Human format: "<file>:<line>:<col>: <reason> -> <target>\n    <raw>"
+            // Human format:
+            //   "<file>:<line>:<col>: broken -> <target> (<reason>)"
+            //   "    <raw> [in :PROPERTIES: drawer, property :KEY:]"
             writeln!(
                 self.stdout,
-                "{}:{}:{}: {} {} {}\n    {}",
+                "{}:{}:{}: {} {} {}\n    {}{}",
                 b.source_file.display().to_string().bright_blue(),
                 b.line,
                 b.column,
@@ -280,6 +375,7 @@ impl<'a> StdoutWriter<'a> {
                 "->".dimmed(),
                 format!("{} ({})", b.resolved_target.display(), b.reason_message).bright_yellow(),
                 b.raw.dimmed(),
+                human_origin(b).dimmed(),
             )
         }
     }
@@ -433,6 +529,126 @@ mod tests {
             "[[file:target.org::*Témoignage — antécédents][t]]\n",
         );
         assert_eq!(run(opts_for(vec![td.path().to_path_buf()])).unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Drawer / property links. `check` validates everything a user can
+    // follow, so a broken metadata pointer must not read as a clean run.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_run_detects_broken_link_in_canonical_property_value() {
+        let td = TempDir::new("prop-broken");
+        write(
+            &td.path().join("source.org"),
+            indoc::indoc! {"
+                * Visit
+                :PROPERTIES:
+                :SCOPE: [[file:missing-folder/][gone]]
+                :END:
+            "},
+        );
+        assert_eq!(
+            run(opts_for(vec![td.path().to_path_buf()])).unwrap(),
+            1,
+            "a dead metadata pointer is a broken link"
+        );
+    }
+
+    #[test]
+    fn test_run_detects_broken_link_in_free_form_drawer_text() {
+        let td = TempDir::new("drawer-broken");
+        write(
+            &td.path().join("source.org"),
+            indoc::indoc! {"
+                * Visit
+                :LOGBOOK:
+                - Note taken on [2026-08-17 Mon] see [[file:gone.org][g]]
+                :END:
+            "},
+        );
+        assert_eq!(run(opts_for(vec![td.path().to_path_buf()])).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_run_accepts_valid_property_link() {
+        let td = TempDir::new("prop-ok");
+        write(&td.path().join("target.org"), "* H\n");
+        write(
+            &td.path().join("source.org"),
+            indoc::indoc! {"
+                * Visit
+                :PROPERTIES:
+                :PREDECESSOR: [[file:target.org][t]]
+                :END:
+            "},
+        );
+        assert_eq!(run(opts_for(vec![td.path().to_path_buf()])).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_run_validates_narrative_property_links_too() {
+        // Unlike `backlinks`, `check` does not care whether the value
+        // is a pure pointer: Emacs opens it either way.
+        let td = TempDir::new("prose-broken");
+        write(
+            &td.path().join("source.org"),
+            indoc::indoc! {"
+                * Visit
+                :PROPERTIES:
+                :TIMESTAMP_NOTE: le bilan cite [[file:gone.org][g]] sans conclure
+                :END:
+            "},
+        );
+        assert_eq!(run(opts_for(vec![td.path().to_path_buf()])).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_run_accepts_tilde_prefixed_link_to_existing_home_file() {
+        // `~/` must expand to the user's home, not be joined under the
+        // source file's directory. Uses a file that genuinely exists.
+        let home = dirs::home_dir().expect("home dir required");
+        let probe = home.join(".org-cli-check-tilde-probe.org");
+        fs::write(&probe, "* H\n").expect("write probe in home");
+
+        let td = TempDir::new("tilde-ok");
+        write(
+            &td.path().join("source.org"),
+            "[[file:~/.org-cli-check-tilde-probe.org][probe]]\n",
+        );
+        let exit = run(opts_for(vec![td.path().to_path_buf()])).unwrap();
+        let _ = fs::remove_file(&probe);
+
+        assert_eq!(exit, 0, "~/ must expand to the home directory");
+    }
+
+    #[test]
+    fn test_broken_link_origin_fields_flatten_each_origin() {
+        // The three output formats all read these flat fields; the
+        // NDJSON/NUL/human wire shapes are asserted end-to-end in
+        // `tests/check_integration.rs`.
+        assert_eq!(
+            BrokenLink::origin_fields(&LinkOrigin::Body),
+            ("body", None, None)
+        );
+        assert_eq!(
+            BrokenLink::origin_fields(&LinkOrigin::Drawer {
+                drawer: "LOGBOOK".into()
+            }),
+            ("drawer", Some("LOGBOOK".to_string()), None)
+        );
+        assert_eq!(
+            BrokenLink::origin_fields(&LinkOrigin::Property {
+                drawer: "PROPERTIES".into(),
+                key: "SOURCE_AUDIO".into(),
+                pure_pointer: true,
+            }),
+            (
+                "property",
+                Some("PROPERTIES".to_string()),
+                Some("SOURCE_AUDIO".to_string())
+            )
+        );
     }
 
     #[test]

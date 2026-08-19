@@ -5,8 +5,39 @@
 //! targets (headings, `:CUSTOM_ID:` properties) inside an org file.
 //!
 //! Higher layers (`crate::cli::action::check`,
-//! `crate::cli::action::orphans`) consume these to validate cross-file
+//! `crate::cli::action::orphans`,
+//! `crate::cli::action::backlinks`) consume these to validate cross-file
 //! link integrity (forward) or detect unreferenced files (reverse).
+//!
+//! # Where links live: body, drawers, and property values
+//!
+//! A `file:` link is not only found in ordinary body text. It also
+//! occurs inside metadata — a `:PROPERTIES:` entry recording
+//! provenance, or a free-form note in a `:LOGBOOK:` drawer. Those
+//! links are *followable in Emacs* but reach this module through three
+//! different parser paths, and consumers do not all want them:
+//!
+//! - **Body** — `orgize`'s `traverse()` emits a `Link` container.
+//! - **Drawer content** — `orgize` builds the `LINK` node but
+//!   `traverse()` never descends into `DRAWER_CONTENT`, so the walker
+//!   misses it. The node is recovered here by walking drawer
+//!   descendants directly.
+//! - **Canonical property value** — `orgize` stores a node-property
+//!   value as one raw `TEXT` token, so no `LINK` node exists at all
+//!   (this mirrors `org-element`, which likewise exposes `:value` as a
+//!   string). The value is recovered by re-parsing it *with this same
+//!   extractor* — no second link parser is introduced.
+//!
+//! A `:PROPERTIES:` drawer only becomes a typed `PROPERTY_DRAWER` when
+//! it sits immediately after its headline; anywhere else the identical
+//! text parses as a plain `DRAWER`. Both shapes are handled, and both
+//! report a [`LinkOrigin::Property`] when the drawer line has
+//! `:KEY: value` shape, so callers see one consistent origin regardless
+//! of which parser path produced the link.
+//!
+//! Each link therefore carries a [`LinkOrigin`], and each consumer
+//! selects the origins it wants via an [`OriginPolicy`]. See that type
+//! for the per-command rationale.
 
 use std::collections::HashSet;
 use std::fs;
@@ -15,10 +46,12 @@ use std::path::{Path, PathBuf};
 use log::warn;
 use orgize::{
     Org,
-    ast::Headline,
+    ast::{Drawer, Headline, Link as OrgLink, PropertyDrawer},
     export::{Container, Event, from_fn},
     rowan::ast::AstNode,
 };
+
+use crate::org::property::parse_property_line;
 
 /// A link extracted from an org document.
 ///
@@ -46,6 +79,124 @@ pub struct Link {
     pub line: usize,
     /// 1-based column number of the link's opening `[[` in the source.
     pub column: usize,
+    /// Where in the document structure the link was found. Consumers
+    /// filter on this via [`OriginPolicy`]; `check` also reports it so
+    /// a broken metadata pointer is distinguishable from a broken
+    /// prose link.
+    pub origin: LinkOrigin,
+}
+
+/// Where in an org document's structure a [`Link`] was found.
+///
+/// This is the axis the three link-graph commands disagree on, so it
+/// is modelled explicitly rather than being flattened into a boolean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkOrigin {
+    /// Ordinary document content — paragraphs, list items, tables,
+    /// quote blocks. The links `org-cli` has always seen.
+    Body,
+    /// Inside a drawer, but not on a `:KEY: value` line: free-form
+    /// text such as an `org-add-note` entry in a `:LOGBOOK:` drawer.
+    Drawer {
+        /// Drawer name as written, upper-cased for stability
+        /// (`"LOGBOOK"`, `"PROPERTIES"`, …).
+        drawer: String,
+    },
+    /// The value of a node property, i.e. a `:KEY: value` line. Carries
+    /// the key so diagnostics can name the exact metadata field.
+    Property {
+        /// Drawer name as written, upper-cased (`"PROPERTIES"` for the
+        /// common case; a property-shaped line inside another drawer
+        /// keeps that drawer's name).
+        drawer: String,
+        /// Property key, exactly as written in the source.
+        key: String,
+        /// `true` when the property value is *nothing but* the link —
+        /// a pure pointer such as `:PREDECESSOR: [[file:prev.org][…]]`.
+        /// `false` when the link is embedded in surrounding narrative
+        /// prose, where it reads as a citation rather than a relation.
+        pure_pointer: bool,
+    },
+}
+
+impl LinkOrigin {
+    /// Short machine-friendly tag for output formats.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            LinkOrigin::Body => "body",
+            LinkOrigin::Drawer { .. } => "drawer",
+            LinkOrigin::Property { .. } => "property",
+        }
+    }
+
+    /// `true` for links that are document content rather than metadata.
+    pub fn is_body(&self) -> bool {
+        matches!(self, LinkOrigin::Body)
+    }
+
+    /// `true` for a property value consisting solely of the link.
+    pub fn is_pure_pointer(&self) -> bool {
+        matches!(
+            self,
+            LinkOrigin::Property {
+                pure_pointer: true,
+                ..
+            }
+        )
+    }
+
+    /// Human-readable origin suffix used in `check` diagnostics, e.g.
+    /// `" in :PROPERTIES: :SOURCE_AUDIO:"`. Empty for body links, whose
+    /// line/column already say everything.
+    pub fn describe(&self) -> String {
+        match self {
+            LinkOrigin::Body => String::new(),
+            LinkOrigin::Drawer { drawer } => format!(" in :{}: drawer", drawer),
+            LinkOrigin::Property { drawer, key, .. } => {
+                format!(" in :{}: drawer, property :{}:", drawer, key)
+            }
+        }
+    }
+}
+
+/// Which [`LinkOrigin`]s a consumer counts as graph edges.
+///
+/// The three link-graph commands make different promises, so they take
+/// different rows here rather than sharing one edge set:
+///
+/// - `check` promises *followability*: Emacs opens a link in a drawer
+///   or a property value, so a broken one is a defect a user can hit.
+///   It takes [`OriginPolicy::AllFollowable`].
+/// - `backlinks` promises *meaningful reverse navigation*. A property
+///   whose value IS a link asserts a relation; a link buried in a long
+///   narrative property value is a citation inside prose, and promoting
+///   it to an edge inflates the reverse index. It takes
+///   [`OriginPolicy::BodyAndPurePointers`].
+/// - `orphans` promises to *surface unreferenced files*. Every added
+///   edge can only suppress an orphan report, never produce one, so
+///   widening the edge set here can only hide a genuinely forgotten
+///   document. It keeps [`OriginPolicy::BodyOnly`], leaving its
+///   semantics unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginPolicy {
+    /// Body links only — the historical edge set.
+    BodyOnly,
+    /// Body links, plus property values that are pure pointers.
+    BodyAndPurePointers,
+    /// Every link a user can follow: body, drawer text, and all
+    /// property values.
+    AllFollowable,
+}
+
+impl OriginPolicy {
+    /// `true` when a link with this origin counts under this policy.
+    pub fn admits(&self, origin: &LinkOrigin) -> bool {
+        match self {
+            OriginPolicy::BodyOnly => origin.is_body(),
+            OriginPolicy::BodyAndPurePointers => origin.is_body() || origin.is_pure_pointer(),
+            OriginPolicy::AllFollowable => true,
+        }
+    }
 }
 
 /// The kind of in-file target referenced by a link's anchor.
@@ -205,10 +356,11 @@ pub struct ResolvedTarget {
 /// otherwise lexically joined. This matches the historical behavior
 /// of `cli::action::check::resolve_path`.
 pub fn resolve_target(source_dir: &Path, link: &Link) -> ResolvedTarget {
-    let joined = if link.target_path.is_absolute() {
-        link.target_path.clone()
+    let expanded = expand_tilde(&link.target_path);
+    let joined = if expanded.is_absolute() {
+        expanded
     } else {
-        source_dir.join(&link.target_path)
+        source_dir.join(expanded)
     };
     let path = fs::canonicalize(&joined).unwrap_or(joined);
     ResolvedTarget {
@@ -217,18 +369,59 @@ pub fn resolve_target(source_dir: &Path, link: &Link) -> ResolvedTarget {
     }
 }
 
-/// Read every org file in `org_files`, extract all `[[file:...]]`
-/// links, resolve each target relative to its source file's
-/// directory, and return the de-duplicated set of resolved targets.
+/// Expand a leading `~` (bare, or `~/rest`) to the user's home
+/// directory, as Emacs does when following a link.
+///
+/// Without this, `[[file:~/notes.org]]` is not absolute and is joined
+/// under the source file's directory, producing a bogus
+/// `<source-dir>/~/notes.org` that never exists — reporting a
+/// perfectly valid link as broken.
+///
+/// Only a leading `~` is expanded. `~user` forms are left untouched
+/// (resolving another user's home needs the password database, which
+/// this tool does not consult), and so is a `~` anywhere but the first
+/// component, which is an ordinary filename character.
+fn expand_tilde(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let rest = if s == "~" {
+        ""
+    } else if let Some(r) = s.strip_prefix("~/") {
+        r
+    } else {
+        return path.to_path_buf();
+    };
+    match dirs::home_dir() {
+        Some(home) if rest.is_empty() => home,
+        Some(home) => home.join(rest),
+        None => {
+            warn!(
+                "cannot determine home directory; leaving {:?} unexpanded",
+                s
+            );
+            path.to_path_buf()
+        }
+    }
+}
+
+/// Read every org file in `org_files`, extract the `[[file:...]]`
+/// links admitted by `policy`, resolve each target relative to its
+/// source file's directory, and return the de-duplicated set of
+/// resolved targets.
 ///
 /// I/O failures on a single org file are logged via `log::warn!` and
 /// the file is skipped — same defensive policy as
 /// [`crate::cli::action::check`].
 ///
-/// This is the **graph-walk core** shared by `check` (forward
-/// integrity: do these targets exist?) and `orphans` (reverse
-/// integrity: which on-disk files are *not* in this set?).
-pub fn collect_referenced_paths(org_files: &[PathBuf]) -> HashSet<ResolvedTarget> {
+/// This is the **graph-walk core** behind `orphans` (reverse
+/// integrity: which on-disk files are *not* in this set?). `orphans`
+/// passes [`OriginPolicy::BodyOnly`]: an extra edge there can only
+/// suppress a warning, never raise one.
+pub fn collect_referenced_paths(
+    org_files: &[PathBuf],
+    policy: OriginPolicy,
+) -> HashSet<ResolvedTarget> {
     let mut out = HashSet::new();
     for source_file in org_files {
         let content = match fs::read_to_string(source_file) {
@@ -243,47 +436,221 @@ pub fn collect_referenced_paths(org_files: &[PathBuf]) -> HashSet<ResolvedTarget
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         for link in extract_file_links(&content) {
+            if !policy.admits(&link.origin) {
+                continue;
+            }
             out.insert(resolve_target(&source_dir, &link));
         }
     }
     out
 }
 
-/// Extract every `[[file:...]]` link from the given org content.
+/// Extract every `[[file:...]]` link from the given org content,
+/// including links inside drawers and node-property values.
 ///
 /// The returned [`Link`]s have their `file:` prefix stripped and
-/// their path part percent-decoded. Path resolution against the
-/// containing file's directory is the caller's responsibility.
+/// their path part percent-decoded, and each carries the
+/// [`LinkOrigin`] it was found at. Path resolution against the
+/// containing file's directory is the caller's responsibility, as is
+/// filtering by [`OriginPolicy`] — this function reports everything it
+/// finds.
+///
+/// Links are returned in source order.
 pub fn extract_file_links(content: &str) -> Vec<Link> {
+    let mut out = extract_body_links(content);
+    out.extend(extract_drawer_links(content));
+    out.sort_by_key(|l| (l.line, l.column));
+    out
+}
+
+/// Extract the `file:` links `orgize`'s traversal reaches: ordinary
+/// document content (paragraphs, lists, tables, quote blocks).
+///
+/// Deliberately uses `traverse()` rather than a raw descendant walk:
+/// the walker's coverage *is* the definition of "body" here, and a
+/// descendant walk would additionally pick up links in headline
+/// titles, silently widening the historical edge set.
+fn extract_body_links(content: &str) -> Vec<Link> {
     let mut out: Vec<Link> = Vec::new();
     let mut handler = from_fn(|event| {
         let Event::Enter(Container::Link(link)) = event else {
             return;
         };
-        let raw_path = link.path().to_string();
-        let Some(after_scheme) = raw_path.strip_prefix("file:") else {
-            return; // skip http:, id:, etc.
-        };
-
-        let (path_str, anchor) = split_anchor(after_scheme);
-        let decoded = percent_decode(path_str);
-        let target_is_directory = decoded.ends_with('/');
-        let target_path = PathBuf::from(decoded);
-
-        let offset: usize = link.start().into();
-        let (line, column) = offset_to_line_col(content, offset);
-
-        out.push(Link {
-            raw: link.raw(),
-            target_path,
-            target_is_directory,
-            anchor,
-            line,
-            column,
-        });
+        if let Some(l) = build_link(content, &link, LinkOrigin::Body) {
+            out.push(l);
+        }
     });
     Org::parse(content).traverse(&mut handler);
     out
+}
+
+/// Extract the `file:` links that live in metadata: drawer content and
+/// node-property values.
+///
+/// Two parser shapes are covered, and both are reached from the *same*
+/// `orgize` parse used for body links — no separate org parser exists
+/// in this crate:
+///
+/// - A plain `DRAWER` (including a `:PROPERTIES:` drawer that is not
+///   positioned immediately after its headline) *does* contain `LINK`
+///   nodes; they are collected by walking its descendants. Whether a
+///   given link is a property value is then decided by re-reading its
+///   source line through
+///   [`crate::org::property::parse_property_line`].
+/// - A canonical `PROPERTY_DRAWER` contains no `LINK` nodes at all —
+///   each value is one raw token. Every value is re-parsed *through
+///   this module's own body extractor*, and the resulting links are
+///   re-anchored to their absolute position in the document.
+fn extract_drawer_links(content: &str) -> Vec<Link> {
+    let org = Org::parse(content);
+    let mut out: Vec<Link> = Vec::new();
+
+    // Plain drawers: LINK nodes exist, traverse() just never visits
+    // them. Blocks nested inside a drawer (`#+begin_src`) still yield
+    // no LINK node, so code samples stay excluded exactly as before.
+    for drawer in org
+        .document()
+        .syntax()
+        .descendants()
+        .filter_map(Drawer::cast)
+    {
+        let name = drawer.name().to_string().trim().to_uppercase();
+        for link in drawer.syntax().descendants().filter_map(OrgLink::cast) {
+            let offset: usize = link.start().into();
+            let origin = classify_drawer_link(content, offset, &name);
+            if let Some(l) = build_link(content, &link, origin) {
+                out.push(l);
+            }
+        }
+    }
+
+    // Canonical property drawers: values are opaque text, so re-parse
+    // each value with the body extractor and shift the results back to
+    // document coordinates.
+    for pd in org
+        .document()
+        .syntax()
+        .descendants()
+        .filter_map(PropertyDrawer::cast)
+    {
+        let drawer_name = property_drawer_name(&pd);
+        for np in pd.node_properties() {
+            let raw = np.raw();
+            let np_offset: usize = np.start().into();
+            let Some(parsed) = parse_property_line(&raw) else {
+                continue;
+            };
+            // Locate the value inside the raw property line so nested
+            // link offsets can be mapped back to the document.
+            let Some(value_in_line) = raw.find(&parsed.value) else {
+                continue;
+            };
+            let value_offset = np_offset + value_in_line;
+            for mut link in extract_body_links(&parsed.value) {
+                let pure_pointer = parsed.value.trim() == link.raw.trim();
+                link.origin = LinkOrigin::Property {
+                    drawer: drawer_name.clone(),
+                    key: parsed.key.clone(),
+                    pure_pointer,
+                };
+                let abs = value_offset + offset_of(&parsed.value, link.line, link.column);
+                let (line, column) = offset_to_line_col(content, abs);
+                link.line = line;
+                link.column = column;
+                out.push(link);
+            }
+        }
+    }
+
+    out
+}
+
+/// Name of a canonical property drawer, read from its `DRAWER_BEGIN`
+/// text so an unusual spelling is reported as written (upper-cased).
+/// Falls back to `PROPERTIES`, which is what the parser requires for
+/// this node to exist in the first place.
+fn property_drawer_name(pd: &PropertyDrawer) -> String {
+    pd.syntax()
+        .children()
+        .find(|n| n.kind() == orgize::SyntaxKind::DRAWER_BEGIN)
+        .map(|n| n.text().to_string())
+        .map(|s| s.trim().trim_matches(':').trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "PROPERTIES".to_string())
+}
+
+/// Decide whether a link found in a plain drawer sits on a
+/// `:KEY: value` line (a property) or in free-form drawer text.
+///
+/// This is what makes a *degraded* `:PROPERTIES:` drawer — one not
+/// placed immediately after its headline, which the parser downgrades
+/// to a plain drawer — still report [`LinkOrigin::Property`] with its
+/// key, matching the canonical case.
+fn classify_drawer_link(content: &str, link_offset: usize, drawer_name: &str) -> LinkOrigin {
+    let line_start = content[..link_offset.min(content.len())]
+        .rfind('\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let line_end = content[line_start..]
+        .find('\n')
+        .map(|p| line_start + p)
+        .unwrap_or(content.len());
+    let line = &content[line_start..line_end];
+
+    match parse_property_line(line) {
+        Some(p) => {
+            // A property line whose value is exactly one link is a
+            // pure pointer; anything else is prose around a citation.
+            let pure_pointer = p.value.starts_with("[[") && p.value.ends_with("]]");
+            LinkOrigin::Property {
+                drawer: drawer_name.to_string(),
+                key: p.key,
+                pure_pointer,
+            }
+        }
+        None => LinkOrigin::Drawer {
+            drawer: drawer_name.to_string(),
+        },
+    }
+}
+
+/// Byte offset of a 1-based (line, column) position in `s`. Inverse of
+/// [`offset_to_line_col`], used to re-anchor links found in a re-parsed
+/// property value back into the whole document.
+fn offset_of(s: &str, line: usize, column: usize) -> usize {
+    let mut start = 0;
+    for _ in 1..line {
+        match s[start..].find('\n') {
+            Some(p) => start += p + 1,
+            None => return s.len(),
+        }
+    }
+    (start + column - 1).min(s.len())
+}
+
+/// Build a [`Link`] from an `orgize` link node, or `None` when the node
+/// is not a `file:` link (`http:`, `id:`, `[[*Heading]]`, …).
+fn build_link(content: &str, link: &OrgLink, origin: LinkOrigin) -> Option<Link> {
+    let raw_path = link.path().to_string();
+    let after_scheme = raw_path.strip_prefix("file:")?;
+
+    let (path_str, anchor) = split_anchor(after_scheme);
+    let decoded = percent_decode(path_str);
+    let target_is_directory = decoded.ends_with('/');
+    let target_path = PathBuf::from(decoded);
+
+    let offset: usize = link.start().into();
+    let (line, column) = offset_to_line_col(content, offset);
+
+    Some(Link {
+        raw: link.raw(),
+        target_path,
+        target_is_directory,
+        anchor,
+        line,
+        column,
+        origin,
+    })
 }
 
 /// Whitespace-collapse and trim a heading title for matching.
@@ -618,6 +985,362 @@ mod tests {
         assert_eq!(r.path, PathBuf::from("/tmp/does/not/exist.org"));
     }
 
+    // ---------------------------------------------------------------
+    // Link origin: body vs drawer vs property value.
+    // ---------------------------------------------------------------
+
+    fn origins(src: &str) -> Vec<(String, LinkOrigin)> {
+        extract_file_links(src)
+            .into_iter()
+            .map(|l| (l.target_path.display().to_string(), l.origin))
+            .collect()
+    }
+
+    #[test]
+    fn test_body_link_origin_is_body() {
+        let src = "* H\nsee [[file:a.org][A]]\n";
+        assert_eq!(origins(src), vec![("a.org".to_string(), LinkOrigin::Body)]);
+    }
+
+    #[test]
+    fn test_canonical_property_value_link_is_a_pure_pointer() {
+        let src = indoc! {"
+            * H
+            :PROPERTIES:
+            :SOURCE_AUDIO: [[file:a.org][A]]
+            :END:
+        "};
+        assert_eq!(
+            origins(src),
+            vec![(
+                "a.org".to_string(),
+                LinkOrigin::Property {
+                    drawer: "PROPERTIES".to_string(),
+                    key: "SOURCE_AUDIO".to_string(),
+                    pure_pointer: true,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn test_narrative_property_value_link_is_not_a_pure_pointer() {
+        let src = indoc! {"
+            * H
+            :PROPERTIES:
+            :TIMESTAMP_NOTE: le bilan cite [[file:a.org][A]] sans conclure
+            :END:
+        "};
+        assert_eq!(
+            origins(src),
+            vec![(
+                "a.org".to_string(),
+                LinkOrigin::Property {
+                    drawer: "PROPERTIES".to_string(),
+                    key: "TIMESTAMP_NOTE".to_string(),
+                    pure_pointer: false,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn test_degraded_property_drawer_still_reports_property_origin() {
+        // A `:PROPERTIES:` drawer not placed immediately after its
+        // headline parses as a plain DRAWER, but is the same thing to
+        // the user and must classify identically.
+        let src = indoc! {"
+            * H
+
+            :PROPERTIES:
+            :PREDECESSOR: [[file:a.org][A]]
+            :END:
+        "};
+        assert_eq!(
+            origins(src),
+            vec![(
+                "a.org".to_string(),
+                LinkOrigin::Property {
+                    drawer: "PROPERTIES".to_string(),
+                    key: "PREDECESSOR".to_string(),
+                    pure_pointer: true,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn test_free_form_drawer_text_link_is_drawer_origin() {
+        let src = indoc! {"
+            * H
+            :LOGBOOK:
+            - Note taken on [2026-08-17 Mon] see [[file:a.org][A]]
+            :END:
+        "};
+        assert_eq!(
+            origins(src),
+            vec![(
+                "a.org".to_string(),
+                LinkOrigin::Drawer {
+                    drawer: "LOGBOOK".to_string()
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn test_clock_line_yields_no_link() {
+        let src = indoc! {"
+            * H
+            :LOGBOOK:
+            CLOCK: [2026-08-17 Mon 10:00]--[2026-08-17 Mon 11:00] =>  1:00
+            :END:
+        "};
+        assert!(extract_file_links(src).is_empty());
+    }
+
+    #[test]
+    fn test_blocks_stay_excluded_inside_and_outside_drawers() {
+        // Code and examples are quoted material, not links — true
+        // before this change and it must stay true, including when the
+        // block sits inside a drawer.
+        let src = indoc! {"
+            * H
+            #+begin_src text
+            [[file:a.org][A]]
+            #+end_src
+            :MYDRAWER:
+            #+begin_example
+            [[file:b.org][B]]
+            #+end_example
+            :END:
+        "};
+        assert!(extract_file_links(src).is_empty(), "got {:?}", origins(src));
+    }
+
+    #[test]
+    fn test_headline_title_link_is_not_extracted() {
+        // Guards the body extractor against silently widening: a
+        // descendant walk would pick this up, `traverse()` does not,
+        // and this change is not authorized to alter that.
+        let src = "* Head [[file:a.org][A]]\nbody\n";
+        assert!(extract_file_links(src).is_empty());
+    }
+
+    #[test]
+    fn test_links_are_returned_in_source_order_across_origins() {
+        let src = indoc! {"
+            * H
+            :PROPERTIES:
+            :K: [[file:prop.org][P]]
+            :END:
+            body [[file:body.org][B]]
+            :LOGBOOK:
+            - note [[file:log.org][L]]
+            :END:
+        "};
+        let paths: Vec<String> = extract_file_links(src)
+            .into_iter()
+            .map(|l| l.target_path.display().to_string())
+            .collect();
+        assert_eq!(paths, vec!["prop.org", "body.org", "log.org"]);
+    }
+
+    #[test]
+    fn test_drawer_link_line_and_column_point_at_the_link() {
+        let src = indoc! {"
+            * H
+            :PROPERTIES:
+            :K: [[file:a.org][A]]
+            :END:
+        "};
+        let l = &extract_file_links(src)[0];
+        assert_eq!(l.line, 3, "1-based line of the property entry");
+        assert_eq!(l.column, 5, "column of the opening `[[`");
+        assert_eq!(l.raw, "[[file:a.org][A]]");
+    }
+
+    #[test]
+    fn test_property_value_link_keeps_anchor_and_directory_semantics() {
+        let src = indoc! {"
+            * H
+            :PROPERTIES:
+            :K: [[file:a.org::*Some Heading][A]]
+            :DIR: [[file:photos/][p]]
+            :END:
+        "};
+        let links = extract_file_links(src);
+        assert_eq!(
+            links[0].anchor,
+            Some(Anchor::Heading("Some Heading".to_string()))
+        );
+        assert_eq!(links[0].target_path, PathBuf::from("a.org"));
+        assert!(links[1].target_is_directory);
+    }
+
+    #[test]
+    fn test_property_shaped_line_in_a_non_properties_drawer_names_that_drawer() {
+        let src = indoc! {"
+            * H
+            :LOGBOOK:
+            :PRED: [[file:a.org][A]]
+            :END:
+        "};
+        assert_eq!(
+            origins(src),
+            vec![(
+                "a.org".to_string(),
+                LinkOrigin::Property {
+                    drawer: "LOGBOOK".to_string(),
+                    key: "PRED".to_string(),
+                    pure_pointer: true,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn test_origin_describe_names_the_metadata_field() {
+        assert_eq!(LinkOrigin::Body.describe(), "");
+        assert_eq!(
+            LinkOrigin::Drawer {
+                drawer: "LOGBOOK".into()
+            }
+            .describe(),
+            " in :LOGBOOK: drawer"
+        );
+        assert_eq!(
+            LinkOrigin::Property {
+                drawer: "PROPERTIES".into(),
+                key: "SOURCE_AUDIO".into(),
+                pure_pointer: true,
+            }
+            .describe(),
+            " in :PROPERTIES: drawer, property :SOURCE_AUDIO:"
+        );
+    }
+
+    #[test]
+    fn test_origin_tags_are_stable_for_machine_output() {
+        assert_eq!(LinkOrigin::Body.tag(), "body");
+        assert_eq!(LinkOrigin::Drawer { drawer: "X".into() }.tag(), "drawer");
+        assert_eq!(
+            LinkOrigin::Property {
+                drawer: "PROPERTIES".into(),
+                key: "K".into(),
+                pure_pointer: false,
+            }
+            .tag(),
+            "property"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Per-command policy.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_policy_body_only_rejects_all_metadata_links() {
+        let p = OriginPolicy::BodyOnly;
+        assert!(p.admits(&LinkOrigin::Body));
+        assert!(!p.admits(&LinkOrigin::Drawer {
+            drawer: "LOGBOOK".into()
+        }));
+        assert!(!p.admits(&LinkOrigin::Property {
+            drawer: "PROPERTIES".into(),
+            key: "K".into(),
+            pure_pointer: true,
+        }));
+    }
+
+    #[test]
+    fn test_policy_body_and_pure_pointers_splits_pointer_from_prose() {
+        let p = OriginPolicy::BodyAndPurePointers;
+        assert!(p.admits(&LinkOrigin::Body));
+        assert!(p.admits(&LinkOrigin::Property {
+            drawer: "PROPERTIES".into(),
+            key: "PREDECESSOR".into(),
+            pure_pointer: true,
+        }));
+        assert!(
+            !p.admits(&LinkOrigin::Property {
+                drawer: "PROPERTIES".into(),
+                key: "TIMESTAMP_NOTE".into(),
+                pure_pointer: false,
+            }),
+            "a link inside narrative prose is a citation, not a relation"
+        );
+        assert!(!p.admits(&LinkOrigin::Drawer {
+            drawer: "LOGBOOK".into()
+        }));
+    }
+
+    #[test]
+    fn test_policy_all_followable_admits_every_origin() {
+        let p = OriginPolicy::AllFollowable;
+        assert!(p.admits(&LinkOrigin::Body));
+        assert!(p.admits(&LinkOrigin::Drawer {
+            drawer: "LOGBOOK".into()
+        }));
+        assert!(p.admits(&LinkOrigin::Property {
+            drawer: "PROPERTIES".into(),
+            key: "K".into(),
+            pure_pointer: false,
+        }));
+    }
+
+    // ---------------------------------------------------------------
+    // `~/` expansion.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_target_expands_leading_tilde_to_home() {
+        let home = dirs::home_dir().expect("home dir required for this test");
+        let src = "[[file:~/some-file-that-need-not-exist.org][x]]\n";
+        let link = &extract_file_links(src)[0];
+        let r = resolve_target(Path::new("/tmp"), link);
+        assert_eq!(r.path, home.join("some-file-that-need-not-exist.org"));
+    }
+
+    #[test]
+    fn test_resolve_target_expands_bare_tilde() {
+        let home = dirs::home_dir().expect("home dir required for this test");
+        let src = "[[file:~][home]]\n";
+        let link = &extract_file_links(src)[0];
+        let r = resolve_target(Path::new("/tmp"), link);
+        assert_eq!(r.path, fs::canonicalize(&home).unwrap_or(home));
+    }
+
+    #[test]
+    fn test_resolve_target_expands_tilde_in_property_value() {
+        // The 5 real archive failures were `~/`-prefixed links inside
+        // `:TIMESTAMP_NOTE:` values: both fixes must compose.
+        let home = dirs::home_dir().expect("home dir required for this test");
+        let src = indoc! {"
+            * H
+            :PROPERTIES:
+            :TIMESTAMP_NOTE: cf [[file:~/notes/x.org][x]]
+            :END:
+        "};
+        let link = &extract_file_links(src)[0];
+        let r = resolve_target(Path::new("/tmp"), link);
+        assert_eq!(r.path, home.join("notes/x.org"));
+    }
+
+    #[test]
+    fn test_resolve_target_leaves_non_leading_and_user_tildes_alone() {
+        // `~backup.org` is an ordinary filename; `~user/` needs the
+        // password database and is out of scope.
+        for (raw, expected) in [
+            ("[[file:~backup.org][b]]\n", "/tmp/~backup.org"),
+            ("[[file:notes/~/x.org][x]]\n", "/tmp/notes/~/x.org"),
+        ] {
+            let link = &extract_file_links(raw)[0];
+            let r = resolve_target(Path::new("/tmp"), link);
+            assert_eq!(r.path, PathBuf::from(expected));
+        }
+    }
+
     #[test]
     fn test_collect_referenced_paths_dedups_across_files() {
         let td = tempdir_helper::TempDir::new("collect-dedup");
@@ -629,7 +1352,7 @@ mod tests {
         );
 
         let org_files = vec![td.path().join("a.org"), td.path().join("nested/b.org")];
-        let set = collect_referenced_paths(&org_files);
+        let set = collect_referenced_paths(&org_files, OriginPolicy::BodyOnly);
         assert_eq!(
             set.len(),
             1,
@@ -646,7 +1369,7 @@ mod tests {
         // Path that doesn't exist — `read_to_string` errors are
         // logged and the file is skipped, not propagated.
         let bogus = td.path().join("ghost.org");
-        let set = collect_referenced_paths(&[bogus]);
+        let set = collect_referenced_paths(&[bogus], OriginPolicy::BodyOnly);
         assert!(set.is_empty());
     }
 
@@ -657,7 +1380,7 @@ mod tests {
             &td.path().join("a.org"),
             "[[https://example.com][site]] [[id:abc][by-id]]\n",
         );
-        let set = collect_referenced_paths(&[td.path().join("a.org")]);
+        let set = collect_referenced_paths(&[td.path().join("a.org")], OriginPolicy::BodyOnly);
         assert!(
             set.is_empty(),
             "only file: links contribute, got: {:?}",
@@ -670,8 +1393,55 @@ mod tests {
         let td = tempdir_helper::TempDir::new("collect-dir");
         std::fs::create_dir_all(td.path().join("photos")).unwrap();
         write_file(&td.path().join("a.org"), "[[file:photos/][p]]\n");
-        let set = collect_referenced_paths(&[td.path().join("a.org")]);
+        let set = collect_referenced_paths(&[td.path().join("a.org")], OriginPolicy::BodyOnly);
         assert_eq!(set.len(), 1);
         assert!(set.iter().next().unwrap().is_directory_link);
+    }
+
+    #[test]
+    fn test_collect_referenced_paths_honors_the_requested_policy() {
+        let td = tempdir_helper::TempDir::new("collect-policy");
+        write_file(&td.path().join("body.org"), "* H\n");
+        write_file(&td.path().join("pointer.org"), "* H\n");
+        write_file(&td.path().join("prose.org"), "* H\n");
+        write_file(&td.path().join("note.org"), "* H\n");
+        write_file(
+            &td.path().join("a.org"),
+            indoc! {"
+                * H
+                :PROPERTIES:
+                :PREDECESSOR: [[file:pointer.org][p]]
+                :NOTE: mentions [[file:prose.org][x]] in passing
+                :END:
+                body [[file:body.org][b]]
+                :LOGBOOK:
+                - note [[file:note.org][n]]
+                :END:
+            "},
+        );
+
+        let names = |policy| -> Vec<String> {
+            let mut v: Vec<String> = collect_referenced_paths(&[td.path().join("a.org")], policy)
+                .into_iter()
+                .map(|t| t.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            names(OriginPolicy::BodyOnly),
+            vec!["body.org"],
+            "orphans keeps its historical edge set"
+        );
+        assert_eq!(
+            names(OriginPolicy::BodyAndPurePointers),
+            vec!["body.org", "pointer.org"],
+            "pure pointers count; prose-embedded citations do not"
+        );
+        assert_eq!(
+            names(OriginPolicy::AllFollowable),
+            vec!["body.org", "note.org", "pointer.org", "prose.org"],
+        );
     }
 }

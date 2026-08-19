@@ -1,0 +1,22 @@
+#+TITLE: Check fixture
+
+* Visit with metadata pointers
+:PROPERTIES:
+:SOURCE_AUDIO: [[file:missing-audio.ogg][recording]]
+:PREDECESSOR: [[file:target.org][previous visit]]
+:TIMESTAMP_NOTE: le bilan cite [[file:missing-prose.org][ce document]] sans conclure
+:END:
+:LOGBOOK:
+- Note taken on [2026-08-17 Mon] see [[file:missing-note.org][the note]]
+CLOCK: [2026-08-17 Mon 10:00 +0200]--[2026-08-17 Mon 11:00 +0200] =>  1:00
+:END:
+
+A body link that resolves: [[file:target.org][the target]].
+
+A body link that does not: [[file:missing-body.org][gone]].
+
+Quoted syntax must NOT be treated as a link:
+
+#+begin_src org
+[[file:not-a-real-link.org][example only]]
+#+end_src

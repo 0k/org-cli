@@ -1,0 +1,7 @@
+#+TITLE: Metadata only
+
+The ONLY references to this file in the fixture live in
+``linker.org``'s ``:PROPERTIES:`` drawer and its ``:LOGBOOK:``
+note. ``orphans`` counts body links only, so this file must still
+be reported as an orphan: a metadata pointer must never silence a
+forgotten document.

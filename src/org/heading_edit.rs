@@ -32,6 +32,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::org::heading::{direct_child_lines, section_span, subtree_span};
+use crate::org::property::parse_property_line;
 use crate::org::todo_keywords::TodoKeywords;
 
 // ---------------------------------------------------------------------
@@ -626,8 +627,8 @@ pub fn set_property(
             // Look for an existing entry for `key`.
             let mut found: Option<usize> = None;
             for (i, line) in lines.iter().enumerate().take(end - 1).skip(start) {
-                if let Some((k, _)) = parse_property_line(line)
-                    && k == key
+                if let Some(p) = parse_property_line(line)
+                    && p.key == key
                 {
                     found = Some(i);
                     break;
@@ -635,7 +636,7 @@ pub fn set_property(
             }
             match found {
                 Some(i) => {
-                    old_value = parse_property_line(&lines[i]).map(|(_, v)| v);
+                    old_value = parse_property_line(&lines[i]).map(|p| p.value);
                     lines[i] = format!("{}:{}: {}", indent, key, value);
                 }
                 None => {
@@ -690,8 +691,8 @@ pub fn unset_property(
     // :PROPERTIES:/:END: markers.
     let mut target: Option<usize> = None;
     for (i, line) in lines.iter().enumerate().take(end - 1).skip(start) {
-        if let Some((k, _)) = parse_property_line(line)
-            && k == key
+        if let Some(p) = parse_property_line(line)
+            && p.key == key
         {
             target = Some(i);
             break;
@@ -702,7 +703,7 @@ pub fn unset_property(
         line: heading_line,
     })?;
 
-    let old_value = parse_property_line(&lines[target]).map(|(_, v)| v);
+    let old_value = parse_property_line(&lines[target]).map(|p| p.value);
 
     // Entry count in the drawer (between markers).
     let entry_count = end - 1 - start;
@@ -717,26 +718,6 @@ pub fn unset_property(
     record.key = Some(key.to_string());
     record.old = old_value;
     Ok((join_lines(&lines, trailing_newline), record))
-}
-
-/// Parse a `:KEY: value` property line, returning `(key, value)`.
-///
-/// The value keeps everything after the first space that follows the
-/// closing colon (trimmed of surrounding whitespace). Returns `None`
-/// when the line is not a property entry.
-fn parse_property_line(line: &str) -> Option<(String, String)> {
-    let trimmed = line.trim_start();
-    if !trimmed.starts_with(':') {
-        return None;
-    }
-    let rest = &trimmed[1..];
-    let close = rest.find(':')?;
-    let key = &rest[..close];
-    if key.is_empty() || key.eq_ignore_ascii_case("END") || key.eq_ignore_ascii_case("PROPERTIES") {
-        return None;
-    }
-    let value = rest[close + 1..].trim().to_string();
-    Some((key.to_string(), value))
 }
 
 /// The indentation for a freshly created `:PROPERTIES:` drawer.

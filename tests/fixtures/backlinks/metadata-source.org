@@ -1,0 +1,15 @@
+#+TITLE: Metadata source
+
+* Visit with metadata pointers
+:PROPERTIES:
+:PREDECESSOR: [[file:target.org][previous visit]]
+:TIMESTAMP_NOTE: le bilan cite [[file:unrelated.org][ce document]] sans conclure
+:END:
+:LOGBOOK:
+- Note taken on [2026-08-17 Mon] see [[file:unrelated.org][the note]]
+:END:
+
+The ``:PREDECESSOR:`` value above is a pure pointer, so it is a
+backlink to ``target.org``. The links to ``unrelated.org`` sit
+inside narrative prose and free-form drawer text, so they are
+citations rather than relations and must NOT be reported.

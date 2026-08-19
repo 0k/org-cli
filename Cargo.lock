@@ -947,7 +947,7 @@ dependencies = [
 [[package]]
 name = "kal-sse"
 version = "0.1.0"
-source = "git+https://github.com/0k/kal-sse?rev=30b279606e505892ad46e097b17a713b6235dd30#30b279606e505892ad46e097b17a713b6235dd30"
+source = "git+https://github.com/0k/kal-sse?rev=1e1a253e424380bb89b4d4821bcea354f7f06c42#1e1a253e424380bb89b4d4821bcea354f7f06c42"
 dependencies = [
  "async-stream",
  "axum",

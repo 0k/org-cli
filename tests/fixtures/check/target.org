@@ -1,0 +1,4 @@
+#+TITLE: Check target
+
+* Target
+The file that the valid links in ``source.org`` point at.

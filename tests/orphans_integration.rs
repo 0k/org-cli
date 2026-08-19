@@ -4,7 +4,11 @@
 //! `tests/fixtures/orphans/` and asserts:
 //!
 //! - exit code is 1 (orphans found),
-//! - the NDJSON stream contains exactly the three expected orphans,
+//! - the NDJSON stream contains exactly the four expected orphans,
+//! - `metadata-only.org`, reachable *only* through a `:PROPERTIES:`
+//!   pointer and a `:LOGBOOK:` note in `linker.org`, is still
+//!   reported: this command counts body links only, because an extra
+//!   edge here could only ever hide a forgotten file,
 //! - `--directory-references-all-children` removes
 //!   `ref-folder/child.org` from the orphan set,
 //! - `--filter-path sub` narrows the report to the `sub/` subtree.
@@ -44,7 +48,7 @@ fn parse_orphan_path(line: &str) -> String {
 }
 
 #[test]
-fn test_orphans_default_run_reports_three_orphans() {
+fn test_orphans_default_run_reports_four_orphans() {
     let fixture = fixture_root();
     let output = Command::new(bin_path())
         .arg("orphans")
@@ -53,7 +57,7 @@ fn test_orphans_default_run_reports_three_orphans() {
         .output()
         .expect("failed to spawn org-cli");
 
-    // Three orphans are present → exit code 1.
+    // Four orphans are present → exit code 1.
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -72,6 +76,8 @@ fn test_orphans_default_run_reports_three_orphans() {
         fixture.join("orphan.org"),
         fixture.join("ref-folder").join("child.org"),
         fixture.join("sub").join("unvisited.org"),
+        // Reachable only from metadata, which this command ignores.
+        fixture.join("metadata-only.org"),
     ]
     .iter()
     .map(|p| {
@@ -83,6 +89,45 @@ fn test_orphans_default_run_reports_three_orphans() {
     .collect();
 
     assert_eq!(paths, expected, "unexpected orphan set");
+}
+
+#[test]
+fn test_orphans_metadata_links_do_not_hide_a_forgotten_file() {
+    // `linker.org` points at `metadata-only.org` from a `:PROPERTIES:`
+    // value and a `:LOGBOOK:` note, and at `ref.org` from body text.
+    // Same hub, same link syntax, same target directory — the only
+    // difference is where the link sits. The metadata-only target must
+    // still be reported, the body-linked one must not.
+    let fixture = fixture_root();
+    let output = Command::new(bin_path())
+        .arg("orphans")
+        .arg("-j")
+        .arg(&fixture)
+        .output()
+        .expect("failed to spawn org-cli");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout not UTF-8");
+    let paths: BTreeSet<String> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(parse_orphan_path)
+        .collect();
+
+    let canon = |name: &str| {
+        std::fs::canonicalize(fixture.join(name))
+            .unwrap_or_else(|e| panic!("canonicalize {name}: {e}"))
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    assert!(
+        paths.contains(&canon("metadata-only.org")),
+        "a drawer/property pointer must not silence an orphan; got {paths:?}"
+    );
+    assert!(
+        !paths.contains(&canon("ref.org")),
+        "a body link still marks its target referenced; got {paths:?}"
+    );
 }
 
 #[test]
@@ -110,6 +155,7 @@ fn test_orphans_directory_flag_absorbs_folder_children() {
     let expected: BTreeSet<String> = [
         fixture.join("orphan.org"),
         fixture.join("sub").join("unvisited.org"),
+        fixture.join("metadata-only.org"),
     ]
     .iter()
     .map(|p| {

@@ -13,3 +13,16 @@ deterministic targets to surface.
   [[file:sub/visited.org][visited]]
 - Self-link so this hub isn't itself reported as orphan:
   [[file:linker.org][self]]
+
+* Metadata references
+:PROPERTIES:
+:PREDECESSOR: [[file:metadata-only.org][metadata only]]
+:END:
+:LOGBOOK:
+- Note taken on [2026-08-17 Mon] see [[file:metadata-only.org][again]]
+:END:
+
+The two links above are metadata, not body text. ``orphans``
+counts body links only, so ``metadata-only.org`` must still be
+reported as an orphan.
+

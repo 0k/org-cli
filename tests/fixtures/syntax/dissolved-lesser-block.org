@@ -1,0 +1,5 @@
+#+begin_src org
+* Unescaped heading dissolves the lesser block
+:PROPERTIES:
+:A: 1
+#+end_src

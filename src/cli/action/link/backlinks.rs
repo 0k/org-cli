@@ -1,9 +1,9 @@
-//! `backlinks` subcommand — targeted reverse link-graph query.
+//! `link backlinks` action — targeted reverse link-graph query.
 //!
-//! Where [`crate::cli::action::check`] asks "do all my links point
+//! Where [`crate::cli::action::link::check`] asks "do all my links point
 //! at real files?" (forward validity) and
-//! [`crate::cli::action::orphans`] asks "are *all* my files pointed
-//! at by *some* link?" (aggregate set-difference), `backlinks` asks
+//! [`crate::cli::action::link::orphans`] asks "are *all* my files pointed
+//! at by *some* link?" (aggregate set-difference), `link backlinks` asks
 //! the **targeted** reverse question: "which org files link to *this
 //! one* file?".
 //!
@@ -38,7 +38,7 @@
 //! inflate the reverse index with references the author never meant as
 //! navigation. Free-form drawer text is excluded for the same reason.
 //!
-//! [`crate::cli::action::check`] deliberately takes a wider view: it
+//! [`crate::cli::action::link::check`] deliberately takes a wider view: it
 //! validates every followable link, including those narrative ones,
 //! because a broken pointer is a defect wherever it sits.
 //!
@@ -66,7 +66,7 @@ use crate::org::link::{OriginPolicy, extract_file_links, resolve_target};
 /// the module docs for the rationale.
 const POLICY: OriginPolicy = OriginPolicy::BodyAndPurePointers;
 
-/// CLI options received from `Commands::Backlinks`.
+/// CLI options received from `LinkCommands::Backlinks`.
 #[derive(Debug, Clone)]
 pub struct BacklinksOptions {
     /// The file to find backlinks for. Resolved (canonicalized) the
@@ -96,8 +96,8 @@ pub struct Backlink {
 /// least one backlink was found, `Ok(1)` when none were found, `Err`
 /// on usage / I/O errors.
 ///
-/// The exit-code convention is deliberately the inverse of `check` /
-/// `orphans`: here "no backlinks" is the notable empty result worth
+/// The exit-code convention is deliberately the inverse of `link check` /
+/// `link orphans`: here "no backlinks" is the notable empty result worth
 /// signalling with a non-zero status (e.g. for scripts asserting a
 /// file *is* referenced before deleting it).
 pub fn run(opts: BacklinksOptions) -> Result<i32, String> {

@@ -1,7 +1,7 @@
-//! `orphans` subcommand — reverse link-graph query.
+//! `link orphans` action — reverse link-graph query.
 //!
-//! Where [`crate::cli::action::check`] asks "do all my links point
-//! at real files?", `orphans` asks the dual question: "are all my
+//! Where [`crate::cli::action::link::check`] asks "do all my links point
+//! at real files?", `link orphans` asks the dual question: "are all my
 //! files pointed at by some link?". Files that no `[[file:...]]`
 //! reference reaches are reported as orphans.
 //!
@@ -28,7 +28,7 @@
 //!
 //! ## Why metadata links are deliberately excluded
 //!
-//! Unlike [`crate::cli::action::check`], this command counts only
+//! Unlike [`crate::cli::action::link::check`], this command counts only
 //! [`crate::org::link::LinkOrigin::Body`] links
 //! ([`crate::org::link::OriginPolicy::BodyOnly`]). The asymmetry is
 //! intentional and follows from the direction of the error: an extra
@@ -53,7 +53,7 @@ use walkdir::WalkDir;
 use crate::cli::action::walk::collect_org_files;
 use crate::org::link::{OriginPolicy, ResolvedTarget, collect_referenced_paths};
 
-/// CLI options for the `orphans` subcommand.
+/// CLI options for the `link orphans` action.
 #[derive(Debug, Clone)]
 pub struct OrphansOptions {
     /// Paths to scan for both `[[file:...]]` link sources (org

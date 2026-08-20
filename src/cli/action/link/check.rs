@@ -1,4 +1,4 @@
-//! `check` subcommand — link integrity check for org files.
+//! `link check` action — link integrity check for org files.
 //!
 //! Walks the requested paths (files and directories), parses every
 //! `.org` file with [`crate::org::link::extract_file_links`], resolves
@@ -21,7 +21,7 @@
 //!
 //! This is wider than the other two link-graph commands on purpose.
 //! Here an extra link can only ever *add* a warning, so erring towards
-//! inclusion is safe; for [`crate::cli::action::orphans`] the same edge
+//! inclusion is safe; for [`crate::cli::action::link::orphans`] the same edge
 //! would remove one. Each broken link reports its
 //! [`crate::org::link::LinkOrigin`], so a consumer can tell a broken
 //! prose link from a broken `:SOURCE_AUDIO:` pointer and treat them at
@@ -46,7 +46,7 @@ use crate::org::link::{
 /// Everything a user can follow — see the module docs.
 const POLICY: OriginPolicy = OriginPolicy::AllFollowable;
 
-/// CLI options received from `Commands::Check`.
+/// CLI options received from `LinkCommands::Check`.
 #[derive(Debug, Clone)]
 pub struct CheckOptions {
     pub paths: Vec<PathBuf>,
@@ -315,7 +315,7 @@ fn nul_origin(b: &BrokenLink) -> String {
 ///
 /// Empty for body links, whose line and column already locate them
 /// unambiguously — this keeps the historical output byte-identical for
-/// the links `check` already reported.
+/// the links `link check` already reported.
 fn human_origin(b: &BrokenLink) -> String {
     match (b.origin_drawer.as_deref(), b.origin_property.as_deref()) {
         (Some(drawer), Some(key)) => format!(" in :{}: drawer, property :{}:", drawer, key),
@@ -326,7 +326,7 @@ fn human_origin(b: &BrokenLink) -> String {
 
 /// Wraps stdout and selects the right serializer per CLI flags.
 /// Inline here on purpose — Plan 03 will lift the `output/` module
-/// for `headings`, and `check` will be retrofitted at that point.
+/// for `headings`, and `link check` will be retrofitted at that point.
 struct StdoutWriter<'a> {
     opts: &'a CheckOptions,
     stdout: io::BufWriter<io::Stdout>,
@@ -532,7 +532,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Drawer / property links. `check` validates everything a user can
+    // Drawer / property links. `link check` validates everything a user can
     // follow, so a broken metadata pointer must not read as a clean run.
     // -----------------------------------------------------------------
 
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_run_validates_narrative_property_links_too() {
-        // Unlike `backlinks`, `check` does not care whether the value
+        // Unlike `link backlinks`, `link check` does not care whether the value
         // is a pure pointer: Emacs opens it either way.
         let td = TempDir::new("prose-broken");
         write(

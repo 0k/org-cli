@@ -1,4 +1,4 @@
-//! End-to-end test for the `backlinks` subcommand.
+//! End-to-end test for the `link backlinks` action.
 //!
 //! Spawns the actual `org-cli` binary against the fixture tree at
 //! `tests/fixtures/backlinks/` and asserts:
@@ -53,6 +53,7 @@ fn parse_source_file(line: &str) -> String {
 /// The set of `source_file` values reported for `target`.
 fn backlink_sources(target: &Path) -> BTreeSet<String> {
     let output = Command::new(bin_path())
+        .arg("link")
         .arg("backlinks")
         .arg("-j")
         .arg(target)
@@ -72,6 +73,7 @@ fn test_backlinks_finds_both_referencing_sources() {
     let fixture = fixture_root();
     let target = fixture.join("target.org");
     let output = Command::new(bin_path())
+        .arg("link")
         .arg("backlinks")
         .arg("-j")
         .arg(&target)
@@ -145,6 +147,7 @@ fn test_backlinks_target_with_no_backlinks_exits_one() {
     // nested/source-b.org is linked by nobody in the tree.
     let target = fixture.join("nested").join("source-b.org");
     let output = Command::new(bin_path())
+        .arg("link")
         .arg("backlinks")
         .arg("-j")
         .arg(&target)
@@ -173,6 +176,7 @@ fn test_backlinks_first_flag_stops_early() {
     let fixture = fixture_root();
     let target = fixture.join("target.org");
     let output = Command::new(bin_path())
+        .arg("link")
         .arg("backlinks")
         .arg("-j")
         .arg("--first")

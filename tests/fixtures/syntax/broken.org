@@ -1,0 +1,16 @@
+#+TITLE: Structurally broken fixture
+
+* Drawer never closed, bounded by the next headline
+:PROPERTIES:
+:AUTHOR: X
+:SCOPE: important
+
+** Next heading ends the search
+Body prose.
+
+* Stray terminator with nothing open
+:END:
+
+* Block never closed, runs to end of file
+#+begin_src rust
+fn main() {}

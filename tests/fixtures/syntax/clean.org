@@ -1,0 +1,33 @@
+#+TITLE: Structurally clean fixture
+
+* Heading with a balanced drawer
+:PROPERTIES:
+:AUTHOR: X
+:SCOPE: important
+:END:
+
+Body prose.
+
+* Heading with a balanced logbook
+  :LOGBOOK:
+  - Note taken on [2026-08-17 Mon]
+  :END:
+
+* Heading quoting org syntax inside a block
+
+Block content is literal: the lines below are text, not structure.
+
+#+begin_example
+,* This is not a heading
+:PROPERTIES:
+:UNCLOSED: on purpose
+#+end_example
+
+#+begin_src sh
+echo "not a heading either: * nope"
+#+end_src
+
+* Heading with emphasis that is not a headline
+:PROPERTIES:
+:NOTE: the *emphasis* below must not end this drawer
+:END:

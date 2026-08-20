@@ -1,7 +1,7 @@
 //! Filesystem walker shared by every subcommand whose input is a
 //! mix of org files and directories.
 //!
-//! Centralizing this here prevents `check`, `orphans`, and any
+//! Centralizing this here prevents `link check`, `link orphans`, and any
 //! future subcommand from each growing their own slightly-different
 //! traversal. The traversal rules are:
 //!

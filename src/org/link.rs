@@ -4,9 +4,9 @@
 //! links found in an org document, plus the indexing of anchorable
 //! targets (headings, `:CUSTOM_ID:` properties) inside an org file.
 //!
-//! Higher layers (`crate::cli::action::check`,
-//! `crate::cli::action::orphans`,
-//! `crate::cli::action::backlinks`) consume these to validate cross-file
+//! Higher layers (`crate::cli::action::link::check`,
+//! `crate::cli::action::link::orphans`,
+//! `crate::cli::action::link::backlinks`) consume these to validate cross-file
 //! link integrity (forward) or detect unreferenced files (reverse).
 //!
 //! # Where links live: body, drawers, and property values
@@ -80,7 +80,7 @@ pub struct Link {
     /// 1-based column number of the link's opening `[[` in the source.
     pub column: usize,
     /// Where in the document structure the link was found. Consumers
-    /// filter on this via [`OriginPolicy`]; `check` also reports it so
+    /// filter on this via [`OriginPolicy`]; `link check` also reports it so
     /// a broken metadata pointer is distinguishable from a broken
     /// prose link.
     pub origin: LinkOrigin,
@@ -145,7 +145,7 @@ impl LinkOrigin {
         )
     }
 
-    /// Human-readable origin suffix used in `check` diagnostics, e.g.
+    /// Human-readable origin suffix used in `link check` diagnostics, e.g.
     /// `" in :PROPERTIES: :SOURCE_AUDIO:"`. Empty for body links, whose
     /// line/column already say everything.
     pub fn describe(&self) -> String {
@@ -164,15 +164,15 @@ impl LinkOrigin {
 /// The three link-graph commands make different promises, so they take
 /// different rows here rather than sharing one edge set:
 ///
-/// - `check` promises *followability*: Emacs opens a link in a drawer
+/// - `link check` promises *followability*: Emacs opens a link in a drawer
 ///   or a property value, so a broken one is a defect a user can hit.
 ///   It takes [`OriginPolicy::AllFollowable`].
-/// - `backlinks` promises *meaningful reverse navigation*. A property
+/// - `link backlinks` promises *meaningful reverse navigation*. A property
 ///   whose value IS a link asserts a relation; a link buried in a long
 ///   narrative property value is a citation inside prose, and promoting
 ///   it to an edge inflates the reverse index. It takes
 ///   [`OriginPolicy::BodyAndPurePointers`].
-/// - `orphans` promises to *surface unreferenced files*. Every added
+/// - `link orphans` promises to *surface unreferenced files*. Every added
 ///   edge can only suppress an orphan report, never produce one, so
 ///   widening the edge set here can only hide a genuinely forgotten
 ///   document. It keeps [`OriginPolicy::BodyOnly`], leaving its
@@ -348,13 +348,13 @@ pub struct ResolvedTarget {
 
 /// Resolve a single [`Link`]'s target against a source directory.
 ///
-/// Used by both `check` (forward link validation) and `orphans`
+/// Used by both `link check` (forward link validation) and `link orphans`
 /// (reverse, unreferenced-file detection). Anchors are *not*
 /// considered here — the caller validates them separately if needed.
 ///
 /// The returned path is canonicalized when possible (target exists),
 /// otherwise lexically joined. This matches the historical behavior
-/// of `cli::action::check::resolve_path`.
+/// of `cli::action::link::check::resolve_path`.
 pub fn resolve_target(source_dir: &Path, link: &Link) -> ResolvedTarget {
     let expanded = expand_tilde(&link.target_path);
     let joined = if expanded.is_absolute() {
@@ -412,10 +412,10 @@ fn expand_tilde(path: &Path) -> PathBuf {
 ///
 /// I/O failures on a single org file are logged via `log::warn!` and
 /// the file is skipped — same defensive policy as
-/// [`crate::cli::action::check`].
+/// [`crate::cli::action::link::check`].
 ///
-/// This is the **graph-walk core** behind `orphans` (reverse
-/// integrity: which on-disk files are *not* in this set?). `orphans`
+/// This is the **graph-walk core** behind `link orphans` (reverse
+/// integrity: which on-disk files are *not* in this set?). `link orphans`
 /// passes [`OriginPolicy::BodyOnly`]: an extra edge there can only
 /// suppress a warning, never raise one.
 pub fn collect_referenced_paths(
@@ -879,8 +879,8 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Tests for the shared resolver / collector used by both `check`
-    // and `orphans`.
+    // Tests for the shared resolver / collector used by both `link check`
+    // and `link orphans`.
     // ---------------------------------------------------------------
 
     /// Same tempdir helper as `check.rs::tests` — duplicated here on

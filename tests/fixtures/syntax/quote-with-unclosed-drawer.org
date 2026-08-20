@@ -1,0 +1,4 @@
+#+begin_quote
+:PROPERTIES:
+:A: 1
+#+end_quote

@@ -269,7 +269,7 @@ fn add_inserts_canonical_clock_into_target_heading() {
         .arg("check")
         .arg(&p)
         .output()
-        .expect("spawn org-cli check");
+        .expect("spawn org-cli clock check");
     assert_eq!(
         chk.status.code(),
         Some(0),

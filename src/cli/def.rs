@@ -27,128 +27,23 @@ pub struct Args {
 /// Available commands
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Check that every `[[file:...]]` link in the given org files
-    /// resolves to an existing path (and heading anchor, if any).
-    Check {
-        /// Files or directories to scan. Directories are walked
-        /// recursively; only `*.org` files are inspected.
-        #[arg(default_value = ".")]
-        paths: Vec<std::path::PathBuf>,
-
-        /// NUL-separated record output (for safe shell piping).
-        #[arg(short = '0', conflicts_with = "json")]
-        nul: bool,
-
-        /// NDJSON output (one JSON object per broken link).
-        #[arg(short = 'j', long)]
-        json: bool,
-
-        /// Stop at the first broken link.
-        #[arg(short = '1', long)]
-        first: bool,
-
-        /// Treat warnings (e.g. unresolved `::N` line anchors) as errors.
-        #[arg(long)]
-        strict: bool,
-
-        /// Require exact heading match for `[[file:...::*Heading]]`
-        /// anchors. By default, heading anchors match any headline
-        /// whose title contains the anchor text as a substring, which
-        /// mirrors Emacs' org-mode default link-following behavior.
-        #[arg(long)]
-        strict_headings: bool,
+    /// Query the org *link graph*: validate links, find unreferenced
+    /// files, or list what points at a file.
+    ///
+    /// A link defect is a property of the graph, not of one file:
+    /// deleting `a.org` breaks links that live in *other* files. These
+    /// actions therefore scan the whole corpus by default — narrowing
+    /// the scope hides exactly the inbound breakage you want to catch.
+    Link {
+        #[command(subcommand)]
+        action: LinkCommands,
     },
 
-    /// Find files that are *not* the target of any `[[file:...]]`
-    /// link anywhere in the scanned org graph (orphans /
-    /// "forgotten by the graph").
-    ///
-    /// PATH... gives the link-graph scope (which org files to scan
-    /// for links). The candidate set (which files to check for
-    /// orphan-ness) defaults to the same paths but can be narrowed
-    /// with --filter-path or widened to non-org files via
-    /// --include-ext.
-    Orphans {
-        /// Files or directories to scan for `[[file:...]]` links
-        /// AND, by default, to look for candidate files in. Walked
-        /// recursively for `*.org` files (link sources) and for
-        /// candidate files matching --include-ext.
-        #[arg(default_value = ".")]
-        paths: Vec<std::path::PathBuf>,
-
-        /// NUL-separated record output (for safe shell piping).
-        #[arg(short = '0', conflicts_with = "json")]
-        nul: bool,
-
-        /// NDJSON output (one JSON object per orphan).
-        #[arg(short = 'j', long)]
-        json: bool,
-
-        /// Stop at the first orphan found.
-        #[arg(short = '1', long)]
-        first: bool,
-
-        /// Only report orphans whose path is under one of these
-        /// prefixes (after canonicalization). Repeatable. When
-        /// omitted, every orphan found is reported.
-        #[arg(long = "filter-path", value_name = "PATH")]
-        filter_paths: Vec<std::path::PathBuf>,
-
-        /// File extensions to consider as orphan candidates.
-        /// Repeatable. Default: `org`. Pass e.g. `--include-ext pdf
-        /// --include-ext jpg` to widen the candidate set.
-        #[arg(long = "include-ext", value_name = "EXT")]
-        include_exts: Vec<String>,
-
-        /// Glob patterns to skip when scanning candidate files
-        /// (e.g. `--exclude '**/.git/**'`). Repeatable.
-        #[arg(long = "exclude", value_name = "GLOB")]
-        exclude_globs: Vec<String>,
-
-        /// When a link points to `foo/`, treat every file inside
-        /// `foo/` (recursively) as referenced. Default off: only
-        /// `foo/` itself is referenced.
-        #[arg(long = "directory-references-all-children")]
-        directory_references_all_children: bool,
-    },
-
-    /// Find every org file that links to TARGET via a
-    /// `[[file:...]]` reference (reverse link-graph query /
-    /// "backlinks").
-    ///
-    /// TARGET and every scanned link are canonicalized the same
-    /// way, so a link written `[[file:../target.org]]` from a
-    /// nested directory matches a TARGET given as `target.org` from
-    /// the root — something a naive `grep` cannot do.
-    ///
-    /// Exits 0 when at least one backlink is found, 1 when none are
-    /// (the inverse of `check`/`orphans`: here "no backlinks" is the
-    /// notable result, useful for asserting a file *is* referenced
-    /// before deleting it).
-    ///
-    /// v1 considers only `[[file:...]]` links; content references
-    /// (`#+INCLUDE:`, `id:` links, raw text) are out of scope.
-    Backlinks {
-        /// The file to find backlinks for.
-        target: std::path::PathBuf,
-
-        /// Files or directories giving the link-graph scope (which
-        /// org files to scan for links). Directories are walked
-        /// recursively; only `*.org` files are inspected.
-        #[arg(default_value = ".")]
-        paths: Vec<std::path::PathBuf>,
-
-        /// NUL-separated record output (for safe shell piping).
-        #[arg(short = '0', conflicts_with = "json")]
-        nul: bool,
-
-        /// NDJSON output (one JSON object per backlink).
-        #[arg(short = 'j', long)]
-        json: bool,
-
-        /// Stop at the first backlink found.
-        #[arg(short = '1', long)]
-        first: bool,
+    /// Check the structural validity of org files themselves
+    /// (block and drawer delimiters).
+    Syntax {
+        #[command(subcommand)]
+        action: SyntaxCommands,
     },
 
     /// List headings across org files with optional title/property filters.
@@ -282,6 +177,173 @@ pub enum Commands {
         /// (`~/.cache/org-cli/todos.sqlite`).
         #[arg(long = "db", value_name = "PATH")]
         db: Option<std::path::PathBuf>,
+    },
+}
+
+/// `org-cli link <action>` sub-actions — queries over the link graph.
+#[derive(Subcommand, Debug)]
+pub enum LinkCommands {
+    /// Check that every `[[file:...]]` link in the given org files
+    /// resolves to an existing path (and heading anchor, if any).
+    ///
+    /// Scans the whole corpus by default. Narrowing PATHS to the files
+    /// you just changed will *miss* breakage: deleting a file breaks
+    /// the links pointing at it, and those live elsewhere.
+    Check {
+        /// Files or directories to scan. Directories are walked
+        /// recursively; only `*.org` files are inspected.
+        #[arg(default_value = ".")]
+        paths: Vec<std::path::PathBuf>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per broken link).
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Stop at the first broken link.
+        #[arg(short = '1', long)]
+        first: bool,
+
+        /// Treat warnings (e.g. unresolved `::N` line anchors) as errors.
+        #[arg(long)]
+        strict: bool,
+
+        /// Require exact heading match for `[[file:...::*Heading]]`
+        /// anchors. By default, heading anchors match any headline
+        /// whose title contains the anchor text as a substring, which
+        /// mirrors Emacs' org-mode default link-following behavior.
+        #[arg(long)]
+        strict_headings: bool,
+    },
+
+    /// Find files that are *not* the target of any `[[file:...]]`
+    /// link anywhere in the scanned org graph (orphans /
+    /// "forgotten by the graph").
+    ///
+    /// PATH... gives the link-graph scope (which org files to scan
+    /// for links). The candidate set (which files to check for
+    /// orphan-ness) defaults to the same paths but can be narrowed
+    /// with --filter-path or widened to non-org files via
+    /// --include-ext.
+    Orphans {
+        /// Files or directories to scan for `[[file:...]]` links
+        /// AND, by default, to look for candidate files in. Walked
+        /// recursively for `*.org` files (link sources) and for
+        /// candidate files matching --include-ext.
+        #[arg(default_value = ".")]
+        paths: Vec<std::path::PathBuf>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per orphan).
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Stop at the first orphan found.
+        #[arg(short = '1', long)]
+        first: bool,
+
+        /// Only report orphans whose path is under one of these
+        /// prefixes (after canonicalization). Repeatable. When
+        /// omitted, every orphan found is reported.
+        #[arg(long = "filter-path", value_name = "PATH")]
+        filter_paths: Vec<std::path::PathBuf>,
+
+        /// File extensions to consider as orphan candidates.
+        /// Repeatable. Default: `org`. Pass e.g. `--include-ext pdf
+        /// --include-ext jpg` to widen the candidate set.
+        #[arg(long = "include-ext", value_name = "EXT")]
+        include_exts: Vec<String>,
+
+        /// Glob patterns to skip when scanning candidate files
+        /// (e.g. `--exclude '**/.git/**'`). Repeatable.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude_globs: Vec<String>,
+
+        /// When a link points to `foo/`, treat every file inside
+        /// `foo/` (recursively) as referenced. Default off: only
+        /// `foo/` itself is referenced.
+        #[arg(long = "directory-references-all-children")]
+        directory_references_all_children: bool,
+    },
+
+    /// Find every org file that links to TARGET via a
+    /// `[[file:...]]` reference (reverse link-graph query /
+    /// "backlinks").
+    ///
+    /// TARGET and every scanned link are canonicalized the same
+    /// way, so a link written `[[file:../target.org]]` from a
+    /// nested directory matches a TARGET given as `target.org` from
+    /// the root — something a naive `grep` cannot do.
+    ///
+    /// Exits 0 when at least one backlink is found, 1 when none are
+    /// (the inverse of `link check` / `link orphans`: here "no
+    /// backlinks" is the notable result, useful for asserting a file
+    /// *is* referenced before deleting it).
+    ///
+    /// v1 considers only `[[file:...]]` links; content references
+    /// (`#+INCLUDE:`, `id:` links, raw text) are out of scope.
+    Backlinks {
+        /// The file to find backlinks for.
+        target: std::path::PathBuf,
+
+        /// Files or directories giving the link-graph scope (which
+        /// org files to scan for links). Directories are walked
+        /// recursively; only `*.org` files are inspected.
+        #[arg(default_value = ".")]
+        paths: Vec<std::path::PathBuf>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per backlink).
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Stop at the first backlink found.
+        #[arg(short = '1', long)]
+        first: bool,
+    },
+}
+
+/// `org-cli syntax <action>` sub-actions — per-file structure.
+#[derive(Subcommand, Debug)]
+pub enum SyntaxCommands {
+    /// Check that block and drawer delimiters balance: every
+    /// `#+begin_X` has its `#+end_X`, every `:PROPERTIES:` /
+    /// `:LOGBOOK:` its `:END:`.
+    ///
+    /// A defect here is local to one file, so PATHS can safely be
+    /// narrowed to just the files a commit touches — unlike
+    /// `link check`, which needs the whole corpus.
+    ///
+    /// This matters because an unterminated drawer breaks no link: it
+    /// silently removes every property inside it from the parse, so a
+    /// link-only gate stays green while the metadata becomes
+    /// machine-invisible.
+    Check {
+        /// Files or directories to scan. Directories are walked
+        /// recursively; only `*.org` files are inspected.
+        #[arg(default_value = ".")]
+        paths: Vec<std::path::PathBuf>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per defect).
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Stop at the first defect.
+        #[arg(short = '1', long)]
+        first: bool,
     },
 }
 

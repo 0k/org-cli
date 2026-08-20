@@ -1,4 +1,4 @@
-//! End-to-end test for the `orphans` subcommand.
+//! End-to-end test for the `link orphans` action.
 //!
 //! Spawns the actual `org-cli` binary against the fixture tree at
 //! `tests/fixtures/orphans/` and asserts:
@@ -51,6 +51,7 @@ fn parse_orphan_path(line: &str) -> String {
 fn test_orphans_default_run_reports_four_orphans() {
     let fixture = fixture_root();
     let output = Command::new(bin_path())
+        .arg("link")
         .arg("orphans")
         .arg("-j")
         .arg(&fixture)
@@ -100,6 +101,7 @@ fn test_orphans_metadata_links_do_not_hide_a_forgotten_file() {
     // still be reported, the body-linked one must not.
     let fixture = fixture_root();
     let output = Command::new(bin_path())
+        .arg("link")
         .arg("orphans")
         .arg("-j")
         .arg(&fixture)
@@ -134,6 +136,7 @@ fn test_orphans_metadata_links_do_not_hide_a_forgotten_file() {
 fn test_orphans_directory_flag_absorbs_folder_children() {
     let fixture = fixture_root();
     let output = Command::new(bin_path())
+        .arg("link")
         .arg("orphans")
         .arg("-j")
         .arg("--directory-references-all-children")
@@ -173,6 +176,7 @@ fn test_orphans_directory_flag_absorbs_folder_children() {
 fn test_orphans_filter_path_narrows_to_subtree() {
     let fixture = fixture_root();
     let output = Command::new(bin_path())
+        .arg("link")
         .arg("orphans")
         .arg("-j")
         .arg("--filter-path")

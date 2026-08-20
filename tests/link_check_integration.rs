@@ -1,4 +1,4 @@
-//! End-to-end tests for the `check` subcommand.
+//! End-to-end tests for the `link check` action.
 //!
 //! Spawns the actual `org-cli` binary against the fixture tree at
 //! `tests/fixtures/check/` and asserts the *specification* of what
@@ -35,6 +35,7 @@ fn bin_path() -> PathBuf {
 /// `(exit_code, stdout)`.
 fn run_check(args: &[&str]) -> (Option<i32>, String) {
     let output = Command::new(bin_path())
+        .arg("link")
         .arg("check")
         .args(args)
         .arg(fixture_root())
@@ -228,6 +229,7 @@ fn test_check_clean_tree_reports_no_broken_links() {
     // Guards the fixture assertions from passing vacuously: a tree
     // whose only file has no links must exit 0.
     let output = Command::new(bin_path())
+        .arg("link")
         .arg("check")
         .arg(fixture_root().join("target.org"))
         .output()

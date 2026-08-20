@@ -1,0 +1,7 @@
+#+begin_quote
+#+begin_src org
+* Unescaped heading
+:PROPERTIES:
+:A: 1
+#+end_src
+#+end_quote

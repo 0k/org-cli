@@ -35,74 +35,34 @@ pub fn run() -> Result<(), String> {
             println!("Run with --help for usage information.");
             Ok(())
         }
-        Some(def::Commands::Check {
-            paths,
-            nul,
-            json,
-            first,
-            strict,
-            strict_headings,
-        }) => {
-            let opts = action::check::CheckOptions {
-                paths,
-                nul,
-                json,
-                first,
-                strict,
-                strict_headings,
-            };
-            let exit_code = action::check::run(opts)?;
+        Some(def::Commands::Link { action: link_cmd }) => {
+            let exit_code = dispatch_link(link_cmd)?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
             Ok(())
         }
-        Some(def::Commands::Orphans {
-            paths,
-            nul,
-            json,
-            first,
-            filter_paths,
-            include_exts,
-            exclude_globs,
-            directory_references_all_children,
-        }) => {
-            let opts = action::orphans::OrphansOptions {
+
+        Some(def::Commands::Syntax { action: syntax_cmd }) => match syntax_cmd {
+            def::SyntaxCommands::Check {
                 paths,
                 nul,
                 json,
                 first,
-                filter_paths,
-                include_exts,
-                exclude_globs,
-                directory_references_all_children,
-            };
-            let exit_code = action::orphans::run(opts)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
+            } => {
+                let opts = action::syntax::check::CheckOptions {
+                    paths,
+                    nul,
+                    json,
+                    first,
+                };
+                let exit_code = action::syntax::check::run(opts)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        Some(def::Commands::Backlinks {
-            target,
-            paths,
-            nul,
-            json,
-            first,
-        }) => {
-            let opts = action::backlinks::BacklinksOptions {
-                target,
-                paths,
-                nul,
-                json,
-                first,
-            };
-            let exit_code = action::backlinks::run(opts)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
-        }
+        },
         Some(def::Commands::Headings {
             paths,
             exclude,
@@ -280,6 +240,61 @@ pub fn run() -> Result<(), String> {
             }
             Ok(())
         }
+    }
+}
+
+/// Dispatch the `link` sub-actions to their orchestration functions.
+/// Factored out of [`run`] for the same reason as [`dispatch_heading`]:
+/// three subcommands, each with a wide option set.
+fn dispatch_link(cmd: def::LinkCommands) -> Result<i32, String> {
+    match cmd {
+        def::LinkCommands::Check {
+            paths,
+            nul,
+            json,
+            first,
+            strict,
+            strict_headings,
+        } => action::link::check::run(action::link::check::CheckOptions {
+            paths,
+            nul,
+            json,
+            first,
+            strict,
+            strict_headings,
+        }),
+        def::LinkCommands::Orphans {
+            paths,
+            nul,
+            json,
+            first,
+            filter_paths,
+            include_exts,
+            exclude_globs,
+            directory_references_all_children,
+        } => action::link::orphans::run(action::link::orphans::OrphansOptions {
+            paths,
+            nul,
+            json,
+            first,
+            filter_paths,
+            include_exts,
+            exclude_globs,
+            directory_references_all_children,
+        }),
+        def::LinkCommands::Backlinks {
+            target,
+            paths,
+            nul,
+            json,
+            first,
+        } => action::link::backlinks::run(action::link::backlinks::BacklinksOptions {
+            target,
+            paths,
+            nul,
+            json,
+            first,
+        }),
     }
 }
 

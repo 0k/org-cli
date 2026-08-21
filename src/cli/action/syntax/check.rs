@@ -1,8 +1,8 @@
 //! `syntax check` action — structural validity of org files.
 //!
 //! Walks the requested paths, scans every `.org` file with
-//! [`crate::org::syntax::scan`], and reports unbalanced block and
-//! drawer delimiters.
+//! [`crate::org::syntax::scan`], and reports invalid block, generic
+//! drawer, and property-drawer structure.
 //!
 //! This module is the *orchestration* layer; what counts as a defect
 //! lives in [`crate::org::syntax`].

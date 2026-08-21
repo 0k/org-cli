@@ -1,0 +1,49 @@
+* Valid properties then logbook
+:PROPERTIES:
+:A: one
+:END:
+:LOGBOOK:
+- note
+:END:
+
+* Blank before properties
+
+:PROPERTIES:
+:A: two
+:END:
+
+* Logbook before properties
+:LOGBOOK:
+- note
+:END:
+:PROPERTIES:
+:A: three
+:END:
+
+* Invalid property content
+:PROPERTIES:
+:A: four
+
+:B: five
+:END:
+
+* Nested generic drawer
+:OUTER:
+:INNER:
+:END:
+:END:
+
+* Headline in generic drawer
+:LOGBOOK:
+- note
+** Heading escapes drawer
+:END:
+
+* Paired END drawer
+:END:
+text
+:END:
+
+* Invalid opener
+:BAD.NAME:
+:END:

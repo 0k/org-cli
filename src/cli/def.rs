@@ -40,7 +40,7 @@ pub enum Commands {
     },
 
     /// Check the structural validity of org files themselves
-    /// (block and drawer delimiters).
+    /// (blocks, drawers, and property metadata).
     Syntax {
         #[command(subcommand)]
         action: SyntaxCommands,
@@ -315,9 +315,10 @@ pub enum LinkCommands {
 /// `org-cli syntax <action>` sub-actions — per-file structure.
 #[derive(Subcommand, Debug)]
 pub enum SyntaxCommands {
-    /// Check that block and drawer delimiters balance: every
-    /// `#+begin_X` has its `#+end_X`, every `:PROPERTIES:` /
-    /// `:LOGBOOK:` its `:END:`.
+    /// Check block and drawer structure: delimiters balance,
+    /// `:PROPERTIES:` drawers occupy their privileged heading position
+    /// and contain only node properties, and generic drawers contain
+    /// neither headlines nor nested drawers.
     ///
     /// A defect here is local to one file, so PATHS can safely be
     /// narrowed to just the files a commit touches — unlike

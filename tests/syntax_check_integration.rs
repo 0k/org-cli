@@ -103,10 +103,11 @@ fn test_syntax_check_reports_dissolved_lesser_block_like_emacs() {
         got,
         vec![
             (1, "unterminated-block".to_string()),
+            (3, "invalid-property-drawer-content".to_string()),
             (3, "unterminated-drawer".to_string()),
             (5, "stray-block-end".to_string()),
         ],
-        "must match Emacs org-lint's three findings for this shape"
+        "must report both raw balance and invalid property semantics"
     );
 }
 
@@ -130,6 +131,7 @@ fn test_syntax_check_reports_nested_failures_inside_greater_block() {
         vec![
             (1, "unterminated-block".to_string()),
             (2, "unterminated-block".to_string()),
+            (4, "invalid-property-drawer-content".to_string()),
             (4, "unterminated-drawer".to_string()),
             (6, "stray-block-end".to_string()),
             (7, "stray-block-end".to_string()),
@@ -146,10 +148,15 @@ fn test_syntax_check_keeps_parent_greater_end_valid_around_broken_drawer() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(rows.len(), 1, "only the drawer is incomplete: {rows:?}");
-    assert_eq!(rows[0]["reason_tag"], "unterminated-drawer");
-    assert_eq!(rows[0]["line"], 2);
-    assert_eq!(rows[0]["bounded_at"], 4);
+    assert_eq!(
+        rows.len(),
+        2,
+        "property placement and closure both fail: {rows:?}"
+    );
+    assert_eq!(rows[0]["reason_tag"], "misplaced-property-drawer");
+    assert_eq!(rows[1]["reason_tag"], "unterminated-drawer");
+    assert_eq!(rows[1]["line"], 2);
+    assert_eq!(rows[1]["bounded_at"], 4);
 }
 
 #[test]
@@ -163,6 +170,68 @@ fn test_syntax_check_rejects_trailing_garbage_on_end_marker() {
         .map(|v| v["reason_tag"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(tags, vec!["unterminated-block", "invalid-block-end"]);
+}
+
+#[test]
+fn test_syntax_check_reports_official_drawer_semantic_errors() {
+    let target = fixture_root().join("drawer-semantics.org");
+    let (code, stdout) = run_syntax(&["-j"], &target);
+    assert_eq!(code, Some(1));
+    let got: Vec<(u64, String)> = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .map(|v| {
+            (
+                v["line"].as_u64().unwrap(),
+                v["reason_tag"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (11, "misplaced-property-drawer".to_string()),
+            (19, "misplaced-property-drawer".to_string()),
+            (24, "invalid-property-drawer-content".to_string()),
+            (32, "nested-drawer".to_string()),
+            (34, "stray-drawer-end".to_string()),
+            (37, "headline-in-drawer".to_string()),
+            (40, "stray-drawer-end".to_string()),
+            (49, "stray-drawer-end".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_syntax_check_human_output_names_drawer_semantic_error() {
+    let target = fixture_root().join("drawer-semantics.org");
+    let (code, stdout) = run_syntax(&[], &target);
+    assert_eq!(code, Some(1));
+    assert!(
+        stdout.contains("drawer-semantics.org:11: misplaced-property-drawer"),
+        "got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("8 syntax defect(s) found"),
+        "got:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_syntax_check_nul_output_carries_drawer_semantic_tags() {
+    let target = fixture_root().join("drawer-semantics.org");
+    let (code, stdout) = run_syntax(&["-0"], &target);
+    assert_eq!(code, Some(1));
+    let records: Vec<&str> = stdout.split("\0\0").filter(|r| !r.is_empty()).collect();
+    assert_eq!(records.len(), 8);
+    let tags: BTreeSet<&str> = records
+        .iter()
+        .map(|record| record.split('\0').nth(2).expect("reason tag field"))
+        .collect();
+    assert!(tags.contains("misplaced-property-drawer"));
+    assert!(tags.contains("invalid-property-drawer-content"));
+    assert!(tags.contains("nested-drawer"));
+    assert!(tags.contains("headline-in-drawer"));
 }
 
 // ---------------------------------------------------------------------
@@ -184,8 +253,9 @@ fn test_syntax_check_reports_every_defect_shape() {
         .collect();
 
     let expected: BTreeSet<(String, u64)> = [
-        // opener line of the drawer that is never closed
-        ("unterminated-drawer", 4),
+        // property semantics fail at the opener and the next heading
+        ("invalid-property-drawer-content", 4),
+        ("headline-in-drawer", 4),
         // the stray `:END:` itself
         ("stray-drawer-end", 12),
         // opener line of the block that runs to EOF
@@ -206,7 +276,7 @@ fn test_syntax_check_names_the_bounding_line() {
     let records = json_records();
     let drawer = records
         .iter()
-        .find(|v| v["reason_tag"] == "unterminated-drawer")
+        .find(|v| v["reason_tag"] == "headline-in-drawer")
         .expect("drawer defect present");
 
     assert_eq!(drawer["construct"], "PROPERTIES");
@@ -218,7 +288,7 @@ fn test_syntax_check_names_the_bounding_line() {
         drawer["reason_message"]
             .as_str()
             .expect("reason_message is a string")
-            .contains("boundary at line 8"),
+            .contains("headline at line 8"),
     );
 }
 
@@ -244,7 +314,7 @@ fn test_syntax_check_human_output_shows_location_and_opener() {
     assert_eq!(code, Some(1));
 
     assert!(
-        stdout.contains("broken.org:4: unterminated-drawer"),
+        stdout.contains("broken.org:4: invalid-property-drawer-content"),
         "human output must locate the opener; got:\n{stdout}"
     );
     assert!(
@@ -252,7 +322,7 @@ fn test_syntax_check_human_output_shows_location_and_opener() {
         "human output must echo the opening line; got:\n{stdout}"
     );
     assert!(
-        stdout.contains("3 syntax defect(s) found"),
+        stdout.contains("4 syntax defect(s) found"),
         "human output must summarise; got:\n{stdout}"
     );
 }
@@ -268,7 +338,7 @@ fn test_syntax_check_nul_records_have_six_fields() {
     assert_eq!(code, Some(1));
 
     let records: Vec<&str> = stdout.split("\0\0").filter(|r| !r.is_empty()).collect();
-    assert_eq!(records.len(), 3, "one record per defect");
+    assert_eq!(records.len(), 4, "one record per defect");
 
     for r in &records {
         let fields: Vec<&str> = r.split('\0').collect();
@@ -324,7 +394,7 @@ fn test_syntax_check_scans_a_directory_recursively() {
     assert_eq!(code, Some(1));
     assert_eq!(
         stdout.lines().filter(|l| !l.trim().is_empty()).count(),
-        14,
+        26,
         "all malformed fixtures contribute their full diagnostics"
     );
 }

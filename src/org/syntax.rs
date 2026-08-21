@@ -1,7 +1,7 @@
 //! Org-mode structural syntax defects.
 //!
-//! Owns one fact: whether a file's *block* and *drawer* delimiters
-//! balance. This is a per-file property, deliberately unlike
+//! Owns one fact: whether a file's blocks and drawers follow Emacs
+//! Org's structural grammar. This is a per-file property, deliberately unlike
 //! [`crate::org::link`], whose defects are a property of the link
 //! *graph* and can only be judged across the whole corpus.
 //!
@@ -26,10 +26,15 @@
 //! - an opener with no closer ([`DefectKind::UnterminatedBlock`],
 //!   [`DefectKind::UnterminatedDrawer`]),
 //! - a closer with no opener ([`DefectKind::StrayBlockEnd`],
-//!   [`DefectKind::StrayDrawerEnd`]).
+//!   [`DefectKind::StrayDrawerEnd`]),
+//! - a misplaced or malformed property drawer
+//!   ([`DefectKind::MisplacedPropertyDrawer`],
+//!   [`DefectKind::InvalidPropertyDrawerContent`]),
+//! - forbidden drawer containment ([`DefectKind::NestedDrawer`],
+//!   [`DefectKind::HeadlineInDrawer`]).
 //!
 //! Style is not a defect: indentation, unknown `#+begin_` types, and
-//! property naming are all left alone.
+//! property-key spelling and case are left alone.
 //!
 //! ## Two rules that are easy to get wrong
 //!
@@ -47,6 +52,8 @@
 //!    evidence, so it bounds the defect.
 
 use serde::Serialize;
+
+use crate::org::property::parse_property_line;
 
 /// What kind of structural breakage was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -66,6 +73,15 @@ pub enum DefectKind {
     UnterminatedDrawer,
     /// `:END:` with no drawer open at that point.
     StrayDrawerEnd,
+    /// `:PROPERTIES:` is closed but does not occupy the privileged
+    /// position immediately after a heading and optional planning line.
+    MisplacedPropertyDrawer,
+    /// A recognized property drawer contains a non-property line.
+    InvalidPropertyDrawerContent,
+    /// A generic drawer contains another drawer opener.
+    NestedDrawer,
+    /// A context-free headline interrupts a generic drawer.
+    HeadlineInDrawer,
 }
 
 impl DefectKind {
@@ -79,6 +95,10 @@ impl DefectKind {
             DefectKind::InvalidNestedBlock => "invalid-nested-block",
             DefectKind::UnterminatedDrawer => "unterminated-drawer",
             DefectKind::StrayDrawerEnd => "stray-drawer-end",
+            DefectKind::MisplacedPropertyDrawer => "misplaced-property-drawer",
+            DefectKind::InvalidPropertyDrawerContent => "invalid-property-drawer-content",
+            DefectKind::NestedDrawer => "nested-drawer",
+            DefectKind::HeadlineInDrawer => "headline-in-drawer",
         }
     }
 }
@@ -148,6 +168,26 @@ impl SyntaxDefect {
                 ),
             },
             DefectKind::StrayDrawerEnd => "stray `:END:` with no drawer open".to_string(),
+            DefectKind::MisplacedPropertyDrawer =>
+                "misplaced `:PROPERTIES:` drawer (must immediately follow a heading and optional planning line)".to_string(),
+            DefectKind::InvalidPropertyDrawerContent => match self.bounded_at {
+                Some(l) => format!(
+                    "invalid `:PROPERTIES:` drawer content at line {} (only node-property lines are allowed)",
+                    l
+                ),
+                None => "invalid `:PROPERTIES:` drawer content (only node-property lines are allowed)".to_string(),
+            },
+            DefectKind::NestedDrawer => format!(
+                "nested `:{}` drawer (generic drawers cannot contain another drawer)",
+                self.construct
+            ),
+            DefectKind::HeadlineInDrawer => match self.bounded_at {
+                Some(l) => format!(
+                    "headline at line {} interrupts `:{}` drawer (drawers cannot contain headlines)",
+                    l, self.construct
+                ),
+                None => format!("headline interrupts `:{}` drawer", self.construct),
+            },
         }
     }
 }
@@ -187,7 +227,7 @@ fn block_delimiter(trimmed: &str) -> Option<BlockDelimiter> {
     if !is_end {
         return Some(BlockDelimiter::Begin(name.to_string()));
     }
-    if rest.trim().is_empty() {
+    if rest.trim_matches([' ', '\t']).is_empty() {
         Some(BlockDelimiter::End(name.to_string()))
     } else {
         Some(BlockDelimiter::InvalidEnd(name.to_string()))
@@ -222,7 +262,79 @@ fn drawer_opener(trimmed: &str) -> Option<String> {
     if inner.eq_ignore_ascii_case("END") {
         return None;
     }
-    Some(inner.to_ascii_uppercase())
+    Some(inner.to_uppercase())
+}
+
+fn is_planning_line(trimmed: &str) -> bool {
+    let mut rest = trimmed;
+    let mut found = false;
+    while let Some(keyword_len) = ["CLOSED:", "DEADLINE:", "SCHEDULED:"]
+        .into_iter()
+        .find(|keyword| rest.to_ascii_uppercase().starts_with(keyword))
+        .map(str::len)
+    {
+        let after_keyword = rest[keyword_len..].trim_start_matches([' ', '\t']);
+        let Some(open) = after_keyword.chars().next() else {
+            return false;
+        };
+        let close = match open {
+            '[' => ']',
+            '<' => '>',
+            _ => return false,
+        };
+        let Some(end) = after_keyword.find(close) else {
+            return false;
+        };
+        found = true;
+        rest = after_keyword[end + close.len_utf8()..].trim_start_matches([' ', '\t']);
+    }
+    found && rest.is_empty()
+}
+
+fn is_root_comment(trimmed: &str) -> bool {
+    trimmed.starts_with("# ") || trimmed == "#"
+}
+
+fn has_future_drawer_end_before_headline(lines: &[&str], start: usize) -> bool {
+    for line in &lines[start..] {
+        let trimmed = line.trim_matches([' ', '\t']);
+        if is_headline(line) {
+            return false;
+        }
+        if trimmed.eq_ignore_ascii_case(":END:") {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawerKind {
+    Generic,
+    MisplacedProperty,
+    RecoveredProperty,
+    Property,
+}
+
+#[derive(Debug, Clone)]
+struct OpenDrawer {
+    name: String,
+    line: usize,
+    raw: String,
+    kind: DrawerKind,
+    /// Block stack depth when the drawer opened. A matching block end
+    /// above this depth closes a block contained by the drawer; at this
+    /// depth it bounds an unterminated drawer inside a greater block.
+    block_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectionPrefix {
+    Root,
+    RootComment,
+    Heading,
+    Planning,
+    Body,
 }
 
 /// Scan `content` and report every structural defect, ordered by the
@@ -233,7 +345,7 @@ fn drawer_opener(trimmed: &str) -> Option<String> {
 ///
 /// let defects = scan("* H\n:PROPERTIES:\n:A: 1\n* Next\n");
 /// assert_eq!(defects.len(), 1);
-/// assert_eq!(defects[0].kind, DefectKind::UnterminatedDrawer);
+/// assert_eq!(defects[0].kind, DefectKind::InvalidPropertyDrawerContent);
 /// assert_eq!(defects[0].line, 2);
 ///
 /// // Comma escaping makes a headline-shaped line literal payload.
@@ -241,17 +353,18 @@ fn drawer_opener(trimmed: &str) -> Option<String> {
 /// ```
 pub fn scan(content: &str) -> Vec<SyntaxDefect> {
     let mut defects = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
 
     // Open blocks: (type, opening line, raw opener). Greater blocks
     // may contain nested blocks, so this is a stack rather than one
     // opaque state.
     let mut blocks: Vec<(String, usize, String)> = Vec::new();
-    // Open drawer: (name, opening line, raw opener).
-    let mut drawer: Option<(String, usize, String)> = None;
+    let mut drawer: Option<OpenDrawer> = None;
+    let mut section_prefix = SectionPrefix::Root;
 
-    for (idx, line) in content.lines().enumerate() {
+    for (idx, line) in lines.iter().copied().enumerate() {
         let lineno = idx + 1;
-        let trimmed = line.trim();
+        let trimmed = line.trim_matches([' ', '\t']);
 
         // A dissolved lesser block needs this same line processed
         // again as ordinary structure, so one physical line may take
@@ -294,56 +407,124 @@ pub fn scan(content: &str) -> Vec<SyntaxDefect> {
                 }
             }
 
-            // Drawers are opaque until `:END:` or a headline. Raw
-            // closing-block lines inside a broken drawer are still
-            // useful lint findings, but cannot close an outer block.
-            if drawer.is_some() {
+            if matches!(drawer.as_ref().map(|d| d.kind), Some(DrawerKind::Property)) {
                 if trimmed.eq_ignore_ascii_case(":END:") {
                     drawer = None;
+                    section_prefix = SectionPrefix::Body;
                 } else if is_headline(line) {
-                    let (name, open_line, raw) = drawer.take().expect("drawer is open");
+                    let open = drawer.take().expect("property drawer is open");
                     defects.push(SyntaxDefect {
-                        line: open_line,
-                        kind: DefectKind::UnterminatedDrawer,
-                        construct: name,
-                        raw,
+                        line: open.line,
+                        kind: DefectKind::InvalidPropertyDrawerContent,
+                        construct: open.name,
+                        raw: open.raw,
                         bounded_at: Some(lineno),
                     });
                     continue;
-                } else {
-                    match block_delimiter(trimmed) {
-                        Some(BlockDelimiter::End(name))
-                            if blocks.last().is_some_and(|(open, _, _)| open == &name) =>
+                } else if parse_property_line(line).is_none() {
+                    let open = drawer.as_mut().expect("property drawer is open");
+                    defects.push(SyntaxDefect {
+                        line: open.line,
+                        kind: DefectKind::InvalidPropertyDrawerContent,
+                        construct: open.name.clone(),
+                        raw: open.raw.clone(),
+                        bounded_at: Some(lineno),
+                    });
+                    // Emacs falls back to a generic drawer when the
+                    // privileged property grammar fails. Re-process
+                    // the offending line under that recovery grammar
+                    // so balanced blocks inside it stay balanced.
+                    open.kind = DrawerKind::RecoveredProperty;
+                    continue;
+                }
+                break;
+            }
+
+            if drawer.is_some() {
+                if trimmed.eq_ignore_ascii_case(":END:") {
+                    drawer = None;
+                    break;
+                }
+                if is_headline(line) {
+                    let open = drawer.take().expect("generic drawer is open");
+                    defects.push(SyntaxDefect {
+                        line: open.line,
+                        kind: DefectKind::HeadlineInDrawer,
+                        construct: open.name,
+                        raw: open.raw,
+                        bounded_at: Some(lineno),
+                    });
+                    continue;
+                }
+
+                match block_delimiter(trimmed) {
+                    Some(BlockDelimiter::Begin(name)) => {
+                        if !is_lesser_block(&name)
+                            && blocks.last().is_some_and(|(open, _, _)| open == &name)
                         {
-                            let (drawer_name, open_line, raw) =
-                                drawer.take().expect("drawer is open");
                             defects.push(SyntaxDefect {
-                                line: open_line,
-                                kind: DefectKind::UnterminatedDrawer,
-                                construct: drawer_name,
-                                raw,
-                                bounded_at: Some(lineno),
+                                line: lineno,
+                                kind: DefectKind::InvalidNestedBlock,
+                                construct: name,
+                                raw: trimmed.to_string(),
+                                bounded_at: None,
                             });
-                            // Re-process this line as the valid end of
-                            // the containing greater block.
-                            continue;
+                        } else {
+                            blocks.push((name, lineno, trimmed.to_string()));
                         }
-                        Some(BlockDelimiter::End(name)) => defects.push(SyntaxDefect {
+                        break;
+                    }
+                    Some(BlockDelimiter::End(name))
+                        if blocks.last().is_some_and(|(open, _, _)| open == &name) =>
+                    {
+                        let depth = drawer.as_ref().expect("generic drawer is open").block_depth;
+                        if blocks.len() > depth {
+                            blocks.pop();
+                            break;
+                        }
+                        let open = drawer.take().expect("generic drawer is open");
+                        defects.push(SyntaxDefect {
+                            line: open.line,
+                            kind: DefectKind::UnterminatedDrawer,
+                            construct: open.name,
+                            raw: open.raw,
+                            bounded_at: Some(lineno),
+                        });
+                        continue;
+                    }
+                    Some(BlockDelimiter::End(name)) => {
+                        defects.push(SyntaxDefect {
                             line: lineno,
                             kind: DefectKind::StrayBlockEnd,
                             construct: name,
                             raw: trimmed.to_string(),
                             bounded_at: None,
-                        }),
-                        Some(BlockDelimiter::InvalidEnd(name)) => defects.push(SyntaxDefect {
+                        });
+                        break;
+                    }
+                    Some(BlockDelimiter::InvalidEnd(name)) => {
+                        defects.push(SyntaxDefect {
                             line: lineno,
                             kind: DefectKind::InvalidBlockEnd,
                             construct: name,
                             raw: trimmed.to_string(),
                             bounded_at: None,
-                        }),
-                        _ => {}
+                        });
+                        break;
                     }
+                    None => {}
+                }
+
+                if matches!(drawer.as_ref().map(|d| d.kind), Some(DrawerKind::Generic))
+                    && let Some(name) = drawer_opener(trimmed)
+                {
+                    defects.push(SyntaxDefect {
+                        line: lineno,
+                        kind: DefectKind::NestedDrawer,
+                        construct: name,
+                        raw: trimmed.to_string(),
+                        bounded_at: None,
+                    });
                 }
                 break;
             }
@@ -363,6 +544,7 @@ pub fn scan(content: &str) -> Vec<SyntaxDefect> {
                     } else {
                         blocks.push((name, lineno, trimmed.to_string()));
                     }
+                    section_prefix = SectionPrefix::Body;
                     break;
                 }
                 Some(BlockDelimiter::End(name)) => {
@@ -377,6 +559,7 @@ pub fn scan(content: &str) -> Vec<SyntaxDefect> {
                             bounded_at: None,
                         });
                     }
+                    section_prefix = SectionPrefix::Body;
                     break;
                 }
                 Some(BlockDelimiter::InvalidEnd(name)) => {
@@ -387,29 +570,103 @@ pub fn scan(content: &str) -> Vec<SyntaxDefect> {
                         raw: trimmed.to_string(),
                         bounded_at: None,
                     });
+                    section_prefix = SectionPrefix::Body;
                     break;
                 }
                 None => {}
             }
 
             if is_headline(line) {
+                section_prefix = SectionPrefix::Heading;
+                break;
+            }
+
+            if trimmed.is_empty() {
+                if matches!(
+                    section_prefix,
+                    SectionPrefix::RootComment | SectionPrefix::Heading | SectionPrefix::Planning
+                ) {
+                    section_prefix = SectionPrefix::Body;
+                }
+                break;
+            }
+
+            if section_prefix == SectionPrefix::Heading && is_planning_line(trimmed) {
+                section_prefix = SectionPrefix::Planning;
+                break;
+            }
+
+            if section_prefix == SectionPrefix::Planning && is_planning_line(trimmed) {
+                section_prefix = SectionPrefix::Body;
+                break;
+            }
+
+            if matches!(
+                section_prefix,
+                SectionPrefix::Root | SectionPrefix::RootComment
+            ) && is_root_comment(trimmed)
+            {
+                section_prefix = SectionPrefix::RootComment;
                 break;
             }
 
             if trimmed.eq_ignore_ascii_case(":END:") {
-                defects.push(SyntaxDefect {
-                    line: lineno,
-                    kind: DefectKind::StrayDrawerEnd,
-                    construct: "END".to_string(),
-                    raw: trimmed.to_string(),
-                    bounded_at: None,
-                });
+                if has_future_drawer_end_before_headline(&lines, idx + 1) {
+                    drawer = Some(OpenDrawer {
+                        name: "END".to_string(),
+                        line: lineno,
+                        raw: trimmed.to_string(),
+                        kind: DrawerKind::Generic,
+                        block_depth: blocks.len(),
+                    });
+                    section_prefix = SectionPrefix::Body;
+                } else {
+                    defects.push(SyntaxDefect {
+                        line: lineno,
+                        kind: DefectKind::StrayDrawerEnd,
+                        construct: "END".to_string(),
+                        raw: trimmed.to_string(),
+                        bounded_at: None,
+                    });
+                }
                 break;
             }
 
             if let Some(name) = drawer_opener(trimmed) {
-                drawer = Some((name, lineno, trimmed.to_string()));
+                let kind = if name.eq_ignore_ascii_case("PROPERTIES") {
+                    if matches!(
+                        section_prefix,
+                        SectionPrefix::Root
+                            | SectionPrefix::RootComment
+                            | SectionPrefix::Heading
+                            | SectionPrefix::Planning
+                    ) {
+                        DrawerKind::Property
+                    } else {
+                        defects.push(SyntaxDefect {
+                            line: lineno,
+                            kind: DefectKind::MisplacedPropertyDrawer,
+                            construct: name.clone(),
+                            raw: trimmed.to_string(),
+                            bounded_at: None,
+                        });
+                        DrawerKind::MisplacedProperty
+                    }
+                } else {
+                    DrawerKind::Generic
+                };
+                drawer = Some(OpenDrawer {
+                    name,
+                    line: lineno,
+                    raw: trimmed.to_string(),
+                    kind,
+                    block_depth: blocks.len(),
+                });
+                section_prefix = SectionPrefix::Body;
+                break;
             }
+
+            section_prefix = SectionPrefix::Body;
             break;
         }
     }
@@ -423,12 +680,12 @@ pub fn scan(content: &str) -> Vec<SyntaxDefect> {
             bounded_at: None,
         });
     }
-    if let Some((name, open_line, raw)) = drawer {
+    if let Some(open) = drawer {
         defects.push(SyntaxDefect {
-            line: open_line,
+            line: open.line,
             kind: DefectKind::UnterminatedDrawer,
-            construct: name,
-            raw,
+            construct: open.name,
+            raw: open.raw,
             bounded_at: None,
         });
     }
@@ -444,6 +701,13 @@ mod tests {
 
     fn kinds(content: &str) -> Vec<DefectKind> {
         scan(content).into_iter().map(|d| d.kind).collect()
+    }
+
+    fn tag_lines(content: &str) -> Vec<(usize, &'static str)> {
+        scan(content)
+            .into_iter()
+            .map(|d| (d.line, d.kind.tag()))
+            .collect()
     }
 
     // -----------------------------------------------------------------
@@ -538,6 +802,7 @@ mod tests {
             d.iter().map(|x| (x.line, x.kind)).collect::<Vec<_>>(),
             vec![
                 (1, DefectKind::UnterminatedBlock),
+                (3, DefectKind::InvalidPropertyDrawerContent),
                 (3, DefectKind::UnterminatedDrawer),
                 (5, DefectKind::StrayBlockEnd),
             ]
@@ -589,6 +854,7 @@ mod tests {
             vec![
                 (1, DefectKind::UnterminatedBlock),
                 (2, DefectKind::UnterminatedBlock),
+                (4, DefectKind::InvalidPropertyDrawerContent),
                 (4, DefectKind::UnterminatedDrawer),
                 (6, DefectKind::StrayBlockEnd),
                 (7, DefectKind::StrayBlockEnd),
@@ -601,8 +867,8 @@ mod tests {
         let content = indoc! {"
             #+begin_quote
             prose inside quote
-            :PROPERTIES:
-            :A: 1
+            :LOGBOOK:
+            - note
             :END:
             #+begin_src sh
             echo hi
@@ -616,8 +882,8 @@ mod tests {
     fn test_scan_parent_greater_end_bounds_broken_drawer_then_closes_parent() {
         let content = indoc! {"
             #+begin_quote
-            :PROPERTIES:
-            :A: 1
+            :LOGBOOK:
+            - note
             #+end_quote
         "};
         let d = scan(content);
@@ -664,13 +930,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_does_not_treat_punctuation_property_as_drawer() {
-        // Org drawer names use word characters, `-`, and `_`. A
-        // punctuation-bearing line is ordinary prose, not an opener.
-        assert!(scan("* H\n:not.a.drawer:\n").is_empty());
-    }
-
-    #[test]
     fn test_scan_does_not_treat_mismatched_nested_end_as_closing() {
         // `#+end_quote` does not close a `src` block; the src block is
         // still open at EOF and that is the one defect.
@@ -687,11 +946,249 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_ignores_bare_star_without_space() {
-        // `*bold*` is emphasis, not a headline, so it must not bound
-        // the drawer.
+    fn test_scan_rejects_non_property_markup_inside_property_drawer() {
+        // `*bold*` is not a headline, but it is still not a node
+        // property and therefore invalid inside `:PROPERTIES:`.
         let content = "* H\n:PROPERTIES:\n*emphasis*\n:END:\n";
+        assert_eq!(
+            tag_lines(content),
+            vec![(2, "invalid-property-drawer-content")]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Drawer semantics. These follow Emacs Org, not orgize's narrower
+    // generic-drawer name grammar or its silent fallback behavior.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_scan_accepts_properties_then_logbook_with_optional_planning() {
+        let content = indoc! {"
+            * Direct
+            :PROPERTIES:
+            :A: one
+            :END:
+            :LOGBOOK:
+            - note
+            :END:
+
+            * With planning
+            CLOSED: [2026-08-20 Thu]
+            :PROPERTIES:
+            :A: two
+            :END:
+
+            :LOGBOOK:
+            - note
+            :END:
+        "};
         assert!(scan(content).is_empty(), "{:?}", scan(content));
+    }
+
+    #[test]
+    fn test_scan_accepts_case_insensitive_single_planning_line() {
+        let content = indoc! {"
+            * H
+            scheduled: <2026-08-20 Thu>
+            :PROPERTIES:
+            :A: one
+            :END:
+        "};
+        assert!(scan(content).is_empty(), "{:?}", scan(content));
+    }
+
+    #[test]
+    fn test_scan_rejects_properties_after_second_planning_line() {
+        let content = indoc! {"
+            * H
+            SCHEDULED: <2026-08-20 Thu>
+            DEADLINE: <2026-08-21 Fri>
+            :PROPERTIES:
+            :A: one
+            :END:
+        "};
+        assert_eq!(tag_lines(content), vec![(4, "misplaced-property-drawer")]);
+    }
+
+    #[test]
+    fn test_scan_root_properties_allow_one_contiguous_comment_element() {
+        let valid = indoc! {"
+            # comment one
+            # comment two
+            :PROPERTIES:
+            :A: one
+            :END:
+        "};
+        assert!(scan(valid).is_empty(), "{:?}", scan(valid));
+
+        let separated = indoc! {"
+            # first comment group
+
+            # second comment group
+            :PROPERTIES:
+            :A: two
+            :END:
+        "};
+        assert_eq!(tag_lines(separated), vec![(4, "misplaced-property-drawer")]);
+    }
+
+    #[test]
+    fn test_scan_reports_every_misplaced_property_drawer() {
+        let content = indoc! {"
+            * Blank before properties
+
+            :PROPERTIES:
+            :A: one
+            :END:
+
+            * Logbook before properties
+            :LOGBOOK:
+            - note
+            :END:
+            :PROPERTIES:
+            :A: two
+            :END:
+
+            * Duplicate properties
+            :PROPERTIES:
+            :A: three
+            :END:
+            :PROPERTIES:
+            :B: four
+            :END:
+        "};
+        assert_eq!(
+            tag_lines(content),
+            vec![
+                (3, "misplaced-property-drawer"),
+                (11, "misplaced-property-drawer"),
+                (19, "misplaced-property-drawer"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scan_reports_invalid_property_drawer_contents_once_per_drawer() {
+        let content = indoc! {"
+            * Blank inside
+            :PROPERTIES:
+            :A: one
+
+            :END:
+
+            * Prose inside
+            :PROPERTIES:
+            not a property
+            :END:
+
+            * Block inside
+            :PROPERTIES:
+            #+begin_src sh
+            echo hi
+            #+end_src
+            :END:
+
+            * Drawer inside
+            :PROPERTIES:
+            :LOGBOOK:
+            - note
+            :END:
+            :END:
+        "};
+        assert_eq!(
+            tag_lines(content),
+            vec![
+                (2, "invalid-property-drawer-content"),
+                (8, "invalid-property-drawer-content"),
+                (13, "invalid-property-drawer-content"),
+                (20, "invalid-property-drawer-content"),
+                (24, "stray-drawer-end"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scan_accepts_blocks_inside_generic_drawer() {
+        let content = indoc! {"
+            :LOGBOOK:
+            - note
+            #+begin_quote
+            quoted
+            #+end_quote
+            :END:
+        "};
+        assert!(scan(content).is_empty(), "{:?}", scan(content));
+    }
+
+    #[test]
+    fn test_scan_reports_headline_inside_generic_drawer() {
+        let content = indoc! {"
+            :LOGBOOK:
+            - note
+            * Heading
+            :END:
+        "};
+        assert_eq!(
+            tag_lines(content),
+            vec![(1, "headline-in-drawer"), (4, "stray-drawer-end")]
+        );
+    }
+
+    #[test]
+    fn test_scan_reports_nested_generic_drawer() {
+        let content = indoc! {"
+            :OUTER:
+            :INNER:
+            :END:
+            :END:
+        "};
+        assert_eq!(
+            tag_lines(content),
+            vec![(2, "nested-drawer"), (4, "stray-drawer-end")]
+        );
+    }
+
+    #[test]
+    fn test_scan_accepts_paired_drawer_named_end() {
+        assert!(scan(":END:\ncontent\n:END:\n").is_empty());
+    }
+
+    #[test]
+    fn test_scan_treats_punctuation_bearing_colon_line_as_prose() {
+        assert!(scan(":BAD.NAME:\n").is_empty());
+        assert_eq!(
+            tag_lines(":BAD.NAME:\n:END:\n"),
+            vec![(2, "stray-drawer-end")]
+        );
+    }
+
+    #[test]
+    fn test_scan_recovered_property_does_not_invent_nested_drawer() {
+        let content = indoc! {"
+            * H
+            :PROPERTIES:
+            bad content
+            :EMPTY:
+            :END:
+        "};
+        assert_eq!(
+            tag_lines(content),
+            vec![(2, "invalid-property-drawer-content")]
+        );
+    }
+
+    #[test]
+    fn test_scan_does_not_accept_unicode_drawer_indentation() {
+        assert_eq!(
+            tag_lines("\u{a0}:LOGBOOK:\n:END:\n"),
+            vec![(2, "stray-drawer-end")]
+        );
+    }
+
+    #[test]
+    fn test_scan_normalizes_unicode_drawer_name_in_diagnostic() {
+        let defects = scan(":état:\n* Heading\n");
+        assert_eq!(defects[0].construct, "ÉTAT");
     }
 
     // -----------------------------------------------------------------
@@ -710,11 +1207,13 @@ mod tests {
             body
         "};
         let d = scan(content);
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].kind, DefectKind::UnterminatedDrawer);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].kind, DefectKind::InvalidPropertyDrawerContent);
         assert_eq!(d[0].line, 2, "anchored at the opener");
         assert_eq!(d[0].construct, "PROPERTIES");
-        assert_eq!(d[0].bounded_at, Some(6), "the headline that ended it");
+        assert_eq!(d[0].bounded_at, Some(5), "the blank line invalidated it");
+        assert_eq!(d[1].kind, DefectKind::HeadlineInDrawer);
+        assert_eq!(d[1].bounded_at, Some(6), "the headline ended recovery");
     }
 
     #[test]
@@ -762,8 +1261,9 @@ mod tests {
         assert_eq!(
             d.iter().map(|x| (x.line, x.kind)).collect::<Vec<_>>(),
             vec![
-                (2, DefectKind::UnterminatedDrawer),
-                (6, DefectKind::UnterminatedDrawer),
+                (2, DefectKind::InvalidPropertyDrawerContent),
+                (2, DefectKind::HeadlineInDrawer),
+                (6, DefectKind::HeadlineInDrawer),
                 (10, DefectKind::UnterminatedBlock),
             ]
         );
@@ -785,8 +1285,9 @@ mod tests {
             body
         "};
         let d = scan(content);
-        assert_eq!(d.len(), 1, "only the first drawer is broken: {:?}", d);
+        assert_eq!(d.len(), 2, "only the first drawer is broken: {:?}", d);
         assert_eq!(d[0].line, 2);
+        assert_eq!(d[1].line, 2);
     }
 
     #[test]
@@ -797,13 +1298,23 @@ mod tests {
         assert_eq!(DefectKind::InvalidNestedBlock.tag(), "invalid-nested-block");
         assert_eq!(DefectKind::UnterminatedDrawer.tag(), "unterminated-drawer");
         assert_eq!(DefectKind::StrayDrawerEnd.tag(), "stray-drawer-end");
+        assert_eq!(
+            DefectKind::MisplacedPropertyDrawer.tag(),
+            "misplaced-property-drawer"
+        );
+        assert_eq!(
+            DefectKind::InvalidPropertyDrawerContent.tag(),
+            "invalid-property-drawer-content"
+        );
+        assert_eq!(DefectKind::NestedDrawer.tag(), "nested-drawer");
+        assert_eq!(DefectKind::HeadlineInDrawer.tag(), "headline-in-drawer");
     }
 
     #[test]
     fn test_message_names_the_bounding_line_when_known() {
-        let d = scan("* H\n:PROPERTIES:\n:A: 1\n* Next\n");
+        let d = scan("* H\n:LOGBOOK:\n- note\n* Next\n");
         assert!(
-            d[0].message().contains("boundary at line 4"),
+            d[0].message().contains("headline at line 4"),
             "got: {}",
             d[0].message()
         );

@@ -5,6 +5,32 @@ fn bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_org-cli"))
 }
 
+struct TempDir(PathBuf);
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos())
+            .unwrap_or(0);
+        path.push(format!(
+            "org-cli-headings-it-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -165,8 +191,8 @@ fn headings_json_output_matches_expected_bytes() {
     let actual = String::from_utf8(out.stdout).unwrap();
     let expected = format!(
         concat!(
-            "{{\"file\":\"{}\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"done\":false,\"title\":\"TODO Billing task\",\"tags\":[\"urgent\"],\"properties\":{{\"CUSTOM_ID\":\"bill-248\",\"TASK_REF\":\"248\"}}}}\n",
-            "{{\"file\":\"{}\",\"level\":2,\"line\":15,\"keyword\":\"TODO\",\"done\":false,\"title\":\"TODO Nested task\",\"tags\":[],\"properties\":{{\"TASK_REF\":\"314\"}}}}\n"
+            "{{\"file\":\"{}\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"done\":false,\"title\":\"TODO Billing task\",\"tags\":[\"urgent\"],\"properties\":{{\"CUSTOM_ID\":\"bill-248\",\"TASK_REF\":\"248\"}},\"priority\":null,\"fingerprint\":\"e9191080a819d962d2462483ff76f169f411864cbbdf29caa63ff14837999699\",\"etag\":\"fd65efd2c9dc107b6becaecb687a566413d29aee33ca457e234dcb59b1d5400b\",\"todo_keywords\":{{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}}}\n",
+            "{{\"file\":\"{}\",\"level\":2,\"line\":15,\"keyword\":\"TODO\",\"done\":false,\"title\":\"TODO Nested task\",\"tags\":[],\"properties\":{{\"TASK_REF\":\"314\"}},\"priority\":null,\"fingerprint\":\"1ab6c5c7142ef465aa548053748ba2cea1cc975952c3635f1c01b54bf166995a\",\"etag\":\"fd65efd2c9dc107b6becaecb687a566413d29aee33ca457e234dcb59b1d5400b\",\"todo_keywords\":{{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}}}\n"
         ),
         fixture.display(),
         fixture.display()
@@ -278,7 +304,7 @@ fn headings_nul_output_matches_expected_bytes() {
 
     assert_eq!(out.status.code(), Some(0));
     let expected = format!(
-        "1\0{}\0{}\0TODO\00\0TODO Billing task\0urgent\0\02\0{}\0{}\0TODO\00\0TODO Nested task\0\0\0",
+        "1\0{}\0{}\0TODO\00\0TODO Billing task\0urgent\0\0e9191080a819d962d2462483ff76f169f411864cbbdf29caa63ff14837999699\0fd65efd2c9dc107b6becaecb687a566413d29aee33ca457e234dcb59b1d5400b\0{{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}\0\02\0{}\0{}\0TODO\00\0TODO Nested task\0\0\01ab6c5c7142ef465aa548053748ba2cea1cc975952c3635f1c01b54bf166995a\0fd65efd2c9dc107b6becaecb687a566413d29aee33ca457e234dcb59b1d5400b\0{{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}\0\0",
         1,
         fixture.display(),
         15,
@@ -373,6 +399,10 @@ fn headings_todo_keywords_flag_recognizes_custom_keyword() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
     assert_eq!(
         titles_of(&stdout),
         vec![
@@ -380,6 +410,67 @@ fn headings_todo_keywords_flag_recognizes_custom_keyword() {
             "Implement feature".to_string()
         ]
     );
+    assert!(records.iter().all(|record| {
+        record["todo_keywords"] == serde_json::json!({"active":["TODO","WIP"],"done":["DONE"]})
+    }));
+    let wip = records
+        .iter()
+        .find(|record| record["keyword"] == "WIP")
+        .expect("custom CLI fallback must parse WIP");
+    assert_eq!(
+        wip["todo_keywords"]["active"],
+        serde_json::json!(["TODO", "WIP"])
+    );
+}
+
+#[test]
+fn headings_versioned_formats_match_exact_bytes_and_priority_placement() {
+    const ETAG: &str = "733410184441c09822f04a5d3aaf3c4262ea3c26810a5d26033097cd05e1a1f9";
+    const FINGERPRINT: &str = "13a8ef44885266cff793163ac7bfecab5d5fec09bf28839dcabe368d31955789";
+
+    let td = TempDir::new("versioned-formats");
+    let file = td.path().join("versioned.org");
+    std::fs::write(
+        &file,
+        "#+TODO: TODO WIP | DONE CANCELED\n* WIP [#A] Buy milk :home:\n",
+    )
+    .unwrap();
+
+    let json = Command::new(bin_path())
+        .arg("headings")
+        .arg("-j")
+        .arg(&file)
+        .output()
+        .expect("spawn org-cli");
+    assert_eq!(json.status.code(), Some(0));
+    let expected_json = format!(
+        "{{\"file\":\"{}\",\"level\":1,\"line\":2,\"keyword\":\"WIP\",\"done\":false,\"title\":\"Buy milk\",\"tags\":[\"home\"],\"properties\":{{}},\"priority\":\"A\",\"fingerprint\":\"{FINGERPRINT}\",\"etag\":\"{ETAG}\",\"todo_keywords\":{{\"active\":[\"TODO\",\"WIP\"],\"done\":[\"DONE\",\"CANCELED\"]}}}}\n",
+        file.display()
+    );
+    assert_eq!(String::from_utf8(json.stdout).unwrap(), expected_json);
+
+    let nul = Command::new(bin_path())
+        .arg("headings")
+        .arg("-0")
+        .arg(&file)
+        .output()
+        .expect("spawn org-cli");
+    assert_eq!(nul.status.code(), Some(0));
+    let expected_nul = format!(
+        "1\02\0{}\0WIP\00\0Buy milk\0home\0A\0{FINGERPRINT}\0{ETAG}\0{{\"active\":[\"TODO\",\"WIP\"],\"done\":[\"DONE\",\"CANCELED\"]}}\0\0",
+        file.display()
+    )
+    .into_bytes();
+    assert_eq!(nul.stdout, expected_nul);
+
+    let human = Command::new(bin_path())
+        .arg("headings")
+        .arg(&file)
+        .output()
+        .expect("spawn org-cli");
+    assert_eq!(human.status.code(), Some(0));
+    let expected_human = format!("{}:\n   2: * WIP [#A] Buy milk :home:\n", file.display());
+    assert_eq!(String::from_utf8(human.stdout).unwrap(), expected_human);
 }
 
 #[test]

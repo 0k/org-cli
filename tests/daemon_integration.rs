@@ -85,9 +85,16 @@ fn free_port() -> u16 {
 
 #[test]
 fn daemon_serves_snapshot_and_pushes_sse_on_file_change() {
+    const INITIAL_CONTENT: &str = "#+TODO: TODO WIP | DONE CANCELED\n* WIP [#A] Buy milk :home:\n";
+    const INITIAL_ETAG: &str = "733410184441c09822f04a5d3aaf3c4262ea3c26810a5d26033097cd05e1a1f9";
+    const INITIAL_FINGERPRINT: &str =
+        "13a8ef44885266cff793163ac7bfecab5d5fec09bf28839dcabe368d31955789";
+    const UPDATED_CONTENT: &str = "#+TODO: TODO WIP | DONE CANCELED\n* WIP [#破] Rewritten with more bytes\n* TODO Second task\n";
+    const UPDATED_ETAG: &str = "40a28c389f71a4dde04f1618ca16fc34ebc75faae753a47951aa6cc161821cf0";
+
     let td = TempDir::new("push");
     let org = td.path().join("a.org");
-    write(&org, "* TODO Original task\n");
+    write(&org, INITIAL_CONTENT);
     let db = td.path().join("todos.sqlite");
 
     let port = free_port();
@@ -137,6 +144,10 @@ fn daemon_serves_snapshot_and_pushes_sse_on_file_change() {
         snapshot.headers().get("x-snapshot-index").is_some(),
         "snapshot must carry x-snapshot-index"
     );
+    assert!(
+        snapshot.headers().get("etag").is_none(),
+        "multi-file snapshots must not emit a response-level ETag"
+    );
 
     // Body: one TODO record for the fixture. Parse the text ourselves
     // (reqwest's `json()` needs the `json` feature; we only enable
@@ -148,8 +159,19 @@ fn daemon_serves_snapshot_and_pushes_sse_on_file_change() {
         1,
         "expected one indexed TODO, got {records:?}"
     );
-    assert_eq!(records[0]["title"], "Original task");
-    assert_eq!(records[0]["keyword"], "TODO");
+    assert_eq!(std::fs::read(&org).unwrap(), INITIAL_CONTENT.as_bytes());
+    assert_eq!(records[0]["title"], "Buy milk");
+    assert_eq!(records[0]["keyword"], "WIP");
+    assert_eq!(records[0]["priority"], "A");
+    assert_eq!(records[0]["fingerprint"], INITIAL_FINGERPRINT);
+    assert_eq!(records[0]["etag"], INITIAL_ETAG);
+    assert_eq!(
+        records[0]["todo_keywords"],
+        serde_json::json!({
+            "active": ["TODO", "WIP"],
+            "done": ["DONE", "CANCELED"]
+        })
+    );
 
     // --- 2) Open the SSE stream carrying that sub -----------------
     // A dedicated long-timeout client: the stream stays open, and we
@@ -171,7 +193,7 @@ fn daemon_serves_snapshot_and_pushes_sse_on_file_change() {
     // Read the SSE stream on a background thread so the main thread can
     // enforce a hard wall-clock bound (the blocking reader itself only
     // has a per-read timeout).
-    let (found_tx, found_rx) = std::sync::mpsc::channel::<bool>();
+    let (found_tx, found_rx) = std::sync::mpsc::channel::<Option<String>>();
     let reader_handle = std::thread::spawn(move || {
         let mut reader = BufReader::new(SseBody(sse_resp));
         let mut line = String::new();
@@ -179,17 +201,22 @@ fn daemon_serves_snapshot_and_pushes_sse_on_file_change() {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => {
-                    let _ = found_tx.send(false);
+                    let _ = found_tx.send(None);
                     return;
                 }
                 Ok(_) => {
                     if line.starts_with("data:") && line.contains("file-changed") {
-                        let _ = found_tx.send(true);
+                        let data = line
+                            .strip_prefix("data:")
+                            .expect("data prefix checked")
+                            .trim()
+                            .to_string();
+                        let _ = found_tx.send(Some(data));
                         return;
                     }
                 }
                 Err(_) => {
-                    let _ = found_tx.send(false);
+                    let _ = found_tx.send(None);
                     return;
                 }
             }
@@ -199,18 +226,30 @@ fn daemon_serves_snapshot_and_pushes_sse_on_file_change() {
     // Give the SSE subscription a beat to attach, then modify the file
     // (a size change guarantees a fresh fingerprint → reparse).
     std::thread::sleep(Duration::from_millis(300));
-    write(
-        &org,
-        "* TODO Rewritten with more bytes\n* TODO Second task\n",
-    );
+    write(&org, UPDATED_CONTENT);
 
     // --- 3) Assert the push arrives within 10 s ------------------
-    let got = found_rx
+    let data = found_rx
         .recv_timeout(Duration::from_secs(10))
-        .unwrap_or(false);
+        .expect("expected an SSE result within 10s")
+        .expect("SSE stream ended before a file-changed event");
+    let event: serde_json::Value = serde_json::from_str(&data).expect("file-changed JSON event");
+    assert_eq!(std::fs::read(&org).unwrap(), UPDATED_CONTENT.as_bytes());
+    assert_eq!(event["type"], "file-changed");
+    assert_eq!(event["etag"], UPDATED_ETAG);
+    assert_eq!(
+        event["todo_keywords"],
+        serde_json::json!({
+            "active": ["TODO", "WIP"],
+            "done": ["DONE", "CANCELED"]
+        })
+    );
+    let event_todos = event["todos"].as_array().expect("event todos array");
+    assert_eq!(event_todos.len(), 2);
     assert!(
-        got,
-        "expected an SSE `data:` line containing 'file-changed' within 10s"
+        event_todos
+            .iter()
+            .all(|record| record["etag"] == event["etag"])
     );
     let _ = reader_handle.join();
 

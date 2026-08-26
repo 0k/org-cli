@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::str::FromStr;
 
 use orgize::{
@@ -7,9 +8,14 @@ use orgize::{
     rowan::{TextSize, ast::AstNode},
 };
 
+use crate::org::snapshot::sha256_hex;
 use crate::org::todo_keywords::TodoKeywords;
 
 /// A heading extracted from an org-mode file, including its property drawer.
+///
+/// `fingerprint` is not unique: identical heading lines have identical
+/// fingerprints. The snapshot-scoped locator is `(path, line, fingerprint,
+/// etag)`, never the fingerprint alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Heading {
     pub level: u32,
@@ -23,6 +29,11 @@ pub struct Heading {
     /// recognize words like `WIP` or `CANCELED`. `None` when the heading
     /// carries no recognized keyword.
     pub keyword: Option<String>,
+    /// The heading's priority as the bare character, e.g. `A` rather than
+    /// the `[#A]` cookie. `None` means not yet evaluated, not low priority.
+    pub priority: Option<String>,
+    /// Lowercase hex SHA-256 of this exact heading line, terminator excluded.
+    pub fingerprint: String,
     pub title: String,
     pub tags: Vec<String>,
     pub properties: BTreeMap<String, String>,
@@ -62,6 +73,32 @@ impl LineIndex {
     /// the end of the content resolve to the final line without panicking.
     fn line_at(&self, offset: usize) -> usize {
         self.newline_offsets.partition_point(|&pos| pos < offset) + 1
+    }
+
+    /// Return the byte range of 1-based `line`, excluding its terminator.
+    ///
+    /// A trailing LF is excluded. When that LF is immediately preceded by
+    /// CR, the full CRLF pair is excluded. A lone CR without LF remains data.
+    fn line_range(&self, content: &str, line: usize) -> Option<Range<usize>> {
+        if line == 0 {
+            return None;
+        }
+        let start = if line == 1 {
+            0
+        } else {
+            self.newline_offsets.get(line - 2)?.saturating_add(1)
+        };
+        if start > content.len() {
+            return None;
+        }
+        let end = match self.newline_offsets.get(line - 1).copied() {
+            Some(newline) if newline > start && content.as_bytes()[newline - 1] == b'\r' => {
+                newline - 1
+            }
+            Some(newline) => newline,
+            None => content.len(),
+        };
+        Some(start..end)
     }
 }
 
@@ -134,6 +171,12 @@ fn build_heading(content: &str, line_index: &LineIndex, headline: OrgHeadline) -
     let level = u32::try_from(headline.level()).ok()?;
     let line = line_index.line_at(byte_offset(content, headline.start()));
     let keyword = headline.todo_keyword().map(|token| token.to_string());
+    let priority = headline.priority().map(|token| token.to_string());
+    let fingerprint = sha256_hex(
+        content
+            .get(line_index.line_range(content, line)?)?
+            .as_bytes(),
+    );
     let title = headline.title_raw().trim().to_string();
     let tags = headline.tags().map(|tag| tag.to_string()).collect();
     let properties = headline
@@ -150,6 +193,8 @@ fn build_heading(content: &str, line_index: &LineIndex, headline: OrgHeadline) -
         level,
         line,
         keyword,
+        priority,
+        fingerprint,
         title,
         tags,
         properties,
@@ -553,6 +598,9 @@ mod tests {
                     level: 1,
                     line: 1,
                     keyword: Some("TODO".to_string()),
+                    priority: None,
+                    fingerprint: "e640c2d8c38f4bda691fcf8d8cba30e4fd2a53f1478a072f81c244ea688562d9"
+                        .to_string(),
                     title: "Parent heading".to_string(),
                     tags: vec!["work".to_string(), "client".to_string()],
                     properties: props(&[("CUSTOM_ID", "parent-id"), ("TASK_REF", "248")]),
@@ -561,6 +609,9 @@ mod tests {
                     level: 2,
                     line: 7,
                     keyword: None,
+                    priority: None,
+                    fingerprint: "8b38c0d7ac803c4571af11def1e523fd313339b9fd8a194650b9e6536db45c6d"
+                        .to_string(),
                     title: "Child heading".to_string(),
                     tags: vec![],
                     properties: BTreeMap::new(),
@@ -569,6 +620,9 @@ mod tests {
                     level: 1,
                     line: 9,
                     keyword: Some("DONE".to_string()),
+                    priority: None,
+                    fingerprint: "1bfe6956f9548c11f122f6866a6ae224c23c5fbde735e193ba8ed3107cd04fd7"
+                        .to_string(),
                     title: "Finished sibling".to_string(),
                     tags: vec![],
                     properties: BTreeMap::new(),
@@ -577,6 +631,9 @@ mod tests {
                     level: 1,
                     line: 10,
                     keyword: None,
+                    priority: None,
+                    fingerprint: "1f4a9b6bdeb8a7999a8ab4e83789a4b8995681d13ace5462ff8b9024454af3d5"
+                        .to_string(),
                     title: "Sibling".to_string(),
                     tags: vec![],
                     properties: BTreeMap::new(),
@@ -604,6 +661,24 @@ mod tests {
         assert_eq!(
             keywords_seen,
             vec![Some("WIP".to_string()), Some("CANCELED".to_string()), None,]
+        );
+    }
+
+    #[test]
+    fn iter_headings_reports_priority_without_restricting_cookie_values() {
+        let content = indoc! {"
+            * TODO [#A] Latin priority
+            * TODO No priority
+            * TODO [#破] Non-Latin priority
+        "};
+
+        let priorities: Vec<Option<String>> = iter_headings(content)
+            .map(|heading| heading.priority)
+            .collect();
+
+        assert_eq!(
+            priorities,
+            vec![Some("A".to_string()), None, Some("破".to_string())]
         );
     }
 

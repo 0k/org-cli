@@ -10,10 +10,10 @@
 //! [`TodoStore::sync`] returns the diff it applied as a `Vec<TodoEvent>`,
 //! which the future daemon serialises onto an SSE stream verbatim.
 //!
-//! Parsing is delegated wholesale to [`crate::org`] primitives
-//! ([`crate::org::todo_keywords::scan_buffer`] +
-//! [`crate::org::heading::iter_headings_with`]); this module never
-//! reimplements heading or keyword parsing.
+//! Parsing is delegated wholesale to [`crate::org::snapshot::FileSnapshot`],
+//! the single boundary that derives the file ETag, effective TODO keywords,
+//! and headings from one content value. This module never reimplements that
+//! derivation.
 
 mod store;
 

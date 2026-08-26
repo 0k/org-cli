@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use crate::org::heading::iter_headings_with;
-use crate::org::todo_keywords::scan_buffer;
+use crate::org::snapshot::FileSnapshot;
+use crate::org::todo_keywords::TodoKeywords;
 
 /// One indexed TODO heading, as returned by [`TodoStore::query`].
 ///
@@ -33,6 +33,14 @@ pub struct TodoRecord {
     /// Whether `keyword` is a *done* (terminal) state for the file's
     /// effective keyword set.
     pub is_done: bool,
+    /// The heading's priority as a bare value (e.g. `A`), if present.
+    pub priority: Option<String>,
+    /// Lowercase hex SHA-256 of the exact heading line without its terminator.
+    pub fingerprint: String,
+    /// Lowercase hex SHA-256 of the exact file bytes that produced this row.
+    pub etag: String,
+    /// The effective TODO keyword set used to parse this row's snapshot.
+    pub todo_keywords: TodoKeywords,
 }
 
 /// A query against the index. Both fields `None` selects every row.
@@ -60,6 +68,10 @@ pub enum TodoEvent {
     FileChanged {
         /// The file's path.
         path: String,
+        /// Lowercase hex SHA-256 of the exact bytes that produced this event.
+        etag: String,
+        /// The effective TODO keyword set used to parse this event.
+        todo_keywords: TodoKeywords,
         /// Every TODO heading currently in the file.
         todos: Vec<TodoRecord>,
     },
@@ -96,13 +108,30 @@ impl TodoStore {
 
     /// Build a store over an already-open connection (used by tests
     /// with `:memory:`). Applies the pragmas and schema.
-    fn from_connection(conn: Connection) -> Result<Self, String> {
+    fn from_connection(mut conn: Connection) -> Result<Self, String> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| format!("enabling WAL: {}", e))?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| format!("enabling foreign_keys: {}", e))?;
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| format!("applying schema: {}", e))?;
+        let stored_version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|e| format!("reading schema version: {}", e))?;
+        if stored_version != SCHEMA_VERSION {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("starting schema migration: {}", e))?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS headings;
+                 DROP TABLE IF EXISTS files;",
+            )
+            .map_err(|e| format!("dropping old schema: {}", e))?;
+            tx.execute_batch(SCHEMA)
+                .map_err(|e| format!("applying schema: {}", e))?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|e| format!("setting schema version: {}", e))?;
+            tx.commit()
+                .map_err(|e| format!("committing schema migration: {}", e))?;
+        }
         Ok(Self { conn })
     }
 
@@ -120,6 +149,7 @@ impl TodoStore {
     pub fn sync(&mut self, files: &[PathBuf]) -> Result<Vec<TodoEvent>, String> {
         let mut events = Vec::new();
         let mut seen: Vec<String> = Vec::with_capacity(files.len());
+        let fallback = TodoKeywords::default();
 
         for file in files {
             let path_str = file.to_string_lossy().to_string();
@@ -144,18 +174,20 @@ impl TodoStore {
                 continue;
             }
 
-            let content = match fs::read_to_string(file) {
-                Ok(c) => c,
+            let snapshot = match FileSnapshot::read(file, &fallback) {
+                Ok(snapshot) => snapshot,
                 Err(_) => {
                     // Unreadable content: treat as absent (prune).
                     seen.pop();
                     continue;
                 }
             };
-            let todos = parse_todos(&path_str, &content);
-            self.replace_file(&path_str, mtime_ns, size, &todos)?;
+            let todos = records_from_snapshot(&path_str, &snapshot);
+            self.replace_file(&path_str, mtime_ns, size, &snapshot, &todos)?;
             events.push(TodoEvent::FileChanged {
                 path: path_str,
+                etag: snapshot.etag,
+                todo_keywords: snapshot.keywords,
                 todos,
             });
         }
@@ -174,7 +206,8 @@ impl TodoStore {
     /// Query the index. Rows are ordered by path, then line.
     pub fn query(&self, q: &TodoQuery) -> Result<Vec<TodoRecord>, String> {
         let mut sql = String::from(
-            "SELECT f.path, h.line, h.level, h.keyword, h.title, h.tags_json, h.is_done \
+            "SELECT f.path, h.line, h.level, h.keyword, h.title, h.tags_json, h.is_done, \
+                    h.priority, h.fingerprint, f.etag, f.todo_active_json, f.todo_done_json \
              FROM headings h JOIN files f ON f.id = h.file_id",
         );
         let mut clauses: Vec<String> = Vec::new();
@@ -212,16 +245,50 @@ impl TodoStore {
                 let title: String = row.get(4)?;
                 let tags_json: String = row.get(5)?;
                 let is_done: i64 = row.get(6)?;
-                Ok((path, line, level, keyword, title, tags_json, is_done))
+                let priority: Option<String> = row.get(7)?;
+                let fingerprint: String = row.get(8)?;
+                let etag: String = row.get(9)?;
+                let todo_active_json: String = row.get(10)?;
+                let todo_done_json: String = row.get(11)?;
+                Ok((
+                    path,
+                    line,
+                    level,
+                    keyword,
+                    title,
+                    tags_json,
+                    is_done,
+                    priority,
+                    fingerprint,
+                    etag,
+                    todo_active_json,
+                    todo_done_json,
+                ))
             })
             .map_err(|e| format!("running query: {}", e))?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (path, line, level, keyword, title, tags_json, is_done) =
-                row.map_err(|e| format!("reading row: {}", e))?;
+            let (
+                path,
+                line,
+                level,
+                keyword,
+                title,
+                tags_json,
+                is_done,
+                priority,
+                fingerprint,
+                etag,
+                todo_active_json,
+                todo_done_json,
+            ) = row.map_err(|e| format!("reading row: {}", e))?;
             let tags: Vec<String> = serde_json::from_str(&tags_json)
                 .map_err(|e| format!("decoding tags_json {:?}: {}", tags_json, e))?;
+            let active: Vec<String> = serde_json::from_str(&todo_active_json)
+                .map_err(|e| format!("decoding todo_active_json {:?}: {}", todo_active_json, e))?;
+            let done: Vec<String> = serde_json::from_str(&todo_done_json)
+                .map_err(|e| format!("decoding todo_done_json {:?}: {}", todo_done_json, e))?;
             out.push(TodoRecord {
                 path,
                 line: line as usize,
@@ -230,6 +297,10 @@ impl TodoStore {
                 title,
                 tags,
                 is_done: is_done != 0,
+                priority,
+                fingerprint,
+                etag,
+                todo_keywords: TodoKeywords { active, done },
             });
         }
         Ok(out)
@@ -279,16 +350,35 @@ impl TodoStore {
         path: &str,
         mtime_ns: i64,
         size: i64,
+        snapshot: &FileSnapshot,
         todos: &[TodoRecord],
     ) -> Result<(), String> {
+        let todo_active_json = serde_json::to_string(&snapshot.keywords.active)
+            .map_err(|e| format!("encoding active TODO keywords: {}", e))?;
+        let todo_done_json = serde_json::to_string(&snapshot.keywords.done)
+            .map_err(|e| format!("encoding done TODO keywords: {}", e))?;
         let tx = self
             .conn
             .transaction()
             .map_err(|e| format!("starting transaction: {}", e))?;
         tx.execute(
-            "INSERT INTO files(path, mtime_ns, size) VALUES(?, ?, ?) \
-             ON CONFLICT(path) DO UPDATE SET mtime_ns = excluded.mtime_ns, size = excluded.size",
-            params![path, mtime_ns, size],
+            "INSERT INTO files( \
+                 path, mtime_ns, size, etag, todo_active_json, todo_done_json \
+             ) VALUES(?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(path) DO UPDATE SET \
+                 mtime_ns = excluded.mtime_ns, \
+                 size = excluded.size, \
+                 etag = excluded.etag, \
+                 todo_active_json = excluded.todo_active_json, \
+                 todo_done_json = excluded.todo_done_json",
+            params![
+                path,
+                mtime_ns,
+                size,
+                snapshot.etag,
+                todo_active_json,
+                todo_done_json
+            ],
         )
         .map_err(|e| format!("upserting file row: {}", e))?;
         let file_id: i64 = tx
@@ -301,8 +391,9 @@ impl TodoStore {
         {
             let mut ins = tx
                 .prepare(
-                    "INSERT INTO headings(file_id, line, level, keyword, title, tags_json, is_done) \
-                     VALUES(?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO headings( \
+                         file_id, line, level, keyword, title, tags_json, is_done, priority, fingerprint \
+                     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .map_err(|e| format!("preparing insert: {}", e))?;
             for t in todos {
@@ -316,6 +407,8 @@ impl TodoStore {
                     t.title,
                     tags_json,
                     t.is_done as i64,
+                    t.priority,
+                    t.fingerprint,
                 ])
                 .map_err(|e| format!("inserting heading: {}", e))?;
             }
@@ -334,47 +427,60 @@ impl TodoStore {
     }
 }
 
-/// The schema, applied idempotently on open.
+/// Current version of the derived-cache schema.
+const SCHEMA_VERSION: i64 = 1;
+
+/// The schema created after dropping any mismatched cache version.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS files (
-    id       INTEGER PRIMARY KEY,
-    path     TEXT UNIQUE NOT NULL,
-    mtime_ns INTEGER NOT NULL,
-    size     INTEGER NOT NULL
+    id               INTEGER PRIMARY KEY,
+    path             TEXT UNIQUE NOT NULL,
+    mtime_ns         INTEGER NOT NULL,
+    size             INTEGER NOT NULL,
+    etag             TEXT NOT NULL,
+    todo_active_json TEXT NOT NULL,
+    todo_done_json   TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS headings (
-    id        INTEGER PRIMARY KEY,
-    file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    line      INTEGER NOT NULL,
-    level     INTEGER NOT NULL,
-    keyword   TEXT,
-    title     TEXT NOT NULL,
-    tags_json TEXT NOT NULL,
-    is_done   INTEGER NOT NULL
+    id          INTEGER PRIMARY KEY,
+    file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    line        INTEGER NOT NULL,
+    level       INTEGER NOT NULL,
+    keyword     TEXT,
+    title       TEXT NOT NULL,
+    tags_json   TEXT NOT NULL,
+    is_done     INTEGER NOT NULL,
+    priority    TEXT,
+    fingerprint TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_headings_keyword ON headings(keyword);
 ";
 
-/// Parse a file's content into the TODO records to index.
+/// Project one coherent file snapshot into the TODO records to index.
 ///
 /// Reuses the shared org primitives: the effective keyword set is the
 /// in-buffer `#+TODO:` declaration when present, else the default set
 /// (matching `headings.rs`). Only headings that carry a keyword are
 /// kept; `is_done` reflects the file's done set.
-fn parse_todos(path: &str, content: &str) -> Vec<TodoRecord> {
-    let keywords = scan_buffer(content).unwrap_or_default();
-    iter_headings_with(content, &keywords)
+fn records_from_snapshot(path: &str, snapshot: &FileSnapshot) -> Vec<TodoRecord> {
+    snapshot
+        .headings
+        .iter()
         .filter_map(|heading| {
-            let keyword = heading.keyword?;
-            let is_done = keywords.done.contains(&keyword);
+            let keyword = heading.keyword.clone()?;
+            let is_done = snapshot.keywords.done.contains(&keyword);
             Some(TodoRecord {
                 path: path.to_string(),
                 line: heading.line,
                 level: heading.level,
                 keyword,
-                title: heading.title,
-                tags: heading.tags,
+                title: heading.title.clone(),
+                tags: heading.tags.clone(),
                 is_done,
+                priority: heading.priority.clone(),
+                fingerprint: heading.fingerprint.clone(),
+                etag: snapshot.etag.clone(),
+                todo_keywords: snapshot.keywords.clone(),
             })
         })
         .collect()
@@ -462,6 +568,60 @@ mod tests {
     }
 
     #[test]
+    fn open_migrates_old_schema_and_sync_repopulates_new_columns() {
+        let td = TempDir::new("migrate");
+        let db = td.path().join("todos.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (
+                 id INTEGER PRIMARY KEY,
+                 path TEXT UNIQUE NOT NULL,
+                 mtime_ns INTEGER NOT NULL,
+                 size INTEGER NOT NULL
+             );
+             CREATE TABLE headings (
+                 id INTEGER PRIMARY KEY,
+                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                 line INTEGER NOT NULL,
+                 level INTEGER NOT NULL,
+                 keyword TEXT,
+                 title TEXT NOT NULL,
+                 tags_json TEXT NOT NULL,
+                 is_done INTEGER NOT NULL
+             );
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let org = td.path().join("migrated.org");
+        write(
+            &org,
+            "#+TODO: TODO WIP | DONE CANCELED\n* WIP [#A] Migrated\n",
+        );
+        let mut store = TodoStore::open(&db).unwrap();
+        store.sync(std::slice::from_ref(&org)).unwrap();
+
+        let rows = store.query(&TodoQuery::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].priority.as_deref(), Some("A"));
+        assert!(!rows[0].fingerprint.is_empty());
+        assert!(!rows[0].etag.is_empty());
+        assert_eq!(
+            rows[0].todo_keywords,
+            TodoKeywords {
+                active: vec!["TODO".to_string(), "WIP".to_string()],
+                done: vec!["DONE".to_string(), "CANCELED".to_string()],
+            }
+        );
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
     fn sync_indexes_only_keyworded_headings() {
         let td = TempDir::new("only-kw");
         let f = td.path().join("a.org");
@@ -531,6 +691,100 @@ mod tests {
         }
         let rows = store.query(&TodoQuery::default()).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn sync_query_and_events_never_pair_records_with_another_snapshot_version() {
+        const OLD_ETAG: &str = "8e82111e863d2622d6e143c4f05dd92f091f9a006cd3a88d7a342e88c8256cf0";
+        const NEW_ETAG: &str = "4366882759ec106d0b6ce2b5b6a5e2f8339c95f700c4ce78232afe63048803ef";
+        const EMPTY_ETAG: &str = "e16db6d89f98537a8ff8a280751cc2a0b37e4f5f1cd0dca983f8c618b5f7a2ec";
+
+        let td = TempDir::new("coherent");
+        let file = td.path().join("coherent.org");
+        let mut store = mem_store();
+
+        write(&file, "* TODO [#A] Old\n");
+        let old_events = store.sync(std::slice::from_ref(&file)).unwrap();
+        let old_rows = store.query(&TodoQuery::default()).unwrap();
+        let (old_event_etag, old_event_todos, old_event_keywords) = match &old_events[0] {
+            TodoEvent::FileChanged {
+                etag,
+                todo_keywords,
+                todos,
+                ..
+            } => (etag, todos, todo_keywords),
+            other => panic!("expected FileChanged, got {other:?}"),
+        };
+        assert_eq!(old_event_etag, OLD_ETAG);
+        assert_eq!(old_event_keywords, &TodoKeywords::default());
+        assert_eq!(old_event_todos, &old_rows);
+        assert_eq!(old_rows[0].title, "Old");
+        assert_eq!(old_rows[0].priority.as_deref(), Some("A"));
+        assert_eq!(old_rows[0].etag, OLD_ETAG);
+        assert_eq!(old_rows[0].todo_keywords, TodoKeywords::default());
+
+        write(
+            &file,
+            "#+TODO: TODO WIP | DONE CANCELED\n* WIP [#破] New record with more bytes\n* DONE End\n",
+        );
+        let new_events = store.sync(std::slice::from_ref(&file)).unwrap();
+        let new_rows = store.query(&TodoQuery::default()).unwrap();
+        let (new_event_etag, new_event_todos, new_event_keywords) = match &new_events[0] {
+            TodoEvent::FileChanged {
+                etag,
+                todo_keywords,
+                todos,
+                ..
+            } => (etag, todos, todo_keywords),
+            other => panic!("expected FileChanged, got {other:?}"),
+        };
+        let declared = TodoKeywords {
+            active: vec!["TODO".to_string(), "WIP".to_string()],
+            done: vec!["DONE".to_string(), "CANCELED".to_string()],
+        };
+        assert_eq!(new_event_etag, NEW_ETAG);
+        assert_eq!(new_event_keywords, &declared);
+        assert_eq!(new_event_todos, &new_rows);
+        assert_eq!(
+            new_rows
+                .iter()
+                .map(|record| record.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["New record with more bytes", "End"]
+        );
+        assert_eq!(new_rows[0].priority.as_deref(), Some("破"));
+        assert!(new_rows.iter().all(|record| record.etag == NEW_ETAG));
+        assert!(
+            new_rows
+                .iter()
+                .all(|record| record.todo_keywords == declared)
+        );
+        assert!(old_rows.iter().all(|record| record.etag == OLD_ETAG));
+        assert!(old_rows.iter().all(|record| record.title == "Old"));
+        assert_ne!(old_event_etag, new_event_etag);
+
+        write(&file, "#+TODO: NEXT | FINISHED\n* Plain heading only\n");
+        let empty_events = store.sync(std::slice::from_ref(&file)).unwrap();
+        assert!(store.query(&TodoQuery::default()).unwrap().is_empty());
+        match &empty_events[0] {
+            TodoEvent::FileChanged {
+                etag,
+                todo_keywords,
+                todos,
+                ..
+            } => {
+                assert_eq!(etag, EMPTY_ETAG);
+                assert_eq!(
+                    todo_keywords,
+                    &TodoKeywords {
+                        active: vec!["NEXT".to_string()],
+                        done: vec!["FINISHED".to_string()],
+                    }
+                );
+                assert!(todos.is_empty());
+            }
+            other => panic!("expected FileChanged, got {other:?}"),
+        }
     }
 
     #[test]

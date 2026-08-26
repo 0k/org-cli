@@ -5,6 +5,10 @@
 //! [`crate::cli::action::walk::resolve_input_files`] (agenda fallback),
 //! persistence and querying to [`crate::index`]. Output follows the
 //! established three-mode per-action pattern (human / `-0` / `-j`).
+//!
+//! Version fields are appended after the historical seven NUL fields.
+//! Existing indices remain stable, but consumers that assert the old exact
+//! field count must be updated for the deliberate larger record shape.
 
 use std::io::{self, Write};
 
@@ -84,15 +88,29 @@ fn write_json<W: Write>(out: &mut W, records: &[TodoRecord]) -> Result<(), Strin
     Ok(())
 }
 
-/// NUL: `path\0line\0level\0keyword\0title\0tags\0is_done\0\0`.
+/// NUL preserves the historical first seven fields and appends priority,
+/// fingerprint, ETag, and compact-JSON TODO keywords.
 fn write_nul<W: Write>(out: &mut W, records: &[TodoRecord]) -> Result<(), String> {
     for record in records {
         let tags = record.tags.join(",");
         let is_done = if record.is_done { "1" } else { "0" };
+        let priority = record.priority.as_deref().unwrap_or("");
+        let todo_keywords = serde_json::to_string(&record.todo_keywords)
+            .map_err(|e| format!("serializing TODO keywords: {}", e))?;
         write!(
             out,
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0\0",
-            record.path, record.line, record.level, record.keyword, record.title, tags, is_done,
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0\0",
+            record.path,
+            record.line,
+            record.level,
+            record.keyword,
+            record.title,
+            tags,
+            is_done,
+            priority,
+            record.fingerprint,
+            record.etag,
+            todo_keywords,
         )
         .map_err(|e| e.to_string())?;
     }
@@ -112,12 +130,18 @@ fn write_human<W: Write>(out: &mut W, records: &[TodoRecord]) -> Result<(), Stri
         } else {
             format!(" {}", format!(":{}:", record.tags.join(":")).cyan())
         };
+        let priority = record
+            .priority
+            .as_ref()
+            .map(|priority| format!(" [#{}]", priority))
+            .unwrap_or_default();
         writeln!(
             out,
-            "{}:{}: {} {}{}",
+            "{}:{}: {}{} {}{}",
             record.path.bright_blue(),
             record.line,
             keyword,
+            priority,
             record.title,
             tags,
         )
@@ -130,6 +154,7 @@ fn write_human<W: Write>(out: &mut W, records: &[TodoRecord]) -> Result<(), Stri
 mod tests {
     use super::*;
     use crate::index::TodoRecord;
+    use crate::org::todo_keywords::TodoKeywords;
 
     fn record(
         path: &str,
@@ -148,6 +173,10 @@ mod tests {
             title: title.to_string(),
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             is_done,
+            priority: None,
+            fingerprint: "fingerprint".to_string(),
+            etag: "etag".to_string(),
+            todo_keywords: TodoKeywords::default(),
         }
     }
 
@@ -178,7 +207,7 @@ mod tests {
         write_records(&mut out, &records, &opts(true, false)).unwrap();
         assert_eq!(
             out,
-            b"/tmp/a.org\x001\x001\x00TODO\x00Buy milk\x00home,urgent\x000\x00\x00"
+            b"/tmp/a.org\x001\x001\x00TODO\x00Buy milk\x00home,urgent\x000\x00\x00fingerprint\x00etag\x00{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}\x00\x00"
         );
     }
 
@@ -189,7 +218,7 @@ mod tests {
         write_records(&mut out, &records, &opts(true, false)).unwrap();
         assert_eq!(
             out,
-            b"/tmp/a.org\x002\x001\x00DONE\x00Ship it\x00\x001\x00\x00"
+            b"/tmp/a.org\x002\x001\x00DONE\x00Ship it\x00\x001\x00\x00fingerprint\x00etag\x00{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}\x00\x00"
         );
     }
 
@@ -207,7 +236,7 @@ mod tests {
         let mut out = Vec::new();
         write_records(&mut out, &records, &opts(false, true)).unwrap();
         let actual = String::from_utf8(out).unwrap();
-        let expected = "{\"path\":\"/tmp/a.org\",\"line\":1,\"level\":1,\"keyword\":\"TODO\",\"title\":\"Buy milk\",\"tags\":[\"home\"],\"is_done\":false}\n";
+        let expected = "{\"path\":\"/tmp/a.org\",\"line\":1,\"level\":1,\"keyword\":\"TODO\",\"title\":\"Buy milk\",\"tags\":[\"home\"],\"is_done\":false,\"priority\":null,\"fingerprint\":\"fingerprint\",\"etag\":\"etag\",\"todo_keywords\":{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}\n";
         assert_eq!(actual, expected);
     }
 
@@ -216,14 +245,16 @@ mod tests {
         // Force colour off so the assertion is stable regardless of
         // the test runner's TTY state.
         colored::control::set_override(false);
+        let mut priority = record("/tmp/a.org", 1, 1, "TODO", "Buy milk", &["home"], false);
+        priority.priority = Some("A".to_string());
         let records = vec![
-            record("/tmp/a.org", 1, 1, "TODO", "Buy milk", &["home"], false),
+            priority,
             record("/tmp/a.org", 2, 1, "DONE", "Ship it", &[], true),
         ];
         let mut out = Vec::new();
         write_records(&mut out, &records, &opts(false, false)).unwrap();
         let actual = String::from_utf8(out).unwrap();
-        let expected = "/tmp/a.org:1: TODO Buy milk :home:\n/tmp/a.org:2: DONE Ship it\n";
+        let expected = "/tmp/a.org:1: TODO [#A] Buy milk :home:\n/tmp/a.org:2: DONE Ship it\n";
         assert_eq!(actual, expected);
         colored::control::unset_override();
     }

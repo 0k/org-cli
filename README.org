@@ -59,9 +59,13 @@ org-cli headings -f "billing" -i --has-property TASK_REF -j path/
 org-cli headings --exclude '**/archive/**' path/
 #+end_src
 
-NDJSON records carry =file=, =level=, =line=, =title=, =tags=,
-=properties= (full property map). NUL records use the fixed-field
-layout =level\0line\0file\0title\0tags\0\0=.
+NDJSON records carry =file=, =level=, =line=, =keyword=, =done=, =title=,
+=tags=, =properties= (full property map), =priority=, =fingerprint=, =etag=,
+and =todo_keywords=. NUL records use the fixed-field layout
+=level\0line\0file\0keyword\0done\0title\0tags\0priority\0fingerprint\0etag\0todo_keywords\0\0=;
+=todo_keywords= is compact JSON. The new NUL fields are appended, so existing
+field indices remain stable, but consumers that assert the old exact field
+count must be updated.
 
 ** =clock list= — list CLOCK lines, optionally filtered by parent heading
 

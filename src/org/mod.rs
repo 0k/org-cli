@@ -10,5 +10,6 @@ pub mod heading;
 pub mod heading_edit;
 pub mod link;
 pub mod property;
+pub mod snapshot;
 pub mod syntax;
 pub mod todo_keywords;

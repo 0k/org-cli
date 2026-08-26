@@ -1,5 +1,11 @@
+//! `headings` subcommand — parse and list headings directly from files.
+//!
+//! Machine formats expose the coherent file version, effective TODO
+//! keywords, priority, and heading fingerprint. NUL fields are appended
+//! after the historical seven fields: existing field indices remain stable,
+//! but consumers that assert the old exact field count must be updated.
+
 use std::collections::BTreeMap;
-use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -9,8 +15,8 @@ use serde::Serialize;
 
 use crate::cli::action::walk::resolve_input_files;
 use crate::org::filter::FilterOptions;
-use crate::org::heading::iter_headings_with;
-use crate::org::todo_keywords::{TodoKeywords, parse_spec, scan_buffer};
+use crate::org::snapshot::FileSnapshot;
+use crate::org::todo_keywords::{TodoKeywords, parse_spec};
 
 #[derive(Debug, Clone)]
 pub struct HeadingsOptions {
@@ -43,6 +49,10 @@ struct HeadingRecord {
     title: String,
     tags: Vec<String>,
     properties: BTreeMap<String, String>,
+    priority: Option<String>,
+    fingerprint: String,
+    etag: String,
+    todo_keywords: TodoKeywords,
 }
 
 pub fn run(opts: HeadingsOptions) -> Result<i32, String> {
@@ -53,36 +63,41 @@ pub fn run(opts: HeadingsOptions) -> Result<i32, String> {
 
     let mut records = Vec::new();
     for file in &files {
-        let content = match fs::read_to_string(file) {
-            Ok(c) => c,
+        let snapshot = match FileSnapshot::read(file, &cli_keywords) {
+            Ok(snapshot) => snapshot,
             Err(e) => {
                 warn!("cannot read {}: {}", file.display(), e);
                 continue;
             }
         };
-        // Per-file resolution: an in-buffer declaration overrides the
-        // CLI value, which overrides the default set (Emacs semantics).
-        let keywords = scan_buffer(&content).unwrap_or_else(|| cli_keywords.clone());
-        records.extend(
-            iter_headings_with(&content, &keywords)
-                .filter(|heading| filter.matches(heading))
-                .map(|heading| {
-                    let done = heading
-                        .keyword
-                        .as_ref()
-                        .map(|kw| keywords.done.contains(kw));
-                    HeadingRecord {
-                        file: file.clone(),
-                        level: heading.level,
-                        line: heading.line,
-                        keyword: heading.keyword,
-                        done,
-                        title: heading.title,
-                        tags: heading.tags,
-                        properties: heading.properties,
-                    }
-                }),
-        );
+        let FileSnapshot {
+            etag,
+            keywords,
+            headings,
+        } = snapshot;
+        for heading in headings
+            .into_iter()
+            .filter(|heading| filter.matches(heading))
+        {
+            let done = heading
+                .keyword
+                .as_ref()
+                .map(|kw| keywords.done.contains(kw));
+            records.push(HeadingRecord {
+                file: file.clone(),
+                level: heading.level,
+                line: heading.line,
+                keyword: heading.keyword,
+                done,
+                title: heading.title,
+                tags: heading.tags,
+                properties: heading.properties,
+                priority: heading.priority,
+                fingerprint: heading.fingerprint,
+                etag: etag.clone(),
+                todo_keywords: keywords.clone(),
+            });
+        }
     }
 
     write_records(&mut stdout, &records, &opts)?;
@@ -149,6 +164,9 @@ fn write_nul<W: Write>(out: &mut W, records: &[HeadingRecord]) -> Result<(), Str
     for record in records {
         let tags = record.tags.join(",");
         let keyword = record.keyword.as_deref().unwrap_or("");
+        let priority = record.priority.as_deref().unwrap_or("");
+        let todo_keywords = serde_json::to_string(&record.todo_keywords)
+            .map_err(|e| format!("serializing TODO keywords: {}", e))?;
         // `done`: `1`/`0` when a keyword is present, empty otherwise.
         let done = match record.done {
             Some(true) => "1",
@@ -157,7 +175,7 @@ fn write_nul<W: Write>(out: &mut W, records: &[HeadingRecord]) -> Result<(), Str
         };
         write!(
             out,
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0\0",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0\0",
             record.level,
             record.line,
             record.file.display(),
@@ -165,6 +183,10 @@ fn write_nul<W: Write>(out: &mut W, records: &[HeadingRecord]) -> Result<(), Str
             done,
             record.title,
             tags,
+            priority,
+            record.fingerprint,
+            record.etag,
+            todo_keywords,
         )
         .map_err(|e| e.to_string())?;
     }
@@ -189,10 +211,17 @@ fn write_human<W: Write>(out: &mut W, records: &[HeadingRecord]) -> Result<(), S
         } else {
             format!(" :{}:", record.tags.join(":"))
         };
-        let title = match &record.keyword {
-            Some(keyword) => format!("{} {}", keyword, record.title),
-            None => record.title.clone(),
-        };
+        let mut title = String::new();
+        if let Some(keyword) = &record.keyword {
+            title.push_str(keyword);
+            title.push(' ');
+        }
+        if let Some(priority) = &record.priority {
+            title.push_str("[#");
+            title.push_str(priority);
+            title.push_str("] ");
+        }
+        title.push_str(&record.title);
         writeln!(out, "{:>4}: {} {}{}", record.line, stars, title, tags)
             .map_err(|e| e.to_string())?;
     }
@@ -202,6 +231,7 @@ fn write_human<W: Write>(out: &mut W, records: &[HeadingRecord]) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::{HeadingRecord, HeadingsOptions, build_filter, write_records};
+    use crate::org::todo_keywords::TodoKeywords;
     use indoc::indoc;
     use similar::TextDiff;
     use std::collections::BTreeMap;
@@ -265,6 +295,10 @@ mod tests {
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                 .collect::<BTreeMap<_, _>>(),
+            priority: None,
+            fingerprint: "fingerprint".to_string(),
+            etag: "etag".to_string(),
+            todo_keywords: TodoKeywords::default(),
         }
     }
 
@@ -315,17 +349,19 @@ mod tests {
 
     #[test]
     fn human_formatter_renders_keyword_between_stars_and_title() {
+        let mut priority = record_kw(
+            "/tmp/a.org",
+            1,
+            1,
+            Some("TODO"),
+            Some(false),
+            "Buy milk",
+            &["home"],
+            &[],
+        );
+        priority.priority = Some("A".to_string());
         let records = vec![
-            record_kw(
-                "/tmp/a.org",
-                1,
-                1,
-                Some("TODO"),
-                Some(false),
-                "Buy milk",
-                &["home"],
-                &[],
-            ),
+            priority,
             record_kw(
                 "/tmp/a.org",
                 1,
@@ -345,7 +381,7 @@ mod tests {
         let actual = String::from_utf8(out).unwrap();
         let expected = indoc! {"
             /tmp/a.org:
-               1: * TODO Buy milk :home:
+               1: * TODO [#A] Buy milk :home:
                2: * DONE Ship it
                3: * Plain
         "};
@@ -368,13 +404,13 @@ mod tests {
 
         assert_eq!(
             out,
-            b"2\x0017\x00/tmp/a.org\x00\x00\x00Nested\x00ops,low\x00\x00"
+            b"2\x0017\x00/tmp/a.org\x00\x00\x00Nested\x00ops,low\x00\x00fingerprint\x00etag\x00{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}\x00\x00"
         );
     }
 
     #[test]
     fn nul_formatter_renders_keyword_field_when_present() {
-        let records = vec![record_kw(
+        let mut record = record_kw(
             "/tmp/a.org",
             1,
             1,
@@ -383,14 +419,16 @@ mod tests {
             "Buy milk",
             &["home"],
             &[],
-        )];
+        );
+        record.priority = Some("A".to_string());
+        let records = vec![record];
         let mut out = Vec::new();
 
         write_records(&mut out, &records, &opts(true, false)).unwrap();
 
         assert_eq!(
             out,
-            b"1\x001\x00/tmp/a.org\x00TODO\x000\x00Buy milk\x00home\x00\x00"
+            b"1\x001\x00/tmp/a.org\x00TODO\x000\x00Buy milk\x00home\x00A\x00fingerprint\x00etag\x00{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}\x00\x00"
         );
     }
 
@@ -409,13 +447,13 @@ mod tests {
         write_records(&mut out, &records, &opts(false, true)).unwrap();
 
         let actual = String::from_utf8(out).unwrap();
-        let expected = "{\"file\":\"/tmp/a.org\",\"level\":2,\"line\":17,\"keyword\":null,\"done\":null,\"title\":\"Nested\",\"tags\":[\"ops\"],\"properties\":{\"CUSTOM_ID\":\"cid\",\"TASK_REF\":\"248\"}}\n";
+        let expected = "{\"file\":\"/tmp/a.org\",\"level\":2,\"line\":17,\"keyword\":null,\"done\":null,\"title\":\"Nested\",\"tags\":[\"ops\"],\"properties\":{\"CUSTOM_ID\":\"cid\",\"TASK_REF\":\"248\"},\"priority\":null,\"fingerprint\":\"fingerprint\",\"etag\":\"etag\",\"todo_keywords\":{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}\n";
         assert_output_eq(&actual, expected);
     }
 
     #[test]
     fn ndjson_formatter_renders_keyword_field_when_present() {
-        let records = vec![record_kw(
+        let mut record = record_kw(
             "/tmp/a.org",
             1,
             1,
@@ -424,13 +462,15 @@ mod tests {
             "Buy milk",
             &[],
             &[],
-        )];
+        );
+        record.priority = Some("A".to_string());
+        let records = vec![record];
         let mut out = Vec::new();
 
         write_records(&mut out, &records, &opts(false, true)).unwrap();
 
         let actual = String::from_utf8(out).unwrap();
-        let expected = "{\"file\":\"/tmp/a.org\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"done\":false,\"title\":\"Buy milk\",\"tags\":[],\"properties\":{}}\n";
+        let expected = "{\"file\":\"/tmp/a.org\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"done\":false,\"title\":\"Buy milk\",\"tags\":[],\"properties\":{},\"priority\":\"A\",\"fingerprint\":\"fingerprint\",\"etag\":\"etag\",\"todo_keywords\":{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}\n";
         assert_output_eq(&actual, expected);
     }
 

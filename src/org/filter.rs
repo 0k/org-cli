@@ -62,6 +62,8 @@ mod tests {
             level: 1,
             line: 1,
             keyword: keyword.map(str::to_string),
+            priority: None,
+            fingerprint: String::new(),
             title: title.to_string(),
             tags: vec![],
             properties: properties

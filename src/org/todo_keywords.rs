@@ -11,13 +11,15 @@
 //! pre-scan the buffer (see [`scan_buffer`]) and feed the result into
 //! `ParseConfig`.
 
+use serde::Serialize;
+
 /// A resolved pair of org-mode TODO keyword sets.
 ///
 /// `active` holds the "not done" states (e.g. `TODO`, `WIP`) and `done`
 /// the terminal states (e.g. `DONE`, `CANCELED`). The order within each
 /// vector is preserved as declared, matching Emacs' left-to-right
 /// sequence semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TodoKeywords {
     /// Active ("not done") keywords, in declaration order.
     pub active: Vec<String>,

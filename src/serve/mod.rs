@@ -287,6 +287,8 @@ mod tests {
         tx.send(vec![
             TodoEvent::FileChanged {
                 path: "/a.org".into(),
+                etag: "etag".into(),
+                todo_keywords: crate::org::todo_keywords::TodoKeywords::default(),
                 todos: Vec::new(),
             },
             TodoEvent::FileRemoved {

@@ -190,19 +190,43 @@ fn todos_no_sync_on_fresh_db_returns_empty() {
 }
 
 #[test]
-fn todos_nul_output_matches_expected_bytes() {
-    let td = TempDir::new("nul");
-    let dir = td.path().join("org");
-    write(&dir, "* TODO Buy milk :home:urgent:\n");
+fn todos_versioned_formats_match_exact_bytes_and_priority_placement() {
+    const ETAG: &str = "733410184441c09822f04a5d3aaf3c4262ea3c26810a5d26033097cd05e1a1f9";
+    const FINGERPRINT: &str = "13a8ef44885266cff793163ac7bfecab5d5fec09bf28839dcabe368d31955789";
+
+    let td = TempDir::new("versioned-formats");
+    let file = td.path().join("versioned.org");
+    write(
+        &file,
+        "#+TODO: TODO WIP | DONE CANCELED\n* WIP [#A] Buy milk :home:\n",
+    );
     let db = td.path().join("todos.sqlite");
 
-    let out = run_todos(&dir, &db, &["-0"]);
-    assert_eq!(out.status.code(), Some(0));
-    // path\0line\0level\0keyword\0title\0tags\0is_done\0\0
-    let expected = format!(
-        "{}\x001\x001\x00TODO\x00Buy milk\x00home,urgent\x000\x00\x00",
-        dir.display()
+    let json = run_todos(&file, &db, &["-j"]);
+    assert_eq!(json.status.code(), Some(0));
+    let expected_json = format!(
+        "{{\"path\":\"{}\",\"line\":2,\"level\":1,\"keyword\":\"WIP\",\"title\":\"Buy milk\",\"tags\":[\"home\"],\"is_done\":false,\"priority\":\"A\",\"fingerprint\":\"{FINGERPRINT}\",\"etag\":\"{ETAG}\",\"todo_keywords\":{{\"active\":[\"TODO\",\"WIP\"],\"done\":[\"DONE\",\"CANCELED\"]}}}}\n",
+        file.display()
+    );
+    assert_eq!(String::from_utf8(json.stdout).unwrap(), expected_json);
+
+    let nul = run_todos(&file, &db, &["-0"]);
+    assert_eq!(nul.status.code(), Some(0));
+    let expected_nul = format!(
+        "{}\02\01\0WIP\0Buy milk\0home\00\0A\0{FINGERPRINT}\0{ETAG}\0{{\"active\":[\"TODO\",\"WIP\"],\"done\":[\"DONE\",\"CANCELED\"]}}\0\0",
+        file.display()
     )
     .into_bytes();
-    assert_eq!(out.stdout, expected);
+    assert_eq!(nul.stdout, expected_nul);
+
+    let human = Command::new(bin_path())
+        .arg("todos")
+        .arg(&file)
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .expect("spawn org-cli");
+    assert_eq!(human.status.code(), Some(0));
+    let expected_human = format!("{}:2: WIP [#A] Buy milk :home:\n", file.display());
+    assert_eq!(String::from_utf8(human.stdout).unwrap(), expected_human);
 }

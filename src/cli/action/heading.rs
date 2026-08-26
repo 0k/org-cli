@@ -21,8 +21,8 @@ use similar::TextDiff;
 use crate::org::heading::{HeadingPath, resolve_path, subtree_span};
 use crate::org::heading_edit::{
     AddPosition, EditRecord, InsertDest, add_heading, delete_heading, extract_subtree,
-    insert_subtree, set_content, set_keyword, set_property, set_tags, set_title, unset_property,
-    write_atomic,
+    insert_subtree, set_content, set_keyword, set_priority, set_property, set_tags, set_title,
+    unset_property, write_atomic,
 };
 use crate::org::todo_keywords::{TodoKeywords, scan_buffer};
 
@@ -240,6 +240,7 @@ pub struct SetOptions {
     pub line: Option<usize>,
     pub keyword: Option<String>,
     pub no_keyword: bool,
+    pub priority: Option<String>,
     pub title: Option<String>,
     pub add_tag: Vec<String>,
     pub remove_tag: Vec<String>,
@@ -253,7 +254,8 @@ pub struct SetOptions {
     pub nul: bool,
 }
 
-/// Run `heading set`. Applies the requested field edits sequentially,
+/// Run `heading set`. Applies keyword, priority, title, tags,
+/// properties, and content sequentially in heading-anatomy order,
 /// re-using the same target line (which is invariant across a heading's
 /// own edits, since every edit lands on or below the heading line).
 pub fn run_set(opts: SetOptions) -> Result<i32, String> {
@@ -265,6 +267,7 @@ pub fn run_set(opts: SetOptions) -> Result<i32, String> {
     let has_tag_edit =
         opts.set_tags.is_some() || !opts.add_tag.is_empty() || !opts.remove_tag.is_empty();
     let has_edit = has_keyword_edit
+        || opts.priority.is_some()
         || opts.title.is_some()
         || has_tag_edit
         || !opts.property.is_empty()
@@ -295,14 +298,23 @@ pub fn run_set(opts: SetOptions) -> Result<i32, String> {
         records.push(rec);
     }
 
-    // 2. title
-    if let Some(title) = &opts.title {
-        let (out, rec) = set_title(&content, line, title).map_err(|e| e.to_string())?;
+    // 2. priority
+    if let Some(priority) = &opts.priority {
+        let priority = (priority != "none").then_some(priority.as_str());
+        let (out, rec) =
+            set_priority(&content, line, priority, &keywords).map_err(|e| e.to_string())?;
         content = out;
         records.push(rec);
     }
 
-    // 3. tags
+    // 3. title
+    if let Some(title) = &opts.title {
+        let (out, rec) = set_title(&content, line, title, &keywords).map_err(|e| e.to_string())?;
+        content = out;
+        records.push(rec);
+    }
+
+    // 4. tags
     if let Some(spec) = &opts.set_tags {
         let tags = parse_tag_list(spec);
         let (out, rec) = set_tags(&content, line, &tags).map_err(|e| e.to_string())?;
@@ -325,7 +337,7 @@ pub fn run_set(opts: SetOptions) -> Result<i32, String> {
         records.push(rec);
     }
 
-    // 4. properties (set then unset, in flag order)
+    // 5. properties (set then unset, in flag order)
     for kv in &opts.property {
         let (key, value) = parse_kv(kv)?;
         let (out, rec) = set_property(&content, line, &key, &value).map_err(|e| e.to_string())?;
@@ -338,7 +350,7 @@ pub fn run_set(opts: SetOptions) -> Result<i32, String> {
         records.push(rec);
     }
 
-    // 5. content
+    // 6. content
     if let Some(b) = &body {
         let (out, rec) = set_content(&content, line, b).map_err(|e| e.to_string())?;
         content = out;
@@ -516,10 +528,8 @@ pub fn run_move(opts: MoveOptions) -> Result<i32, String> {
 
         if opts.write {
             // Destination first (crash-safe: a crash duplicates, never loses).
-            write_atomic(&dst_path, &dst_new)
-                .map_err(|e| format!("cannot write {}: {}", dst_path.display(), e))?;
-            write_atomic(&opts.file, &src_without)
-                .map_err(|e| format!("cannot write {}: {}", opts.file.display(), e))?;
+            write_atomic(&dst_path, &dst_new).map_err(|e| e.to_string())?;
+            write_atomic(&opts.file, &src_without).map_err(|e| e.to_string())?;
         }
 
         // Report both sides. In dry-run human mode, show the destination
@@ -589,8 +599,7 @@ fn finish(
     nul: bool,
 ) -> Result<i32, String> {
     if write {
-        write_atomic(file, new_content)
-            .map_err(|e| format!("cannot write {}: {}", file.display(), e))?;
+        write_atomic(file, new_content).map_err(|e| e.to_string())?;
     }
     let mode = OutputMode { json, nul, write };
     present(file, original, new_content, records, mode)?;

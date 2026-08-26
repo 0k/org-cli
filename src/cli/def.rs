@@ -526,8 +526,8 @@ pub enum ClockCommands {
 pub enum HeadingCommands {
     /// Edit fields of one existing heading, addressed by PATH or
     /// `--line N`. Field edits are applied in a fixed order (keyword,
-    /// title, tags, properties, content). At least one edit flag is
-    /// required.
+    /// priority, title, tags, properties, content). At least one edit
+    /// flag is required.
     Set {
         /// Target org file.
         file: std::path::PathBuf,
@@ -550,6 +550,11 @@ pub enum HeadingCommands {
         /// Remove the TODO keyword.
         #[arg(long)]
         no_keyword: bool,
+
+        /// Set priority A, B, or C. `none` removes the cookie and means
+        /// "not yet evaluated", never "low priority".
+        #[arg(long, value_name = "P", value_parser = ["A", "B", "C", "none"])]
+        priority: Option<String>,
 
         /// Replace the title text.
         #[arg(long, value_name = "T")]

@@ -4,10 +4,13 @@
 //! Byte-level file assertions use full-content comparison; no private
 //! corpus is involved (fixtures are constructed inline via `indoc`).
 
+use std::fs;
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::PathBuf;
 use std::process::Command;
 
 use indoc::indoc;
+use similar::TextDiff;
 
 fn bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_org-cli"))
@@ -43,6 +46,30 @@ fn assert_ok(out: &std::process::Output) {
         "expected success; stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn assert_output_eq(actual: &str, expected: &str) {
+    if actual != expected {
+        let diff = TextDiff::from_lines(expected, actual);
+        eprintln!();
+        for line in diff
+            .unified_diff()
+            .header("expected", "actual")
+            .to_string()
+            .lines()
+        {
+            if line.starts_with('-') {
+                eprintln!("\x1b[31m{}\x1b[0m", line);
+            } else if line.starts_with('+') {
+                eprintln!("\x1b[32m{}\x1b[0m", line);
+            } else if line.starts_with('@') {
+                eprintln!("\x1b[36m{}\x1b[0m", line);
+            } else {
+                eprintln!("{}", line);
+            }
+        }
+        panic!("Output mismatch - see diff above");
+    }
 }
 
 // =====================================================================
@@ -294,6 +321,249 @@ fn set_multiple_fields_sequential() {
     ]);
     assert_ok(&out);
     assert_eq!(read(f.path()), "* TODO New :x:\n");
+}
+
+#[test]
+fn set_priority_by_line_write() {
+    let f = temp_org("* Task\n");
+    let out = run(&[
+        "heading",
+        "set",
+        f.path().to_str().unwrap(),
+        "--line",
+        "1",
+        "--priority",
+        "A",
+        "--write",
+    ]);
+    assert_ok(&out);
+    assert_output_eq(&read(f.path()), "* [#A] Task\n");
+}
+
+#[test]
+fn set_priority_none_removes_cookie_without_constructing_none_cookie() {
+    let f = temp_org("* [#A] Task\n");
+    let out = run(&[
+        "heading",
+        "set",
+        f.path().to_str().unwrap(),
+        "--line",
+        "1",
+        "--priority",
+        "none",
+        "--write",
+    ]);
+    assert_ok(&out);
+    let content = read(f.path());
+    assert_output_eq(&content, "* Task\n");
+    assert!(!content.contains("[#none]"));
+}
+
+#[test]
+fn set_priority_and_title_preserve_custom_keyword_in_one_invocation() {
+    let f = temp_org(indoc! {"
+        #+TODO: TODO WIP | DONE
+        * WIP Old
+    "});
+    let out = run(&[
+        "heading",
+        "set",
+        f.path().to_str().unwrap(),
+        "--line",
+        "2",
+        "--priority",
+        "B",
+        "--title",
+        "New",
+        "--write",
+    ]);
+    assert_ok(&out);
+    assert_output_eq(
+        &read(f.path()),
+        indoc! {"
+            #+TODO: TODO WIP | DONE
+            * WIP [#B] New
+        "},
+    );
+}
+
+#[test]
+fn set_priority_alone_is_a_valid_edit_request() {
+    let f = temp_org("* Task\n");
+    let out = run(&[
+        "heading",
+        "set",
+        f.path().to_str().unwrap(),
+        "--line",
+        "1",
+        "--priority",
+        "C",
+        "-j",
+    ]);
+    assert_ok(&out);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["op"], "set-priority");
+}
+
+#[test]
+fn set_priority_invalid_value_is_rejected_before_file_mutation() {
+    let original = b"* Task\n";
+    let f = temp_org(std::str::from_utf8(original).unwrap());
+    let out = run(&[
+        "heading",
+        "set",
+        f.path().to_str().unwrap(),
+        "--line",
+        "1",
+        "--priority",
+        "D",
+        "--write",
+    ]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid value 'D'"));
+    assert_eq!(fs::read(f.path()).unwrap(), original);
+}
+
+#[test]
+fn set_priority_dry_run_prints_full_diff_and_keeps_file_unchanged() {
+    let original = "* Task\n";
+    let f = temp_org(original);
+    let out = run(&[
+        "heading",
+        "set",
+        f.path().to_str().unwrap(),
+        "--line",
+        "1",
+        "--priority",
+        "A",
+    ]);
+    assert_ok(&out);
+    assert_output_eq(&read(f.path()), original);
+    let expected = format!(
+        "--- a/{0}\n+++ b/{0}\n@@ -1 +1 @@\n-* Task\n+* [#A] Task\n(dry run: set-priority at line 1; pass --write to apply)\n",
+        f.path().display()
+    );
+    assert_output_eq(&String::from_utf8(out.stdout).unwrap(), &expected);
+}
+
+#[test]
+fn set_priority_json_record_uses_letter_values() {
+    let f = temp_org("* [#A] Task\n");
+    let out = run(&[
+        "heading",
+        "set",
+        f.path().to_str().unwrap(),
+        "--line",
+        "1",
+        "--priority",
+        "C",
+        "-j",
+    ]);
+    assert_ok(&out);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["op"], "set-priority");
+    assert_eq!(record["old"], "A");
+    assert_eq!(record["new"], "C");
+}
+
+#[test]
+fn set_priority_nul_record_uses_existing_shape() {
+    let f = temp_org("* Task\n");
+    let out = run(&[
+        "heading",
+        "set",
+        f.path().to_str().unwrap(),
+        "--line",
+        "1",
+        "--priority",
+        "A",
+        "-0",
+    ]);
+    assert_ok(&out);
+    let expected = format!("{}\0set-priority\01\0\0", f.path().display());
+    assert_output_eq(&String::from_utf8(out.stdout).unwrap(), &expected);
+}
+
+#[test]
+fn heading_set_rejects_crlf_without_changing_raw_bytes() {
+    let original = b"* Task\r\nbody\r\n";
+    let mut f = tempfile::Builder::new().suffix(".org").tempfile().unwrap();
+    use std::io::Write;
+    f.write_all(original).unwrap();
+    f.flush().unwrap();
+
+    let out = run(&[
+        "heading",
+        "set",
+        f.path().to_str().unwrap(),
+        "--line",
+        "1",
+        "--priority",
+        "A",
+        "--write",
+    ]);
+
+    assert_ne!(out.status.code(), Some(0));
+    assert_output_eq(
+        &String::from_utf8(out.stderr).unwrap(),
+        "Error: unsupported CRLF line ending at line 1; heading edits accept LF-only text\n",
+    );
+    assert_eq!(fs::read(f.path()).unwrap(), original);
+}
+
+#[test]
+fn heading_set_write_through_symlink_preserves_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.org");
+    let link = dir.path().join("link.org");
+    fs::write(&target, "* Task\n").unwrap();
+    symlink("target.org", &link).unwrap();
+    let link_before = fs::symlink_metadata(&link).unwrap();
+
+    let out = run(&[
+        "heading",
+        "set",
+        link.to_str().unwrap(),
+        "--line",
+        "1",
+        "--priority",
+        "A",
+        "--write",
+    ]);
+
+    assert_ok(&out);
+    assert_output_eq(&fs::read_to_string(&target).unwrap(), "* [#A] Task\n");
+    let link_after = fs::symlink_metadata(&link).unwrap();
+    assert!(link_after.file_type().is_symlink());
+    assert_eq!(link_after.ino(), link_before.ino());
+    assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("target.org"));
+}
+
+#[test]
+fn heading_set_write_refuses_hard_link_and_preserves_both_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.org");
+    let second = dir.path().join("second.org");
+    fs::write(&first, "* Task\n").unwrap();
+    fs::hard_link(&first, &second).unwrap();
+    let inode = fs::metadata(&first).unwrap().ino();
+
+    let out = run(&[
+        "heading",
+        "set",
+        first.to_str().unwrap(),
+        "--line",
+        "1",
+        "--priority",
+        "A",
+        "--write",
+    ]);
+
+    assert_ne!(out.status.code(), Some(0));
+    assert_output_eq(&fs::read_to_string(&first).unwrap(), "* Task\n");
+    assert_output_eq(&fs::read_to_string(&second).unwrap(), "* Task\n");
+    assert_eq!(fs::metadata(&first).unwrap().ino(), inode);
+    assert_eq!(fs::metadata(&second).unwrap().ino(), inode);
 }
 
 // =====================================================================

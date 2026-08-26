@@ -19,15 +19,17 @@
 //! set_keyword(None)`, `set_property → unset_property`,
 //! `extract_subtree → insert_subtree` at the same place).
 //!
-//! # Line-ending limitation
+//! # Line-ending contract
 //!
-//! Like [`crate::org::clock_add`], this module works on a
-//! `\n`-normalized line-vector model. `\r\n` (CRLF) line endings are not
-//! preserved — the same documented limitation as the rest of the
-//! editing layer.
+//! Heading edits accept LF-only text. Any `\r\n` (CRLF) terminator is
+//! rejected with an error naming its first 1-based line, before an edit
+//! can normalize bytes elsewhere in the file. A lone `\r` not followed
+//! by `\n` is ordinary data and is preserved byte-for-byte on untouched
+//! lines.
 
+use std::ffi::OsString;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -85,6 +87,8 @@ impl EditRecord {
 /// Everything that can go wrong applying a heading edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditError {
+    /// The source or caller-supplied text contains a CRLF terminator.
+    UnsupportedCrlf { line: usize },
     /// `heading_line` (or a referenced parent line) is not a heading.
     NotAHeading { line: usize },
     /// A keyword was rejected because it is not in the active∪done set.
@@ -92,6 +96,8 @@ pub enum EditError {
         keyword: String,
         allowed: Vec<String>,
     },
+    /// A priority was not one of the three supported org letters.
+    InvalidPriority { priority: String },
     /// A tag was empty or contained a `:`.
     InvalidTag { tag: String },
     /// `unset_property` referenced a key that is not present.
@@ -106,6 +112,13 @@ pub enum EditError {
 impl std::fmt::Display for EditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EditError::UnsupportedCrlf { line } => {
+                write!(
+                    f,
+                    "unsupported CRLF line ending at line {}; heading edits accept LF-only text",
+                    line
+                )
+            }
             EditError::NotAHeading { line } => {
                 write!(f, "line {} is not a heading", line)
             }
@@ -120,6 +133,9 @@ impl std::fmt::Display for EditError {
                         allowed.join(", ")
                     }
                 )
+            }
+            EditError::InvalidPriority { priority } => {
+                write!(f, "invalid priority {:?}; expected A, B, or C", priority)
             }
             EditError::InvalidTag { tag } => {
                 write!(
@@ -162,11 +178,30 @@ impl std::error::Error for EditError {}
 // Line-vector helpers (shared shape with clock_add)
 // ---------------------------------------------------------------------
 
-/// Split `content` into owned lines plus a flag recording whether the
-/// original ended with a newline.
-fn split_lines(content: &str) -> (Vec<String>, bool) {
+/// Reject the first CRLF terminator in `content` and report its 1-based
+/// line number. Lone carriage returns remain ordinary data.
+fn ensure_lf_only(content: &str) -> Result<(), EditError> {
+    if let Some(byte_index) = content
+        .as_bytes()
+        .windows(2)
+        .position(|pair| pair == b"\r\n")
+    {
+        let line = content.as_bytes()[..byte_index]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count()
+            + 1;
+        return Err(EditError::UnsupportedCrlf { line });
+    }
+    Ok(())
+}
+
+/// Split LF-only `content` into owned lines plus a flag recording
+/// whether the original ended with a newline.
+fn split_lines(content: &str) -> Result<(Vec<String>, bool), EditError> {
+    ensure_lf_only(content)?;
     let lines = content.lines().map(str::to_string).collect();
-    (lines, content.ends_with('\n'))
+    Ok((lines, content.ends_with('\n')))
 }
 
 /// Reassemble lines into a single string, restoring the trailing newline
@@ -465,7 +500,7 @@ pub fn set_keyword(
     keyword: Option<&str>,
     keywords: &TodoKeywords,
 ) -> Result<(String, EditRecord), EditError> {
-    let (mut lines, trailing_newline) = split_lines(content);
+    let (mut lines, trailing_newline) = split_lines(content)?;
     let raw =
         heading_raw(&lines, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
 
@@ -490,23 +525,58 @@ pub fn set_keyword(
     Ok((join_lines(&lines, trailing_newline), record))
 }
 
+/// Set or remove the heading's priority cookie.
+///
+/// `Some("A" | "B" | "C")` stores the matching org cookie; `None`
+/// removes it. No priority means the heading has not yet been evaluated,
+/// not that it has low priority. `keywords` determines the keyword/title
+/// boundary so custom TODO states remain before the cookie.
+pub fn set_priority(
+    content: &str,
+    heading_line: usize,
+    priority: Option<&str>,
+    keywords: &TodoKeywords,
+) -> Result<(String, EditRecord), EditError> {
+    if let Some(priority) = priority
+        && !matches!(priority, "A" | "B" | "C")
+    {
+        return Err(EditError::InvalidPriority {
+            priority: priority.to_string(),
+        });
+    }
+
+    let (mut lines, trailing_newline) = split_lines(content)?;
+    let raw =
+        heading_raw(&lines, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
+    let mut model = HeadingLineModel::parse(&raw, keywords);
+    let old = model
+        .priority
+        .as_deref()
+        .and_then(|cookie| cookie.strip_prefix("[#"))
+        .and_then(|letter| letter.strip_suffix(']'))
+        .map(str::to_string);
+    model.priority = priority.map(|letter| format!("[#{}]", letter));
+    lines[heading_line - 1] = model.render();
+
+    let mut record = EditRecord::new("set-priority", heading_line);
+    record.old = old;
+    record.new = priority.map(str::to_string);
+    Ok((join_lines(&lines, trailing_newline), record))
+}
+
 /// Replace the heading's title, preserving keyword, priority cookie,
 /// tags, and the tag column when possible.
 pub fn set_title(
     content: &str,
     heading_line: usize,
     title: &str,
+    keywords: &TodoKeywords,
 ) -> Result<(String, EditRecord), EditError> {
-    let (mut lines, trailing_newline) = split_lines(content);
+    let (mut lines, trailing_newline) = split_lines(content)?;
     let raw =
         heading_raw(&lines, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
 
-    let mut model = HeadingLineModel::parse(&raw, &TodoKeywords::default());
-    // Re-parse with default keywords is fine for title editing: whether a
-    // leading word is a keyword only matters for what we *preserve*, and
-    // preserving is column-neutral. But to be safe across custom keyword
-    // sets we re-parse with a permissive default; the title is what the
-    // caller supplies verbatim regardless.
+    let mut model = HeadingLineModel::parse(&raw, keywords);
     let old = model.title.clone();
     model.title = title.trim().to_string();
     lines[heading_line - 1] = model.render();
@@ -534,7 +604,7 @@ pub fn set_tags(
         }
     }
 
-    let (mut lines, trailing_newline) = split_lines(content);
+    let (mut lines, trailing_newline) = split_lines(content)?;
     let raw =
         heading_raw(&lines, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
 
@@ -618,7 +688,7 @@ pub fn set_property(
     key: &str,
     value: &str,
 ) -> Result<(String, EditRecord), EditError> {
-    let (mut lines, trailing_newline) = split_lines(content);
+    let (mut lines, trailing_newline) = split_lines(content)?;
     heading_raw(&lines, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
 
     let old_value;
@@ -677,7 +747,7 @@ pub fn unset_property(
     heading_line: usize,
     key: &str,
 ) -> Result<(String, EditRecord), EditError> {
-    let (mut lines, trailing_newline) = split_lines(content);
+    let (mut lines, trailing_newline) = split_lines(content)?;
     heading_raw(&lines, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
 
     let (start, end, _indent) = find_properties_drawer(&lines, heading_line).ok_or_else(|| {
@@ -747,7 +817,8 @@ pub fn set_content(
     heading_line: usize,
     body: &str,
 ) -> Result<(String, EditRecord), EditError> {
-    let (lines, trailing_newline) = split_lines(content);
+    let (lines, trailing_newline) = split_lines(content)?;
+    ensure_lf_only(body)?;
     heading_raw(&lines, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
 
     let section =
@@ -989,7 +1060,10 @@ pub fn add_heading(
         });
     }
 
-    let (mut lines, trailing_newline) = split_lines(content);
+    let (mut lines, trailing_newline) = split_lines(content)?;
+    if let Some(body) = body {
+        ensure_lf_only(body)?;
+    }
 
     // A new heading adopts the level of the parent's existing direct
     // children (org siblings share a level, including legal level-skips);
@@ -1015,7 +1089,7 @@ pub fn delete_heading(
     content: &str,
     heading_line: usize,
 ) -> Result<(String, EditRecord), EditError> {
-    let (mut lines, trailing_newline) = split_lines(content);
+    let (mut lines, trailing_newline) = split_lines(content)?;
     heading_raw(&lines, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
     let span =
         subtree_span(content, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
@@ -1040,7 +1114,7 @@ pub fn extract_subtree(
     content: &str,
     heading_line: usize,
 ) -> Result<(String, String, EditRecord), EditError> {
-    let (mut lines, trailing_newline) = split_lines(content);
+    let (mut lines, trailing_newline) = split_lines(content)?;
     heading_raw(&lines, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
     let span =
         subtree_span(content, heading_line).ok_or(EditError::NotAHeading { line: heading_line })?;
@@ -1114,7 +1188,8 @@ pub fn insert_subtree(
     block: &str,
     dest: InsertDest,
 ) -> Result<(String, EditRecord), EditError> {
-    let (mut lines, trailing_newline) = split_lines(content);
+    let (mut lines, trailing_newline) = split_lines(content)?;
+    ensure_lf_only(block)?;
 
     let dest_level = destination_child_level(content, &lines, dest.parent_line)?;
 
@@ -1165,28 +1240,341 @@ pub fn insert_subtree(
 // Atomic write
 // ---------------------------------------------------------------------
 
-/// Atomically replace `path`'s contents with `content`.
+/// A refusal or I/O failure while preparing an atomic replacement.
+#[derive(Debug)]
+pub enum AtomicWriteError {
+    /// Existing-file metadata cannot be verified on this platform.
+    UnsupportedPlatform { path: PathBuf },
+    /// The requested path is a symlink whose final target is absent.
+    DanglingSymlink { path: PathBuf },
+    /// The resolved target is not a regular file.
+    NotRegularFile { path: PathBuf },
+    /// The target has names other than the one being replaced.
+    HardLinked { path: PathBuf, nlink: u64 },
+    /// The target carries xattrs or ACLs that replacement would discard.
+    ExtendedMetadataPresent { path: PathBuf },
+    /// Extended metadata could not be inspected reliably.
+    CannotInspectExtendedMetadata { path: PathBuf, source: io::Error },
+    /// The replacement could not receive the target's owner and group.
+    CannotPreserveOwnership {
+        path: PathBuf,
+        uid: u32,
+        gid: u32,
+        source: io::Error,
+    },
+    /// The replacement could not receive the target's permission mode.
+    CannotPreserveMode {
+        path: PathBuf,
+        mode: u32,
+        source: io::Error,
+    },
+    /// A post-application stat did not prove exact metadata preservation.
+    PreservationVerificationFailed { path: PathBuf, detail: String },
+    /// An ordinary filesystem operation failed.
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl std::fmt::Display for AtomicWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedPlatform { path } => write!(
+                f,
+                "refusing atomic replacement of \"{}\": this platform cannot verify preservation of mode, ownership, and ACLs",
+                path.display()
+            ),
+            Self::DanglingSymlink { path } => write!(
+                f,
+                "refusing atomic replacement of \"{}\": symlink target does not exist",
+                path.display()
+            ),
+            Self::NotRegularFile { path } => write!(
+                f,
+                "refusing atomic replacement of \"{}\": target is not a regular file",
+                path.display()
+            ),
+            Self::HardLinked { path, nlink } => write!(
+                f,
+                "refusing atomic replacement of \"{}\": target has {} hard links; replacement would leave the other links unchanged",
+                path.display(),
+                nlink
+            ),
+            Self::ExtendedMetadataPresent { path } => write!(
+                f,
+                "refusing atomic replacement of \"{}\": target has extended attributes or ACLs that this writer does not preserve",
+                path.display()
+            ),
+            Self::CannotInspectExtendedMetadata { path, source } => write!(
+                f,
+                "refusing atomic replacement of \"{}\": cannot verify extended attributes or ACLs: {}",
+                path.display(),
+                source
+            ),
+            Self::CannotPreserveOwnership {
+                path,
+                uid,
+                gid,
+                source,
+            } => write!(
+                f,
+                "refusing atomic replacement of \"{}\": cannot preserve uid {} and gid {}: {}",
+                path.display(),
+                uid,
+                gid,
+                source
+            ),
+            Self::CannotPreserveMode { path, mode, source } => write!(
+                f,
+                "refusing atomic replacement of \"{}\": cannot preserve mode {:#06o}: {}",
+                path.display(),
+                mode,
+                source
+            ),
+            Self::PreservationVerificationFailed { path, detail } => write!(
+                f,
+                "refusing atomic replacement of \"{}\": replacement metadata verification failed: {}",
+                path.display(),
+                detail
+            ),
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => write!(f, "{} \"{}\": {}", operation, path.display(), source),
+        }
+    }
+}
+
+impl std::error::Error for AtomicWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CannotInspectExtendedMetadata { source, .. }
+            | Self::CannotPreserveOwnership { source, .. }
+            | Self::CannotPreserveMode { source, .. }
+            | Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+fn inspect_extended_metadata_with(
+    path: &Path,
+    list_xattrs_fn: impl Fn(&Path) -> io::Result<Vec<OsString>>,
+) -> Result<(), AtomicWriteError> {
+    let attributes =
+        list_xattrs_fn(path).map_err(|source| AtomicWriteError::CannotInspectExtendedMetadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if attributes.is_empty() {
+        Ok(())
+    } else {
+        Err(AtomicWriteError::ExtendedMetadataPresent {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn prepare_replacement_metadata_with(
+    display_path: &Path,
+    replacement_path: &Path,
+    target_metadata: &std::fs::Metadata,
+    preservation_supported: bool,
+    chown_fn: impl Fn(&Path, Option<u32>, Option<u32>) -> io::Result<()>,
+    metadata_fn: impl Fn(&Path) -> io::Result<std::fs::Metadata>,
+) -> Result<(), AtomicWriteError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !preservation_supported {
+        return Err(AtomicWriteError::UnsupportedPlatform {
+            path: display_path.to_path_buf(),
+        });
+    }
+
+    let uid = target_metadata.uid();
+    let gid = target_metadata.gid();
+    let mode = target_metadata.mode() & 0o7777;
+    chown_fn(replacement_path, Some(uid), Some(gid)).map_err(|source| {
+        AtomicWriteError::CannotPreserveOwnership {
+            path: display_path.to_path_buf(),
+            uid,
+            gid,
+            source,
+        }
+    })?;
+    std::fs::set_permissions(replacement_path, std::fs::Permissions::from_mode(mode)).map_err(
+        |source| AtomicWriteError::CannotPreserveMode {
+            path: display_path.to_path_buf(),
+            mode,
+            source,
+        },
+    )?;
+
+    let replacement_metadata = metadata_fn(replacement_path).map_err(|source| {
+        AtomicWriteError::PreservationVerificationFailed {
+            path: display_path.to_path_buf(),
+            detail: format!("cannot stat prepared replacement: {}", source),
+        }
+    })?;
+    let actual_mode = replacement_metadata.mode() & 0o7777;
+    if actual_mode != mode {
+        return Err(AtomicWriteError::PreservationVerificationFailed {
+            path: display_path.to_path_buf(),
+            detail: format!("mode is {:#06o}, expected {:#06o}", actual_mode, mode),
+        });
+    }
+    if replacement_metadata.uid() != uid || replacement_metadata.gid() != gid {
+        return Err(AtomicWriteError::PreservationVerificationFailed {
+            path: display_path.to_path_buf(),
+            detail: format!(
+                "uid/gid are {}/{}, expected {}/{}",
+                replacement_metadata.uid(),
+                replacement_metadata.gid(),
+                uid,
+                gid
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Atomically replace `path`'s contents with `content` while preserving
+/// the supported metadata contract.
 ///
-/// Writes to a [`tempfile::NamedTempFile`] created in the *same
-/// directory* as `path` (so the final rename stays on one filesystem and
-/// is atomic), then persists it over `path`. On success readers either
-/// see the whole old file or the whole new file — never a partial write.
+/// Existing symlinks are followed and their final regular-file target is
+/// replaced, leaving the link itself intact. Existing regular files must
+/// have one link, no extended attributes or ACLs, and metadata that can
+/// be copied and verified exactly before rename. Rename installs a new
+/// inode, so already-open file descriptors continue to observe the old
+/// inode. Missing destinations are created with the tempfile's secure
+/// mode and process ownership.
 ///
-/// Lives in this module rather than the CLI layer because it is the
-/// natural write-back partner of the pure edit ops above: keeping the two
-/// together lets the library surface offer "edit then persist" without a
-/// CLI dependency. (The plan's suggested `cli/action/io.rs` would have
-/// pulled the helper into the CLI crate-half prematurely.)
-pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp = match dir {
-        Some(d) => tempfile::NamedTempFile::new_in(d)?,
-        None => tempfile::NamedTempFile::new_in(".")?,
-    };
+/// The guarantee is atomic visibility: readers see either the complete
+/// old file or the complete new file. This function deliberately does
+/// not call `fsync`/`sync_all`, so it does not promise power-loss
+/// durability.
+pub fn write_atomic(path: &Path, content: &str) -> Result<(), AtomicWriteError> {
     use std::io::Write;
-    tmp.write_all(content.as_bytes())?;
-    tmp.flush()?;
-    tmp.persist(path).map_err(|e| e.error)?;
+
+    let requested_path = path.to_path_buf();
+    let (replacement_path, target_metadata) = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let resolved =
+                std::fs::canonicalize(path).map_err(|_| AtomicWriteError::DanglingSymlink {
+                    path: requested_path.clone(),
+                })?;
+            let target_metadata =
+                std::fs::metadata(&resolved).map_err(|source| AtomicWriteError::Io {
+                    operation: "inspect target",
+                    path: requested_path.clone(),
+                    source,
+                })?;
+            (resolved, Some(target_metadata))
+        }
+        Ok(metadata) => (path.to_path_buf(), Some(metadata)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => (path.to_path_buf(), None),
+        Err(source) => {
+            return Err(AtomicWriteError::Io {
+                operation: "inspect target",
+                path: requested_path,
+                source,
+            });
+        }
+    };
+
+    if let Some(metadata) = &target_metadata {
+        if !metadata.file_type().is_file() {
+            return Err(AtomicWriteError::NotRegularFile {
+                path: requested_path,
+            });
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        return Err(AtomicWriteError::UnsupportedPlatform {
+            path: requested_path,
+        });
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() > 1 {
+                return Err(AtomicWriteError::HardLinked {
+                    path: requested_path.clone(),
+                    nlink: metadata.nlink(),
+                });
+            }
+            inspect_extended_metadata_with(&requested_path, |_| {
+                xattr::list(&replacement_path).map(|attrs| attrs.collect())
+            })?;
+        }
+    }
+
+    let directory = replacement_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(directory).map_err(|source| AtomicWriteError::Io {
+            operation: "create temporary file for",
+            path: requested_path.clone(),
+            source,
+        })?;
+    temporary
+        .write_all(content.as_bytes())
+        .map_err(|source| AtomicWriteError::Io {
+            operation: "write temporary file for",
+            path: requested_path.clone(),
+            source,
+        })?;
+    temporary.flush().map_err(|source| AtomicWriteError::Io {
+        operation: "flush temporary file for",
+        path: requested_path.clone(),
+        source,
+    })?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let attributes: Vec<OsString> = xattr::list(temporary.path())
+            .map_err(|source| AtomicWriteError::CannotInspectExtendedMetadata {
+                path: requested_path.clone(),
+                source,
+            })?
+            .collect();
+        for attribute in attributes {
+            xattr::remove(temporary.path(), &attribute).map_err(|source| AtomicWriteError::Io {
+                operation: "clear temporary-file extended metadata for",
+                path: requested_path.clone(),
+                source,
+            })?;
+        }
+        inspect_extended_metadata_with(&requested_path, |_| {
+            xattr::list(temporary.path()).map(|attrs| attrs.collect())
+        })?;
+    }
+
+    if let Some(metadata) = &target_metadata {
+        #[cfg(unix)]
+        prepare_replacement_metadata_with(
+            &requested_path,
+            temporary.path(),
+            metadata,
+            cfg!(target_os = "linux"),
+            |path, uid, gid| std::os::unix::fs::chown(path, uid, gid),
+            |path| std::fs::metadata(path),
+        )?;
+    }
+
+    temporary
+        .persist(&replacement_path)
+        .map_err(|error| AtomicWriteError::Io {
+            operation: "rename replacement over",
+            path: requested_path,
+            source: error.error,
+        })?;
     Ok(())
 }
 
@@ -1199,6 +1587,9 @@ mod tests {
     use super::*;
     use indoc::indoc;
     use similar::TextDiff;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     fn assert_output_eq(actual: &str, expected: &str) {
         if actual != expected {
@@ -1228,6 +1619,37 @@ mod tests {
         TodoKeywords {
             active: vec!["TODO".to_string(), "WIP".to_string()],
             done: vec!["DONE".to_string(), "CANCELED".to_string()],
+        }
+    }
+
+    fn directory_entries(path: &Path) -> Vec<OsString> {
+        let mut entries: Vec<OsString> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FileSnapshot {
+        content: Vec<u8>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        ino: u64,
+        nlink: u64,
+    }
+
+    fn snapshot(path: &Path) -> FileSnapshot {
+        let metadata = fs::metadata(path).unwrap();
+        FileSnapshot {
+            content: fs::read(path).unwrap(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            ino: metadata.ino(),
+            nlink: metadata.nlink(),
         }
     }
 
@@ -1340,7 +1762,7 @@ mod tests {
     #[test]
     fn set_title_preserves_keyword_priority_tags() {
         let content = "* TODO [#A] Old title :work:\n";
-        let (out, rec) = set_title(content, 1, "New title").unwrap();
+        let (out, rec) = set_title(content, 1, "New title", &kw()).unwrap();
         assert_output_eq(&out, "* TODO [#A] New title :work:\n");
         assert_eq!(rec.old.as_deref(), Some("Old title"));
         assert_eq!(rec.new.as_deref(), Some("New title"));
@@ -1350,7 +1772,7 @@ mod tests {
     fn set_title_preserves_tag_column_when_short_enough() {
         let content = "* Short                                                             :t:\n";
         // The tag column here is preserved because the new title is shorter.
-        let (out, _) = set_title(content, 1, "Tiny").unwrap();
+        let (out, _) = set_title(content, 1, "Tiny", &kw()).unwrap();
         // Recompute expected: same column, tags moved to same char column.
         // The column of ":t:" in the input:
         let col = content.find(":t:").unwrap();
@@ -1364,16 +1786,209 @@ mod tests {
     fn set_title_falls_back_to_single_space_when_too_long() {
         let content = "* Hi :t:\n";
         let long = "A very very long replacement title that exceeds the column";
-        let (out, _) = set_title(content, 1, long).unwrap();
+        let (out, _) = set_title(content, 1, long, &kw()).unwrap();
         assert_output_eq(&out, &format!("* {} :t:\n", long));
     }
 
     #[test]
     fn set_title_round_trips() {
         let original = "* TODO [#A] Original :a:b:\n";
-        let (changed, _) = set_title(original, 1, "Temporary").unwrap();
-        let (back, _) = set_title(&changed, 1, "Original").unwrap();
+        let (changed, _) = set_title(original, 1, "Temporary", &kw()).unwrap();
+        let (back, _) = set_title(&changed, 1, "Original", &kw()).unwrap();
         assert_output_eq(&back, original);
+    }
+
+    #[test]
+    fn set_title_preserves_custom_keyword_and_priority() {
+        let content = "* WIP [#A] Old\n";
+        let (out, _) = set_title(content, 1, "New", &kw()).unwrap();
+        assert_output_eq(&out, "* WIP [#A] New\n");
+    }
+
+    // ----- set_priority -----------------------------------------------
+
+    #[test]
+    fn set_priority_sets_each_supported_letter_and_records_letters() {
+        for priority in ["A", "B", "C"] {
+            let (out, record) = set_priority("* Task\n", 1, Some(priority), &kw()).unwrap();
+            assert_output_eq(&out, &format!("* [#{}] Task\n", priority));
+            assert_eq!(record.op, "set-priority");
+            assert_eq!(record.old, None);
+            assert_eq!(record.new.as_deref(), Some(priority));
+        }
+    }
+
+    #[test]
+    fn set_priority_changes_and_removes_cookie_without_spacing_residue() {
+        let original = "* Task\n";
+        let (changed, record) = set_priority("* [#A] Task\n", 1, Some("C"), &kw()).unwrap();
+        assert_output_eq(&changed, "* [#C] Task\n");
+        assert_eq!(record.old.as_deref(), Some("A"));
+        assert_eq!(record.new.as_deref(), Some("C"));
+
+        let (without, record) = set_priority("* [#C] Task\n", 1, None, &kw()).unwrap();
+        assert_output_eq(&without, original);
+        assert_eq!(record.old.as_deref(), Some("C"));
+        assert_eq!(record.new, None);
+
+        let (with, _) = set_priority(original, 1, Some("B"), &kw()).unwrap();
+        let (round_tripped, _) = set_priority(&with, 1, None, &kw()).unwrap();
+        assert_output_eq(&round_tripped, original);
+    }
+
+    #[test]
+    fn set_priority_rejects_values_outside_exact_uppercase_letters() {
+        for priority in ["D", "", "AA", "a"] {
+            assert_eq!(
+                set_priority("* Task\n", 1, Some(priority), &kw()).unwrap_err(),
+                EditError::InvalidPriority {
+                    priority: priority.to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn set_priority_preserves_heading_anatomy_and_wide_tag_column() {
+        let content =
+            "* TODO [#A] Short                                             :wide:column:\n";
+        let (out, _) = set_priority(content, 1, Some("B"), &kw()).unwrap();
+        assert_output_eq(
+            &out,
+            "* TODO [#B] Short                                             :wide:column:\n",
+        );
+    }
+
+    #[test]
+    fn set_priority_uses_custom_keyword_set_for_cookie_position() {
+        let (out, _) = set_priority("* WIP Task\n", 1, Some("A"), &kw()).unwrap();
+        assert_output_eq(&out, "* WIP [#A] Task\n");
+    }
+
+    #[test]
+    fn set_priority_preserves_other_lines_and_trailing_newline_state() {
+        let content = indoc! {"
+            preamble
+            * First
+            body
+            * Second
+            tail
+        "};
+        let (out, _) = set_priority(content, 4, Some("A"), &kw()).unwrap();
+        assert_output_eq(
+            &out,
+            indoc! {"
+                preamble
+                * First
+                body
+                * [#A] Second
+                tail
+            "},
+        );
+
+        let (without_newline, _) = set_priority("* Task", 1, Some("C"), &kw()).unwrap();
+        assert_output_eq(&without_newline, "* [#C] Task");
+    }
+
+    #[test]
+    fn set_priority_rejects_non_heading_line() {
+        assert_eq!(
+            set_priority("* Task\nbody\n", 2, Some("A"), &kw()).unwrap_err(),
+            EditError::NotAHeading { line: 2 }
+        );
+    }
+
+    #[test]
+    fn all_heading_edit_ops_reject_crlf_source_at_first_occurrence() {
+        let content = "* One\nbody\r\n* Two\r\n";
+        let expected = EditError::UnsupportedCrlf { line: 2 };
+        assert_eq!(
+            set_keyword(content, 1, Some("TODO"), &kw()).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            set_priority(content, 1, Some("A"), &kw()).unwrap_err(),
+            expected
+        );
+        assert_eq!(set_title(content, 1, "Title", &kw()).unwrap_err(), expected);
+        assert_eq!(
+            set_tags(content, 1, &["tag".to_string()]).unwrap_err(),
+            expected
+        );
+        assert_eq!(set_property(content, 1, "K", "v").unwrap_err(), expected);
+        assert_eq!(unset_property(content, 1, "K").unwrap_err(), expected);
+        assert_eq!(set_content(content, 1, "body").unwrap_err(), expected);
+        assert_eq!(
+            add_heading(
+                content,
+                None,
+                AddPosition::Last,
+                None,
+                "New",
+                &[],
+                &[],
+                None,
+                &kw()
+            )
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(delete_heading(content, 1).unwrap_err(), expected);
+        assert_eq!(extract_subtree(content, 1).unwrap_err(), expected);
+        assert_eq!(
+            insert_subtree(
+                content,
+                "* Added\n",
+                InsertDest {
+                    parent_line: None,
+                    pos: AddPosition::Last,
+                },
+            )
+            .unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
+    fn caller_supplied_multiline_text_rejects_crlf_at_its_own_line() {
+        assert_eq!(
+            set_content("* Task\n", 1, "first\nsecond\r\nthird").unwrap_err(),
+            EditError::UnsupportedCrlf { line: 2 }
+        );
+        assert_eq!(
+            add_heading(
+                "* Task\n",
+                None,
+                AddPosition::Last,
+                None,
+                "New",
+                &[],
+                &[],
+                Some("first\nsecond\r\n"),
+                &kw(),
+            )
+            .unwrap_err(),
+            EditError::UnsupportedCrlf { line: 2 }
+        );
+        assert_eq!(
+            insert_subtree(
+                "* Task\n",
+                "* First\nbody\r\n",
+                InsertDest {
+                    parent_line: None,
+                    pos: AddPosition::Last,
+                },
+            )
+            .unwrap_err(),
+            EditError::UnsupportedCrlf { line: 2 }
+        );
+    }
+
+    #[test]
+    fn lone_carriage_return_is_data_and_survives_untouched() {
+        let content = "note\rdata\n* Task\n";
+        let (out, _) = set_priority(content, 2, Some("A"), &kw()).unwrap();
+        assert_output_eq(&out, "note\rdata\n* [#A] Task\n");
     }
 
     // ----- set_tags ---------------------------------------------------
@@ -1990,6 +2605,281 @@ mod tests {
     // ----- write_atomic -----------------------------------------------
 
     #[test]
+    fn atomic_write_error_display_contract_is_exact() {
+        let path = PathBuf::from("target.org");
+        let denied = || io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let cases = [
+            (
+                AtomicWriteError::UnsupportedPlatform { path: path.clone() },
+                "refusing atomic replacement of \"target.org\": this platform cannot verify preservation of mode, ownership, and ACLs",
+            ),
+            (
+                AtomicWriteError::DanglingSymlink { path: path.clone() },
+                "refusing atomic replacement of \"target.org\": symlink target does not exist",
+            ),
+            (
+                AtomicWriteError::NotRegularFile { path: path.clone() },
+                "refusing atomic replacement of \"target.org\": target is not a regular file",
+            ),
+            (
+                AtomicWriteError::HardLinked {
+                    path: path.clone(),
+                    nlink: 2,
+                },
+                "refusing atomic replacement of \"target.org\": target has 2 hard links; replacement would leave the other links unchanged",
+            ),
+            (
+                AtomicWriteError::ExtendedMetadataPresent { path: path.clone() },
+                "refusing atomic replacement of \"target.org\": target has extended attributes or ACLs that this writer does not preserve",
+            ),
+            (
+                AtomicWriteError::CannotInspectExtendedMetadata {
+                    path: path.clone(),
+                    source: denied(),
+                },
+                "refusing atomic replacement of \"target.org\": cannot verify extended attributes or ACLs: denied",
+            ),
+            (
+                AtomicWriteError::CannotPreserveOwnership {
+                    path: path.clone(),
+                    uid: 1000,
+                    gid: 1001,
+                    source: denied(),
+                },
+                "refusing atomic replacement of \"target.org\": cannot preserve uid 1000 and gid 1001: denied",
+            ),
+            (
+                AtomicWriteError::CannotPreserveMode {
+                    path: path.clone(),
+                    mode: 0o640,
+                    source: denied(),
+                },
+                "refusing atomic replacement of \"target.org\": cannot preserve mode 0o0640: denied",
+            ),
+            (
+                AtomicWriteError::PreservationVerificationFailed {
+                    path: path.clone(),
+                    detail: "mode mismatch".to_string(),
+                },
+                "refusing atomic replacement of \"target.org\": replacement metadata verification failed: mode mismatch",
+            ),
+            (
+                AtomicWriteError::Io {
+                    operation: "write",
+                    path,
+                    source: denied(),
+                },
+                "write \"target.org\": denied",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_output_eq(&error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn write_atomic_preserves_mode_ownership_and_replaces_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.org");
+        fs::write(&path, "old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let before = snapshot(&path);
+
+        write_atomic(&path, "new\n").unwrap();
+
+        let after = snapshot(&path);
+        assert_eq!(after.content, b"new\n");
+        assert_eq!(after.mode & 0o7777, 0o640);
+        assert_eq!((after.uid, after.gid), (before.uid, before.gid));
+        assert_ne!(after.ino, before.ino);
+    }
+
+    #[test]
+    fn write_atomic_preserves_symlink_identity_and_updates_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.org");
+        let link = dir.path().join("link.org");
+        fs::write(&target, "old\n").unwrap();
+        symlink("target.org", &link).unwrap();
+        let link_before = fs::symlink_metadata(&link).unwrap();
+        let destination_before = fs::read_link(&link).unwrap();
+
+        write_atomic(&link, "new\n").unwrap();
+
+        let link_after = fs::symlink_metadata(&link).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+        assert_eq!(fs::read_link(&link).unwrap(), destination_before);
+        assert!(link_after.file_type().is_symlink());
+        assert_eq!(link_after.ino(), link_before.ino());
+    }
+
+    #[test]
+    fn write_atomic_refuses_hard_links_without_any_change_or_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.org");
+        let second = dir.path().join("second.org");
+        fs::write(&first, "original\n").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+        let before_first = snapshot(&first);
+        let before_second = snapshot(&second);
+        let entries_before = directory_entries(dir.path());
+
+        let error = write_atomic(&first, "replacement\n").unwrap_err();
+
+        assert!(matches!(
+            error,
+            AtomicWriteError::HardLinked { nlink: 2, .. }
+        ));
+        assert_eq!(snapshot(&first), before_first);
+        assert_eq!(snapshot(&second), before_second);
+        assert_eq!(directory_entries(dir.path()), entries_before);
+    }
+
+    #[test]
+    fn write_atomic_refuses_dangling_symlink_without_changing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("dangling.org");
+        symlink("missing.org", &link).unwrap();
+        let metadata_before = fs::symlink_metadata(&link).unwrap();
+        let target_before = fs::read_link(&link).unwrap();
+        let entries_before = directory_entries(dir.path());
+
+        let error = write_atomic(&link, "replacement\n").unwrap_err();
+
+        assert!(matches!(error, AtomicWriteError::DanglingSymlink { .. }));
+        let metadata_after = fs::symlink_metadata(&link).unwrap();
+        assert!(metadata_after.file_type().is_symlink());
+        assert_eq!(metadata_after.ino(), metadata_before.ino());
+        assert_eq!(fs::read_link(&link).unwrap(), target_before);
+        assert_eq!(directory_entries(dir.path()), entries_before);
+    }
+
+    #[test]
+    fn write_atomic_refuses_directory_without_changing_metadata_or_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let metadata_before = fs::metadata(&target).unwrap();
+        let entries_before = directory_entries(dir.path());
+
+        let error = write_atomic(&target, "replacement\n").unwrap_err();
+
+        assert!(matches!(error, AtomicWriteError::NotRegularFile { .. }));
+        let metadata_after = fs::metadata(&target).unwrap();
+        assert_eq!(metadata_after.ino(), metadata_before.ino());
+        assert_eq!(metadata_after.mode(), metadata_before.mode());
+        assert_eq!(directory_entries(dir.path()), entries_before);
+    }
+
+    #[test]
+    fn write_atomic_creates_missing_destination_with_secure_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.org");
+        write_atomic(&path, "new\n").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+    }
+
+    #[test]
+    fn inspect_extended_metadata_seam_reports_presence_and_inspection_failure() {
+        let path = Path::new("target.org");
+        let present =
+            inspect_extended_metadata_with(path, |_| Ok(vec![OsString::from("user.test")]))
+                .unwrap_err();
+        assert!(matches!(
+            present,
+            AtomicWriteError::ExtendedMetadataPresent { .. }
+        ));
+
+        let failure = inspect_extended_metadata_with(path, |_| {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+        })
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            AtomicWriteError::CannotInspectExtendedMetadata { .. }
+        ));
+    }
+
+    #[test]
+    fn prepare_replacement_metadata_seam_reports_chown_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.org");
+        let replacement = dir.path().join("replacement.org");
+        fs::write(&source, "source\n").unwrap();
+        fs::write(&replacement, "replacement\n").unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+
+        let error = prepare_replacement_metadata_with(
+            &source,
+            &replacement,
+            &metadata,
+            true,
+            |_, _, _| Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            |path| fs::metadata(path),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AtomicWriteError::CannotPreserveOwnership { .. }
+        ));
+    }
+
+    #[test]
+    fn prepare_replacement_metadata_seam_reports_post_apply_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.org");
+        let replacement = dir.path().join("replacement.org");
+        let mismatch = dir.path().join("mismatch.org");
+        fs::write(&source, "source\n").unwrap();
+        fs::write(&replacement, "replacement\n").unwrap();
+        fs::write(&mismatch, "mismatch\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&mismatch, fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+
+        let error = prepare_replacement_metadata_with(
+            &source,
+            &replacement,
+            &metadata,
+            true,
+            |_, _, _| Ok(()),
+            |_| fs::metadata(&mismatch),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AtomicWriteError::PreservationVerificationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn prepare_replacement_metadata_seam_reports_unsupported_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.org");
+        let replacement = dir.path().join("replacement.org");
+        fs::write(&source, "source\n").unwrap();
+        fs::write(&replacement, "replacement\n").unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+
+        let error = prepare_replacement_metadata_with(
+            &source,
+            &replacement,
+            &metadata,
+            false,
+            |_, _, _| Ok(()),
+            |path| fs::metadata(path),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AtomicWriteError::UnsupportedPlatform { .. }
+        ));
+    }
+
+    #[test]
     fn write_atomic_creates_and_overwrites() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.org");
@@ -2013,7 +2903,7 @@ mod tests {
     #[test]
     fn ops_preserve_absent_trailing_newline() {
         let content = "* TODO Task :t:"; // no trailing newline
-        let (out, _) = set_title(content, 1, "Renamed").unwrap();
+        let (out, _) = set_title(content, 1, "Renamed", &kw()).unwrap();
         assert_output_eq(&out, "* TODO Renamed :t:");
     }
 }

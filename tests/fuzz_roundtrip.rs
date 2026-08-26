@@ -164,7 +164,7 @@ fn heading_line_is_canonical(content: &str, h: &Heading) -> bool {
     // Probe with set_title(original_title): a pure identity that
     // exercises the full render path. If content is unchanged, the line
     // is canonical.
-    match set_title(content, h.line, &h.title) {
+    match set_title(content, h.line, &h.title, &keyword_pool(content)) {
         Ok((out, _)) => out == content,
         Err(_) => false,
     }
@@ -240,7 +240,13 @@ fn roundtrip_keyword(
 }
 
 /// Op 2: set_title to random strings (shorter and longer), then restore.
-fn roundtrip_title(stats: &mut FileStats, rng: &mut Rng, pristine: &str, h: &Heading) {
+fn roundtrip_title(
+    stats: &mut FileStats,
+    rng: &mut Rng,
+    pristine: &str,
+    h: &Heading,
+    keywords: &TodoKeywords,
+) {
     // Vary length around the original.
     let orig_len = h.title.chars().count();
     let new_len = if rng.below(2) == 0 {
@@ -250,14 +256,14 @@ fn roundtrip_title(stats: &mut FileStats, rng: &mut Rng, pristine: &str, h: &Hea
     };
     let new_title = rng.ascii_title(new_len);
 
-    let forward = match set_title(pristine, h.line, &new_title) {
+    let forward = match set_title(pristine, h.line, &new_title, keywords) {
         Ok((out, _)) => out,
         Err(_) => {
             stats.skip("title_op_error");
             return;
         }
     };
-    let restored = match set_title(&forward, h.line, &h.title) {
+    let restored = match set_title(&forward, h.line, &h.title, keywords) {
         Ok((out, _)) => out,
         Err(_) => {
             stats.skip("title_restore_error");
@@ -576,7 +582,8 @@ fn fuzz_roundtrip() {
             ..Default::default()
         };
 
-        // CRLF / non-UTF-8 files are a documented limitation.
+        // The harness has no carriage-return corpus expectations. The
+        // editor itself enforces its LF-only contract by rejecting CRLF.
         if bytes.contains(&b'\r') {
             stats.skip("crlf_file");
             per_file.push((path.clone(), stats));
@@ -615,7 +622,7 @@ fn fuzz_roundtrip() {
             // Scalar ops: only meaningful for canonical heading lines.
             if heading_line_is_canonical(&pristine, &h) {
                 roundtrip_keyword(&mut stats, &mut rng, &pristine, &h, &keywords);
-                roundtrip_title(&mut stats, &mut rng, &pristine, &h);
+                roundtrip_title(&mut stats, &mut rng, &pristine, &h, &keywords);
                 roundtrip_tags(&mut stats, &mut rng, &pristine, &h);
             } else {
                 stats.skip("non_canonical_heading_line");

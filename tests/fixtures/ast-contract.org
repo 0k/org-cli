@@ -1,0 +1,24 @@
+:PROPERTIES:
+:ID: 01KYKTS6HADBMAG4VWQ6HVT4X1
+:END:
+#+TITLE: AST contract
+
+* TODO [#A] Fix *important* thing :work:urgent:
+SCHEDULED: <2026-07-29 Wed 10:00 -2d> DEADLINE: <2026-07-30 Thu +1w>
+:PROPERTIES:
+:EFFORT: 2:00
+:END:
+:LOGBOOK:
+CLOCK: [2026-01-07 Wed 09:57:20 +0100]--[2026-01-07 Wed 12:19:25 +0100] =>  2:22:05
+CLOCK: [2026-07-28 Tue 09:30 +0200]--[2026-07-28 Tue 11:45 +0200] =>  2:15
+CLOCK: [2026-07-28 Tue 14:00 +0200]
+:END:
+Body with a [[file:/tmp/x.org][link]] and ~code~.
+
+- [ ] item
+  #+begin_src rust
+  fn main() {}
+  #+end_src
+
+** DONE Archived :ARCHIVE:
+CLOSED: [2026-07-28 Tue]

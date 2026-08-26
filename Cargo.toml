@@ -51,3 +51,28 @@ xattr = "1"
 [dev-dependencies]
 indoc = "2"
 reqwest = { version = "0.12", features = ["blocking"] }
+
+# Patch orgize-0.10.0-alpha.10 with a fork that teaches its timestamp
+# parser about numerical UTC offsets (`+0200` / `-0500`) and seconds
+# precision (`09:57:20`, `=>  2:22:05`).
+#
+# Upstream's `repeater_or_delay` also starts on `+`/`-`, consumes the
+# digits, then REQUIRES a unit (`h`/`d`/`w`/`m`/`y`).  Given `+0200` it
+# matched `+`, read `0200`, found no unit and failed — which aborted the
+# WHOLE timestamp, so any `CLOCK:` line carrying an offset silently
+# degraded to a plain paragraph.  The same bug hid clocks inside
+# `:LOGBOOK:` drawers.
+#
+# Both forms are valid org-mode and are what Emacs itself writes, so
+# without this patch the entire canonical CLOCK corpus is invisible to
+# `Headline::clocks()` — and therefore to `org::ast`, whose semantic
+# AST is consumed by `vigil-watch`'s `/api/data-flow` item endpoint and
+# rendered by `vigil-ui`'s Org renderer.
+#
+# `vigil-watch` applies the identical patch; keeping both crates on the
+# same revision is what makes the shared AST fixture meaningful.
+#
+# Source: https://github.com/0k/orgize
+#   branch: vaab/timestamp-tz-offset-and-seconds
+[patch.crates-io]
+orgize = { git = "https://github.com/0k/orgize", rev = "2573cba3b4ccd1ba658d076d3b917667678f6387" }

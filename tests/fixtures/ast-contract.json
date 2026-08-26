@@ -1,0 +1,467 @@
+{
+  "children": [
+    {
+      "properties": [
+        {
+          "key": "ID",
+          "source": {
+            "end": 45,
+            "start": 13
+          },
+          "type": "node-property",
+          "value": "01KYKTS6HADBMAG4VWQ6HVT4X1"
+        }
+      ],
+      "source": {
+        "end": 51,
+        "start": 0
+      },
+      "type": "property-drawer"
+    },
+    {
+      "children": [
+        {
+          "key": "TITLE",
+          "source": {
+            "end": 74,
+            "start": 51
+          },
+          "type": "keyword",
+          "value": " AST contract"
+        }
+      ],
+      "source": {
+        "end": 74,
+        "start": 51
+      },
+      "type": "section"
+    },
+    {
+      "archived": false,
+      "children": [
+        {
+          "entries": [
+            {
+              "kind": "scheduled",
+              "source": {
+                "end": 159,
+                "start": 122
+              },
+              "timestamp": {
+                "active": true,
+                "end": null,
+                "range": false,
+                "raw": "<2026-07-29 Wed 10:00 -2d>",
+                "source": {
+                  "end": 159,
+                  "start": 133
+                },
+                "start": {
+                  "day": "29",
+                  "dayname": "Wed",
+                  "hour": "10",
+                  "minute": "00",
+                  "month": "07",
+                  "second": null,
+                  "tz_offset": null,
+                  "year": "2026"
+                },
+                "type": "timestamp"
+              }
+            },
+            {
+              "kind": "deadline",
+              "source": {
+                "end": 190,
+                "start": 159
+              },
+              "timestamp": {
+                "active": true,
+                "end": null,
+                "range": false,
+                "raw": "<2026-07-30 Thu +1w>",
+                "source": {
+                  "end": 190,
+                  "start": 170
+                },
+                "start": {
+                  "day": "30",
+                  "dayname": "Thu",
+                  "hour": null,
+                  "minute": null,
+                  "month": "07",
+                  "second": null,
+                  "tz_offset": null,
+                  "year": "2026"
+                },
+                "type": "timestamp"
+              }
+            }
+          ],
+          "source": {
+            "end": 191,
+            "start": 122
+          },
+          "type": "planning"
+        },
+        {
+          "properties": [
+            {
+              "key": "EFFORT",
+              "source": {
+                "end": 218,
+                "start": 204
+              },
+              "type": "node-property",
+              "value": "2:00"
+            }
+          ],
+          "source": {
+            "end": 224,
+            "start": 191
+          },
+          "type": "property-drawer"
+        },
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "duration": "2:22:05",
+                  "end": {
+                    "day": "07",
+                    "dayname": "Wed",
+                    "hour": "12",
+                    "minute": "19",
+                    "month": "01",
+                    "second": "25",
+                    "tz_offset": "+0100",
+                    "year": "2026"
+                  },
+                  "running": false,
+                  "source": {
+                    "end": 318,
+                    "start": 234
+                  },
+                  "start": {
+                    "day": "07",
+                    "dayname": "Wed",
+                    "hour": "09",
+                    "minute": "57",
+                    "month": "01",
+                    "second": "20",
+                    "tz_offset": "+0100",
+                    "year": "2026"
+                  },
+                  "type": "clock"
+                },
+                {
+                  "duration": "2:15",
+                  "end": {
+                    "day": "28",
+                    "dayname": "Tue",
+                    "hour": "11",
+                    "minute": "45",
+                    "month": "07",
+                    "second": null,
+                    "tz_offset": "+0200",
+                    "year": "2026"
+                  },
+                  "running": false,
+                  "source": {
+                    "end": 393,
+                    "start": 318
+                  },
+                  "start": {
+                    "day": "28",
+                    "dayname": "Tue",
+                    "hour": "09",
+                    "minute": "30",
+                    "month": "07",
+                    "second": null,
+                    "tz_offset": "+0200",
+                    "year": "2026"
+                  },
+                  "type": "clock"
+                },
+                {
+                  "duration": null,
+                  "end": null,
+                  "running": true,
+                  "source": {
+                    "end": 429,
+                    "start": 393
+                  },
+                  "start": {
+                    "day": "28",
+                    "dayname": "Tue",
+                    "hour": "14",
+                    "minute": "00",
+                    "month": "07",
+                    "second": null,
+                    "tz_offset": "+0200",
+                    "year": "2026"
+                  },
+                  "type": "clock"
+                }
+              ],
+              "name": "LOGBOOK",
+              "source": {
+                "end": 435,
+                "start": 224
+              },
+              "type": "drawer"
+            },
+            {
+              "children": [
+                {
+                  "source": {
+                    "end": 447,
+                    "start": 435
+                  },
+                  "text": "Body with a ",
+                  "type": "text"
+                },
+                {
+                  "description": [
+                    {
+                      "source": {
+                        "end": 470,
+                        "start": 466
+                      },
+                      "text": "link",
+                      "type": "text"
+                    }
+                  ],
+                  "link_type": "file",
+                  "path": "file:/tmp/x.org",
+                  "source": {
+                    "end": 472,
+                    "start": 447
+                  },
+                  "type": "link"
+                },
+                {
+                  "source": {
+                    "end": 477,
+                    "start": 472
+                  },
+                  "text": " and ",
+                  "type": "text"
+                },
+                {
+                  "source": {
+                    "end": 483,
+                    "start": 477
+                  },
+                  "type": "code",
+                  "value": "code"
+                },
+                {
+                  "source": {
+                    "end": 485,
+                    "start": 483
+                  },
+                  "text": ".\n",
+                  "type": "text"
+                },
+                {
+                  "source": {
+                    "end": 486,
+                    "start": 485
+                  },
+                  "text": "\n",
+                  "type": "text"
+                }
+              ],
+              "source": {
+                "end": 486,
+                "start": 435
+              },
+              "type": "paragraph"
+            },
+            {
+              "children": [
+                {
+                  "bullet": "- ",
+                  "checkbox": " ",
+                  "children": [
+                    {
+                      "children": [
+                        {
+                          "source": {
+                            "end": 497,
+                            "start": 492
+                          },
+                          "text": "item\n",
+                          "type": "text"
+                        }
+                      ],
+                      "source": {
+                        "end": 497,
+                        "start": 492
+                      },
+                      "type": "paragraph"
+                    },
+                    {
+                      "language": "rust",
+                      "parameters": null,
+                      "source": {
+                        "end": 544,
+                        "start": 497
+                      },
+                      "switches": null,
+                      "type": "src-block",
+                      "value": "  fn main() {}\n"
+                    }
+                  ],
+                  "counter": null,
+                  "indent": 0,
+                  "source": {
+                    "end": 544,
+                    "start": 486
+                  },
+                  "tag": [],
+                  "type": "list-item"
+                }
+              ],
+              "descriptive": false,
+              "ordered": false,
+              "source": {
+                "end": 544,
+                "start": 486
+              },
+              "type": "plain-list"
+            }
+          ],
+          "source": {
+            "end": 544,
+            "start": 224
+          },
+          "type": "section"
+        },
+        {
+          "archived": true,
+          "children": [
+            {
+              "entries": [
+                {
+                  "kind": "closed",
+                  "source": {
+                    "end": 595,
+                    "start": 571
+                  },
+                  "timestamp": {
+                    "active": false,
+                    "end": null,
+                    "range": false,
+                    "raw": "[2026-07-28 Tue]",
+                    "source": {
+                      "end": 595,
+                      "start": 579
+                    },
+                    "start": {
+                      "day": "28",
+                      "dayname": "Tue",
+                      "hour": null,
+                      "minute": null,
+                      "month": "07",
+                      "second": null,
+                      "tz_offset": null,
+                      "year": "2026"
+                    },
+                    "type": "timestamp"
+                  }
+                }
+              ],
+              "source": {
+                "end": 596,
+                "start": 571
+              },
+              "type": "planning"
+            }
+          ],
+          "commented": false,
+          "level": 2,
+          "priority": null,
+          "source": {
+            "end": 596,
+            "start": 544
+          },
+          "tags": [
+            "ARCHIVE"
+          ],
+          "title": [
+            {
+              "source": {
+                "end": 561,
+                "start": 552
+              },
+              "text": "Archived ",
+              "type": "text"
+            }
+          ],
+          "title_raw": "Archived ",
+          "todo_keyword": "DONE",
+          "todo_type": "done",
+          "type": "headline"
+        }
+      ],
+      "commented": false,
+      "level": 1,
+      "priority": "A",
+      "source": {
+        "end": 596,
+        "start": 74
+      },
+      "tags": [
+        "work",
+        "urgent"
+      ],
+      "title": [
+        {
+          "source": {
+            "end": 90,
+            "start": 86
+          },
+          "text": "Fix ",
+          "type": "text"
+        },
+        {
+          "children": [
+            {
+              "source": {
+                "end": 100,
+                "start": 91
+              },
+              "text": "important",
+              "type": "text"
+            }
+          ],
+          "source": {
+            "end": 101,
+            "start": 90
+          },
+          "type": "bold"
+        },
+        {
+          "source": {
+            "end": 108,
+            "start": 101
+          },
+          "text": " thing ",
+          "type": "text"
+        }
+      ],
+      "title_raw": "Fix *important* thing ",
+      "todo_keyword": "TODO",
+      "todo_type": "todo",
+      "type": "headline"
+    }
+  ],
+  "source": {
+    "end": 596,
+    "start": 0
+  },
+  "type": "document"
+}

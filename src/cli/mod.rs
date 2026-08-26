@@ -232,8 +232,18 @@ pub fn run() -> Result<(), String> {
         }
 
         #[cfg(feature = "server")]
-        Some(def::Commands::Daemon { paths, addr, db }) => {
-            let opts = action::daemon::DaemonOptions { paths, addr, db };
+        Some(def::Commands::Daemon {
+            paths,
+            addr,
+            db,
+            allow_remote_writes,
+        }) => {
+            let opts = action::daemon::DaemonOptions {
+                paths,
+                addr,
+                db,
+                allow_remote_writes,
+            };
             let exit_code = action::daemon::run(opts)?;
             if exit_code != 0 {
                 std::process::exit(exit_code);

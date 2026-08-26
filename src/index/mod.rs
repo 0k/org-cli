@@ -17,4 +17,4 @@
 
 mod store;
 
-pub use store::{TodoEvent, TodoQuery, TodoRecord, TodoStore};
+pub use store::{TodoEvent, TodoQuery, TodoRecord, TodoStore, records_from_snapshot};

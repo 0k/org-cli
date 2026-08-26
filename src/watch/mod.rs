@@ -29,10 +29,10 @@
 //!   (`.#foo.org`), backups (`foo.org~`) and any hidden dotfile.
 //! * **Debounces** events per path over a short window so a burst of
 //!   fs notifications for one save collapses into a single reparse.
-//! * On each debounced batch, calls [`TodoStore::sync`] with the full
-//!   current resolved set (the fingerprint check makes untouched files
-//!   free) and forwards the returned diff — when non-empty — through
-//!   the [`std::sync::mpsc::Sender`].
+//! * On each debounced batch, calls [`TodoStore::sync_forcing`] with the
+//!   full current resolved set and touched paths (the fingerprint check
+//!   keeps every other file free), then forwards any non-empty diff
+//!   through the [`std::sync::mpsc::Sender`].
 //!
 //! # Lifecycle
 //!
@@ -150,7 +150,7 @@ impl TodoWatcher {
     ///
     /// Arms directory watches (plus the agenda file, if any), then
     /// loops: drain debounced fs events, reparse only touched files
-    /// via [`TodoStore::sync`], forward any non-empty diff. Returns
+    /// via [`TodoStore::sync_forcing`], forward any non-empty diff. Returns
     /// `Ok(())` on clean shutdown, or an error string if the initial
     /// watch arming failed.
     pub fn run(mut self) -> Result<(), String> {
@@ -237,7 +237,7 @@ impl TodoWatcher {
         &mut self,
         watcher: &mut RecommendedWatcher,
         re_resolve: bool,
-        _touched: BTreeSet<PathBuf>,
+        touched: BTreeSet<PathBuf>,
     ) -> Result<(), String> {
         if re_resolve {
             // Membership may have changed: re-resolve and re-arm.
@@ -256,7 +256,7 @@ impl TodoWatcher {
         // untouched files free, and passing the full set is what lets
         // `sync` emit `FileRemoved` for anything that dropped out of
         // the membership.
-        let diff = self.store.sync(&self.files)?;
+        let diff = self.store.sync_forcing(&self.files, &touched)?;
         if !diff.is_empty() {
             debug!("watch: sync produced {} event(s)", diff.len());
             // A closed receiver means the consumer is gone; treat it as
@@ -554,6 +554,42 @@ mod tests {
             "diff must carry the reparsed TODO set; got {:?}",
             diff
         );
+    }
+
+    #[test]
+    fn watcher_flush_forces_same_fingerprint_touched_file() {
+        let td = TempDir::new("force-same-fingerprint");
+        let file = td.path().join("a.org");
+        write(&file, "* TODO AAAA\n");
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        let files = vec![file.clone()];
+        let mut store = TodoStore::open(&td.path().join("idx.sqlite")).unwrap();
+        store.sync(&files).unwrap();
+        let (events_tx, events_rx) = mpsc::channel();
+        let mut watcher = TodoWatcher::new(store, files.clone(), None, files, events_tx);
+
+        write(&file, "* TODO BBBB\n");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let (raw_tx, _raw_rx) = mpsc::channel();
+        let mut notify_watcher = build_watcher(raw_tx).unwrap();
+
+        watcher
+            .flush(&mut notify_watcher, false, BTreeSet::from([file]))
+            .unwrap();
+
+        let diff = events_rx.recv_timeout(TEST_RECV).expect("forced diff");
+        match &diff[0] {
+            TodoEvent::FileChanged { todos, .. } => {
+                assert_eq!(todos.len(), 1);
+                assert_eq!(todos[0].title, "BBBB");
+            }
+            other => panic!("expected FileChanged, got {other:?}"),
+        }
     }
 
     #[test]

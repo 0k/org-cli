@@ -40,6 +40,12 @@ pub struct DaemonOptions {
     pub addr: Option<String>,
     /// Explicit index path, overriding config + default.
     pub db: Option<std::path::PathBuf>,
+    /// Permit mutation exposure on a non-loopback bind.
+    ///
+    /// This is an exposure guard, not authorisation. A local reverse proxy or
+    /// tunnel bypasses the bind-address check; real remote safety requires
+    /// authentication.
+    pub allow_remote_writes: bool,
 }
 
 /// Run the daemon. Blocks until Ctrl-C (or a fatal error). Returns 0
@@ -122,12 +128,18 @@ pub fn run(opts: DaemonOptions) -> Result<i32, String> {
 
     info!("daemon: starting HTTP+SSE server on {}", addr);
     let serve_result = runtime.block_on(async move {
-        crate::serve::serve(addr, read_store, events_rx, async {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => info!("daemon: Ctrl-C received, shutting down"),
-                Err(e) => warn!("daemon: failed to listen for Ctrl-C: {}", e),
-            }
-        })
+        crate::serve::serve(
+            addr,
+            read_store,
+            events_rx,
+            opts.allow_remote_writes,
+            async {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => info!("daemon: Ctrl-C received, shutting down"),
+                    Err(e) => warn!("daemon: failed to listen for Ctrl-C: {}", e),
+                }
+            },
+        )
         .await
     });
 

@@ -177,6 +177,14 @@ pub enum Commands {
         /// (`~/.cache/org-cli/todos.sqlite`).
         #[arg(long = "db", value_name = "PATH")]
         db: Option<std::path::PathBuf>,
+
+        /// Expose heading writes when ADDR is not loopback.
+        ///
+        /// This is an exposure guard, not authentication: a local reverse
+        /// proxy or tunnel bypasses it. Real remote safety requires
+        /// authentication in front of org-cli.
+        #[arg(long)]
+        allow_remote_writes: bool,
     },
 }
 

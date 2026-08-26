@@ -2,6 +2,7 @@
 //!
 //! See [`crate::index`] for the module-level rationale.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -147,13 +148,39 @@ impl TodoStore {
     /// `Vec<TodoEvent>`, ordered: changes (in `files` order) first,
     /// then removals.
     pub fn sync(&mut self, files: &[PathBuf]) -> Result<Vec<TodoEvent>, String> {
+        self.sync_forcing(files, &BTreeSet::new())
+    }
+
+    /// Incrementally sync the index, always re-reading paths in `force`.
+    ///
+    /// This is the watcher-facing variant of [`Self::sync`]. A filesystem
+    /// notification is authoritative even when an atomic replacement happens
+    /// to preserve both the recorded modification timestamp and byte length.
+    pub fn sync_forcing(
+        &mut self,
+        files: &[PathBuf],
+        force: &BTreeSet<PathBuf>,
+    ) -> Result<Vec<TodoEvent>, String> {
         let mut events = Vec::new();
         let mut seen: Vec<String> = Vec::with_capacity(files.len());
         let fallback = TodoKeywords::default();
+        let canonical_force: BTreeSet<PathBuf> = force
+            .iter()
+            .filter_map(|path| fs::canonicalize(path).ok())
+            .collect();
 
         for file in files {
             let path_str = file.to_string_lossy().to_string();
             seen.push(path_str.clone());
+
+            let canonical = match fs::canonicalize(file) {
+                Ok(canonical) => canonical,
+                Err(_) => {
+                    seen.pop();
+                    continue;
+                }
+            };
+            let canonical_str = canonical.to_string_lossy().to_string();
 
             // A file we cannot stat is treated as absent: it will be
             // pruned in the removal pass below (we simply don't record
@@ -166,9 +193,12 @@ impl TodoStore {
             let size = meta.len() as i64;
             let mtime_ns = mtime_ns_of(&meta);
 
-            if let Some((old_mtime, old_size)) = self.fingerprint(&path_str)?
+            if !force.contains(file)
+                && !canonical_force.contains(&canonical)
+                && let Some((old_mtime, old_size, old_canonical)) = self.fingerprint(&path_str)?
                 && old_mtime == mtime_ns
                 && old_size == size
+                && old_canonical == canonical_str
             {
                 // Unchanged: skip re-parse, emit nothing.
                 continue;
@@ -183,7 +213,7 @@ impl TodoStore {
                 }
             };
             let todos = records_from_snapshot(&path_str, &snapshot);
-            self.replace_file(&path_str, mtime_ns, size, &snapshot, &todos)?;
+            self.replace_file(&path_str, &canonical_str, mtime_ns, size, &snapshot, &todos)?;
             events.push(TodoEvent::FileChanged {
                 path: path_str,
                 etag: snapshot.etag,
@@ -201,6 +231,28 @@ impl TodoStore {
         }
 
         Ok(events)
+    }
+
+    /// Return the indexed display path for an exact canonical path.
+    ///
+    /// The returned string is the existing API/display identity stored in
+    /// `files.path`; canonical identity is used only for the membership check.
+    pub fn indexed_path_for_canonical(&self, canonical: &Path) -> Result<Option<String>, String> {
+        let canonical = canonical.to_string_lossy();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM files WHERE canonical_path = ? LIMIT 1")
+            .map_err(|e| format!("preparing canonical path query: {}", e))?;
+        let mut rows = stmt
+            .query(params![canonical.as_ref()])
+            .map_err(|e| format!("running canonical path query: {}", e))?;
+        match rows.next().map_err(|e| format!("reading row: {}", e))? {
+            Some(row) => row
+                .get(0)
+                .map(Some)
+                .map_err(|e| format!("reading indexed path: {}", e)),
+            None => Ok(None),
+        }
     }
 
     /// Query the index. Rows are ordered by path, then line.
@@ -306,12 +358,12 @@ impl TodoStore {
         Ok(out)
     }
 
-    /// Return the stored `(mtime_ns, size)` fingerprint of `path`, if
-    /// the file is already indexed.
-    fn fingerprint(&self, path: &str) -> Result<Option<(i64, i64)>, String> {
+    /// Return the stored `(mtime_ns, size, canonical_path)` state of `path`,
+    /// if the file is already indexed.
+    fn fingerprint(&self, path: &str) -> Result<Option<(i64, i64, String)>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT mtime_ns, size FROM files WHERE path = ?")
+            .prepare("SELECT mtime_ns, size, canonical_path FROM files WHERE path = ?")
             .map_err(|e| format!("preparing fingerprint query: {}", e))?;
         let mut rows = stmt
             .query(params![path])
@@ -320,7 +372,8 @@ impl TodoStore {
             Some(row) => {
                 let mtime: i64 = row.get(0).map_err(|e| e.to_string())?;
                 let size: i64 = row.get(1).map_err(|e| e.to_string())?;
-                Ok(Some((mtime, size)))
+                let canonical: String = row.get(2).map_err(|e| e.to_string())?;
+                Ok(Some((mtime, size, canonical)))
             }
             None => Ok(None),
         }
@@ -348,6 +401,7 @@ impl TodoStore {
     fn replace_file(
         &mut self,
         path: &str,
+        canonical_path: &str,
         mtime_ns: i64,
         size: i64,
         snapshot: &FileSnapshot,
@@ -363,9 +417,10 @@ impl TodoStore {
             .map_err(|e| format!("starting transaction: {}", e))?;
         tx.execute(
             "INSERT INTO files( \
-                 path, mtime_ns, size, etag, todo_active_json, todo_done_json \
-             ) VALUES(?, ?, ?, ?, ?, ?) \
+                 path, canonical_path, mtime_ns, size, etag, todo_active_json, todo_done_json \
+             ) VALUES(?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(path) DO UPDATE SET \
+                 canonical_path = excluded.canonical_path, \
                  mtime_ns = excluded.mtime_ns, \
                  size = excluded.size, \
                  etag = excluded.etag, \
@@ -373,6 +428,7 @@ impl TodoStore {
                  todo_done_json = excluded.todo_done_json",
             params![
                 path,
+                canonical_path,
                 mtime_ns,
                 size,
                 snapshot.etag,
@@ -428,13 +484,14 @@ impl TodoStore {
 }
 
 /// Current version of the derived-cache schema.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// The schema created after dropping any mismatched cache version.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS files (
     id               INTEGER PRIMARY KEY,
     path             TEXT UNIQUE NOT NULL,
+    canonical_path   TEXT NOT NULL,
     mtime_ns         INTEGER NOT NULL,
     size             INTEGER NOT NULL,
     etag             TEXT NOT NULL,
@@ -462,7 +519,7 @@ CREATE INDEX IF NOT EXISTS idx_headings_keyword ON headings(keyword);
 /// in-buffer `#+TODO:` declaration when present, else the default set
 /// (matching `headings.rs`). Only headings that carry a keyword are
 /// kept; `is_done` reflects the file's done set.
-fn records_from_snapshot(path: &str, snapshot: &FileSnapshot) -> Vec<TodoRecord> {
+pub fn records_from_snapshot(path: &str, snapshot: &FileSnapshot) -> Vec<TodoRecord> {
     snapshot
         .headings
         .iter()
@@ -516,6 +573,7 @@ fn mtime_ns_of(meta: &fs::Metadata) -> i64 {
 mod tests {
     use super::*;
     use indoc::indoc;
+    use std::collections::BTreeSet;
     use std::path::Path as StdPath;
 
     /// Minimal tempdir helper, mirrors the sibling modules'.
@@ -667,6 +725,57 @@ mod tests {
             "unchanged file must not be reparsed; diff={:?}",
             second
         );
+    }
+
+    #[test]
+    fn canonical_lookup_preserves_indexed_display_path() {
+        let td = TempDir::new("canonical-identity");
+        let target = td.path().join("target.org");
+        let indexed_link = td.path().join("indexed-link.org");
+        write(&target, "* TODO Through link\n");
+        std::os::unix::fs::symlink("target.org", &indexed_link).unwrap();
+        let canonical = fs::canonicalize(&target).unwrap();
+        let mut store = mem_store();
+
+        store.sync(std::slice::from_ref(&indexed_link)).unwrap();
+
+        assert_eq!(
+            store.indexed_path_for_canonical(&canonical).unwrap(),
+            Some(indexed_link.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn sync_forcing_reparses_forced_same_fingerprint_file() {
+        let td = TempDir::new("force");
+        let file = td.path().join("forced.org");
+        write(&file, "* TODO AAAA\n");
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        let mut store = mem_store();
+        store.sync(std::slice::from_ref(&file)).unwrap();
+
+        write(&file, "* TODO BBBB\n");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let force = BTreeSet::from([file.clone()]);
+
+        let events = store
+            .sync_forcing(std::slice::from_ref(&file), &force)
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            TodoEvent::FileChanged { todos, .. } => {
+                assert_eq!(todos.len(), 1);
+                assert_eq!(todos[0].title, "BBBB");
+            }
+            other => panic!("expected FileChanged, got {other:?}"),
+        }
+        assert_eq!(store.query(&TodoQuery::default()).unwrap()[0].title, "BBBB");
     }
 
     #[test]

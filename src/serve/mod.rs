@@ -38,22 +38,29 @@
 //! * `GET /sse/todos?sub=` — the live diff stream via
 //!   [`kal_sse::axum::sse_response`]; a missing / empty `sub` yields
 //!   `409 needs_snapshot`, mirroring vigil-watch.
+mod locks;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, patch};
 use kal_sse::EventLog;
 use log::{debug, info, warn};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::index::{TodoEvent, TodoQuery, TodoRecord, TodoStore};
+use crate::index::{TodoEvent, TodoQuery, TodoRecord, TodoStore, records_from_snapshot};
+use crate::org::heading_edit::{set_keyword, set_priority, write_atomic};
+use crate::org::snapshot::FileSnapshot;
+use crate::org::todo_keywords::TodoKeywords;
+use locks::FileLocks;
 
 /// Disconnect-grace TTL for a subscription's resume cursor: 15 min.
 const EVENT_TTL: Duration = Duration::from_secs(900);
@@ -66,6 +73,8 @@ const CHANNEL_CAPACITY: usize = 256;
 const COMPACT_INTERVAL: Duration = Duration::from_secs(60);
 /// Human-readable pointer embedded in the `409 needs_snapshot` body.
 const RESYNC_HINT: &str = "resync via GET /api/todos?sub=<uuid>";
+/// Explanation returned when the exposure guard disables mutations.
+const REMOTE_WRITES_DISABLED: &str = "writes are disabled for non-loopback binds; restart with --allow-remote-writes to expose mutation (this is not authentication)";
 
 /// Shared state handed to every axum handler.
 ///
@@ -80,6 +89,8 @@ const RESYNC_HINT: &str = "resync via GET /api/todos?sub=<uuid>";
 struct AppState {
     log: Arc<Mutex<EventLog<TodoEvent>>>,
     store: Arc<Mutex<TodoStore>>,
+    locks: FileLocks,
+    writes_enabled: bool,
 }
 
 /// Query parameters shared by the snapshot and SSE endpoints.
@@ -91,6 +102,100 @@ struct TodosParams {
     keyword: Option<String>,
     /// Subscription id (kal-sse `?sub=<uuid>`).
     sub: Option<String>,
+}
+
+/// A tri-state mutation field: omitted, explicit removal, or a new value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Patch<T> {
+    /// The request omitted this field.
+    #[default]
+    Unchanged,
+    /// The request supplied JSON `null`.
+    Remove,
+    /// The request supplied a concrete value.
+    Set(T),
+}
+
+impl<'de, T> Deserialize<'de> for Patch<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(|value| match value {
+            Some(value) => Self::Set(value),
+            None => Self::Remove,
+        })
+    }
+}
+
+fn deserialize_priority_patch<'de, D>(deserializer: D) -> Result<Patch<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Patch::<String>::deserialize(deserializer).map(|patch| match patch {
+        Patch::Set(priority) if priority == "none" => Patch::Remove,
+        other => other,
+    })
+}
+
+/// Snapshot-scoped heading mutation request.
+#[derive(Debug, Deserialize)]
+struct HeadingPatchRequest {
+    path: PathBuf,
+    line: usize,
+    fingerprint: String,
+    #[serde(default)]
+    keyword: Patch<String>,
+    #[serde(default, deserialize_with = "deserialize_priority_patch")]
+    priority: Patch<String>,
+}
+
+/// File-wide state returned after a successful or stale mutation.
+#[derive(Debug, Serialize)]
+struct HeadingPatchResponse {
+    path: String,
+    etag: String,
+    todo_keywords: TodoKeywords,
+    todos: Vec<TodoRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IfMatchError {
+    Missing,
+    Malformed,
+}
+
+fn parse_if_match(headers: &HeaderMap) -> Result<String, IfMatchError> {
+    let values = headers.get_all("if-match");
+    let mut values = values.iter();
+    let value = values.next().ok_or(IfMatchError::Missing)?;
+    if values.next().is_some() {
+        return Err(IfMatchError::Malformed);
+    }
+    let raw = value.to_str().map_err(|_| IfMatchError::Malformed)?.trim();
+    if raw.is_empty() || raw == "*" || raw.starts_with("W/") || raw.contains(',') {
+        return Err(IfMatchError::Malformed);
+    }
+
+    let tag = if raw.starts_with('"') || raw.ends_with('"') {
+        raw.strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .filter(|value| !value.is_empty() && !value.contains('"'))
+            .ok_or(IfMatchError::Malformed)?
+    } else {
+        if raw.chars().any(char::is_whitespace) || raw.contains('"') {
+            return Err(IfMatchError::Malformed);
+        }
+        raw
+    };
+    Ok(tag.to_string())
+}
+
+fn writes_allowed(addr: SocketAddr, allow_remote_writes: bool) -> bool {
+    addr.ip().is_loopback() || allow_remote_writes
 }
 
 /// Build the shared [`EventLog`] and spawn the std bridge thread that
@@ -135,6 +240,7 @@ fn spawn_bridge(rx: Receiver<Vec<TodoEvent>>) -> Arc<Mutex<EventLog<TodoEvent>>>
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/todos", get(snapshot_handler))
+        .route("/api/heading", patch(heading_patch_handler))
         .route("/sse/todos", get(sse_handler))
         .with_state(state)
 }
@@ -178,6 +284,171 @@ async fn snapshot_handler(
         headers.insert("x-sub-id", v);
     }
     Ok((headers, Json(records)))
+}
+
+/// `PATCH /api/heading` — mutate one snapshot-scoped heading locator.
+async fn heading_patch_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !state.writes_enabled {
+        return (StatusCode::FORBIDDEN, REMOTE_WRITES_DISABLED).into_response();
+    }
+
+    let if_match = match parse_if_match(&headers) {
+        Ok(if_match) => if_match,
+        Err(IfMatchError::Missing) => {
+            return (
+                StatusCode::PRECONDITION_REQUIRED,
+                "missing required If-Match header",
+            )
+                .into_response();
+        }
+        Err(IfMatchError::Malformed) => {
+            return (StatusCode::BAD_REQUEST, "malformed If-Match header").into_response();
+        }
+    };
+
+    let request: HeadingPatchRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid JSON body: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let canonical = match std::fs::canonicalize(&request.path) {
+        Ok(canonical) => canonical,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let file_lock = match state.locks.lock_for(&canonical) {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!("heading mutation lock lookup failed: {}", error);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let _file_guard = file_lock.lock().await;
+
+    let indexed_path = match state.store.lock() {
+        Ok(store) => match store.indexed_path_for_canonical(&canonical) {
+            Ok(Some(path)) => path,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => {
+                warn!("heading mutation membership query failed: {}", error);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let content = match std::fs::read_to_string(&canonical) {
+        Ok(content) => content,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("reading \"{}\": {error}", canonical.display()),
+            )
+                .into_response();
+        }
+    };
+    let snapshot = FileSnapshot::from_content(&content, &TodoKeywords::default());
+
+    if snapshot.etag != if_match {
+        return heading_snapshot_response(StatusCode::PRECONDITION_FAILED, indexed_path, snapshot);
+    }
+
+    let locator_matches = snapshot
+        .headings
+        .iter()
+        .any(|heading| heading.line == request.line && heading.fingerprint == request.fingerprint);
+    if !locator_matches {
+        return (
+            StatusCode::CONFLICT,
+            "heading locator does not match current file",
+        )
+            .into_response();
+    }
+    if request.keyword == Patch::Unchanged && request.priority == Patch::Unchanged {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "empty heading patch").into_response();
+    }
+
+    let mut new_content = content.clone();
+    let apply_result = (|| {
+        match &request.priority {
+            Patch::Unchanged => {}
+            Patch::Remove => {
+                new_content = set_priority(&new_content, request.line, None, &snapshot.keywords)?.0;
+            }
+            Patch::Set(priority) => {
+                new_content = set_priority(
+                    &new_content,
+                    request.line,
+                    Some(priority),
+                    &snapshot.keywords,
+                )?
+                .0;
+            }
+        }
+        match &request.keyword {
+            Patch::Unchanged => {}
+            Patch::Remove => {
+                new_content = set_keyword(&new_content, request.line, None, &snapshot.keywords)?.0;
+            }
+            Patch::Set(keyword) => {
+                new_content = set_keyword(
+                    &new_content,
+                    request.line,
+                    Some(keyword),
+                    &snapshot.keywords,
+                )?
+                .0;
+            }
+        }
+        Ok::<(), crate::org::heading_edit::EditError>(())
+    })();
+    if let Err(error) = apply_result {
+        return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
+    }
+
+    if new_content == content {
+        return heading_snapshot_response(StatusCode::OK, indexed_path, snapshot);
+    }
+
+    if let Err(error) = write_atomic(&canonical, &new_content) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
+    }
+    let new_snapshot = FileSnapshot::from_content(&new_content, &TodoKeywords::default());
+    heading_snapshot_response(StatusCode::OK, indexed_path, new_snapshot)
+}
+
+fn heading_snapshot_response(
+    status: StatusCode,
+    indexed_path: String,
+    snapshot: FileSnapshot,
+) -> Response {
+    let etag_header = format!("\"{}\"", snapshot.etag);
+    let todos = records_from_snapshot(&indexed_path, &snapshot);
+    let payload = HeadingPatchResponse {
+        path: indexed_path,
+        etag: snapshot.etag,
+        todo_keywords: snapshot.keywords,
+        todos,
+    };
+    let mut response = (status, Json(payload)).into_response();
+    let value = match HeaderValue::from_str(&etag_header) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!("cannot encode snapshot ETag response header: {}", error);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    response.headers_mut().insert("etag", value);
+    response
 }
 
 /// `GET /sse/todos` — the live diff stream.
@@ -224,6 +495,9 @@ async fn sse_handler(State(state): State<AppState>, Query(params): Query<TodosPa
 ///   snapshot query source; NOT the watcher's writer).
 /// * `rx` — the watcher's diff receiver; its batches are bridged into
 ///   the SSE event log.
+/// * `allow_remote_writes` — exposure override for non-loopback binds.
+///   This is not authorisation: local proxies and tunnels can bypass a bind
+///   check, so authenticated deployments need authentication in front.
 /// * `shutdown` — a future that, once resolved, triggers graceful
 ///   shutdown (typically the daemon's Ctrl-C signal).
 ///
@@ -232,6 +506,7 @@ pub async fn serve<F>(
     addr: SocketAddr,
     store: TodoStore,
     rx: Receiver<Vec<TodoEvent>>,
+    allow_remote_writes: bool,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -241,7 +516,16 @@ where
     let state = AppState {
         log: Arc::clone(&log),
         store: Arc::new(Mutex::new(store)),
+        locks: FileLocks::default(),
+        writes_enabled: writes_allowed(addr, allow_remote_writes),
     };
+
+    if !addr.ip().is_loopback() && allow_remote_writes {
+        warn!(
+            "remote heading writes enabled on {}; this exposure guard is not authorization, and authenticated deployments still require authentication",
+            addr
+        );
+    }
 
     // Periodic compaction: reclaim expired handles + trim the buffer.
     {
@@ -275,6 +559,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+    use serde_json::json;
     use std::sync::mpsc;
 
     /// The bridge thread drains diff batches into the event log,
@@ -320,5 +606,83 @@ mod tests {
         };
         let s = serde_json::to_string(&ev).unwrap();
         assert_eq!(s, r#"{"type":"file-removed","path":"/x.org"}"#);
+    }
+
+    #[test]
+    fn patch_fields_deserialize_absent_null_and_value() {
+        let absent: HeadingPatchRequest = serde_json::from_value(json!({
+            "path": "/tmp/indexed.org",
+            "line": 12,
+            "fingerprint": "abc"
+        }))
+        .unwrap();
+        assert_eq!(absent.keyword, Patch::Unchanged);
+        assert_eq!(absent.priority, Patch::Unchanged);
+
+        let removed: HeadingPatchRequest = serde_json::from_value(json!({
+            "path": "/tmp/indexed.org",
+            "line": 12,
+            "fingerprint": "abc",
+            "keyword": null,
+            "priority": null
+        }))
+        .unwrap();
+        assert_eq!(removed.keyword, Patch::Remove);
+        assert_eq!(removed.priority, Patch::Remove);
+
+        let set: HeadingPatchRequest = serde_json::from_value(json!({
+            "path": "/tmp/indexed.org",
+            "line": 12,
+            "fingerprint": "abc",
+            "keyword": "none",
+            "priority": "B"
+        }))
+        .unwrap();
+        assert_eq!(set.keyword, Patch::Set("none".to_string()));
+        assert_eq!(set.priority, Patch::Set("B".to_string()));
+
+        let priority_none: HeadingPatchRequest = serde_json::from_value(json!({
+            "path": "/tmp/indexed.org",
+            "line": 12,
+            "fingerprint": "abc",
+            "priority": "none"
+        }))
+        .unwrap();
+        assert_eq!(priority_none.keyword, Patch::Unchanged);
+        assert_eq!(priority_none.priority, Patch::Remove);
+    }
+
+    #[test]
+    fn if_match_parser_accepts_single_strong_quoted_or_bare_tag() {
+        for (raw, expected) in [("\"abc\"", "abc"), ("abc", "abc")] {
+            let mut headers = HeaderMap::new();
+            headers.insert("if-match", HeaderValue::from_str(raw).unwrap());
+            assert_eq!(parse_if_match(&headers), Ok(expected.to_string()));
+        }
+
+        assert_eq!(
+            parse_if_match(&HeaderMap::new()),
+            Err(IfMatchError::Missing)
+        );
+        for raw in ["", "*", "W/\"abc\"", "a, b", "\"\""] {
+            let mut headers = HeaderMap::new();
+            headers.insert("if-match", HeaderValue::from_str(raw).unwrap());
+            assert_eq!(
+                parse_if_match(&headers),
+                Err(IfMatchError::Malformed),
+                "If-Match {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_policy_requires_opt_in_for_non_loopback_bind() {
+        let loopback: SocketAddr = "127.0.0.1:7480".parse().unwrap();
+        let non_loopback: SocketAddr = "0.0.0.0:7480".parse().unwrap();
+
+        assert!(writes_allowed(loopback, false));
+        assert!(writes_allowed(loopback, true));
+        assert!(!writes_allowed(non_loopback, false));
+        assert!(writes_allowed(non_loopback, true));
     }
 }

@@ -288,6 +288,62 @@ pub fn section_span(content: &str, heading_line: usize) -> Option<SubtreeSpan> {
     })
 }
 
+/// Return the exact source text of `span`, terminators included.
+///
+/// The slice starts at the first byte of `span.start` and ends after the
+/// line terminator of `span.end` (or at end-of-content when the last line
+/// is unterminated). It is therefore a *verbatim* substring of `content`:
+/// re-parsing it yields the same nodes the whole document produced for
+/// those lines, with byte offsets rebased to the slice.
+///
+/// Returns `None` when the span is empty or out of range (`start == 0`,
+/// or `end < start`).
+pub fn span_text(content: &str, span: SubtreeSpan) -> Option<&str> {
+    if span.start == 0 || span.end < span.start {
+        return None;
+    }
+    let index = LineIndex::new(content);
+    let start = index.line_range(content, span.start)?.start;
+    let end = match index.newline_offsets.get(span.end - 1) {
+        // Include the terminator: the slice must remain a faithful
+        // substring, and a body whose final newline was trimmed would
+        // re-parse with its last element glued to whatever follows.
+        Some(&newline) => newline.saturating_add(1).min(content.len()),
+        None => content.len(),
+    };
+    if end <= start {
+        return None;
+    }
+    Some(&content[start..end])
+}
+
+/// Return the *internal content* of the heading at `heading_line`: every
+/// line of its subtree except the heading line itself.
+///
+/// This is the subtree minus its own first line — planning, drawers, body
+/// text *and* descendant headings. It is deliberately not
+/// [`section_span`] minus one line: a heading's internal content includes
+/// its children, which is what a reader expanding a task expects to see.
+///
+/// Returns `None` when `heading_line` is not a heading line, and
+/// `Some("")` when the heading has no content of its own.
+pub fn heading_body(content: &str, heading_line: usize) -> Option<&str> {
+    let span = subtree_span(content, heading_line)?;
+    if span.end <= span.start {
+        return Some("");
+    }
+    Some(
+        span_text(
+            content,
+            SubtreeSpan {
+                start: span.start + 1,
+                end: span.end,
+            },
+        )
+        .unwrap_or(""),
+    )
+}
+
 // ---------------------------------------------------------------------
 // Heading paths
 // ---------------------------------------------------------------------
@@ -492,8 +548,8 @@ pub fn resolve_path(content: &str, path: &HeadingPath) -> Result<Heading, PathEr
 #[cfg(test)]
 mod tests {
     use super::{
-        Heading, HeadingPath, LineIndex, PathError, SubtreeSpan, heading_for_line, iter_headings,
-        iter_headings_with, resolve_path, section_span, subtree_span,
+        Heading, HeadingPath, LineIndex, PathError, SubtreeSpan, heading_body, heading_for_line,
+        iter_headings, iter_headings_with, resolve_path, section_span, span_text, subtree_span,
     };
     use crate::org::todo_keywords::TodoKeywords;
     use indoc::indoc;
@@ -912,6 +968,83 @@ mod tests {
     fn test_section_span_non_heading_returns_none() {
         let content = "* Heading\nbody\n";
         assert_eq!(section_span(content, 2), None);
+    }
+
+    // ----- span_text / heading_body -----------------------------------
+
+    #[test]
+    fn test_span_text_is_a_verbatim_substring_with_terminator() {
+        let content = indoc! {"
+            * Parent
+            body one
+            body two
+            * Next
+        "};
+        let span = SubtreeSpan { start: 2, end: 3 };
+        let text = span_text(content, span).unwrap();
+
+        assert_eq!(text, "body one\nbody two\n");
+        // Verbatim: the slice must occur literally in the source.
+        assert!(content.contains(text));
+    }
+
+    #[test]
+    fn test_span_text_last_unterminated_line_reaches_end_of_content() {
+        let content = "* Parent\nbody";
+        assert_eq!(
+            span_text(content, SubtreeSpan { start: 2, end: 2 }),
+            Some("body")
+        );
+    }
+
+    #[test]
+    fn test_span_text_rejects_empty_or_out_of_range_spans() {
+        let content = "* Parent\nbody\n";
+        assert_eq!(span_text(content, SubtreeSpan { start: 0, end: 2 }), None);
+        assert_eq!(span_text(content, SubtreeSpan { start: 3, end: 2 }), None);
+        assert_eq!(span_text(content, SubtreeSpan { start: 9, end: 9 }), None);
+    }
+
+    #[test]
+    fn test_heading_body_excludes_the_heading_line_but_keeps_descendants() {
+        let content = indoc! {"
+            * Parent
+            :PROPERTIES:
+            :ID: x
+            :END:
+            parent body
+            ** Child
+            child body
+            * Sibling
+            sibling body
+        "};
+
+        assert_eq!(
+            heading_body(content, 1).unwrap(),
+            indoc! {"
+                :PROPERTIES:
+                :ID: x
+                :END:
+                parent body
+                ** Child
+                child body
+            "}
+        );
+        assert_eq!(heading_body(content, 6).unwrap(), "child body\n");
+    }
+
+    #[test]
+    fn test_heading_body_of_a_bare_heading_is_empty_not_missing() {
+        let content = "* Alone\n* Next\n";
+        assert_eq!(heading_body(content, 1), Some(""));
+        assert_eq!(heading_body(content, 2), Some(""));
+    }
+
+    #[test]
+    fn test_heading_body_of_a_non_heading_line_is_none() {
+        let content = "* Alone\nbody\n";
+        assert_eq!(heading_body(content, 2), None);
+        assert_eq!(heading_body(content, 99), None);
     }
 
     // ----- HeadingPath::from_str --------------------------------------

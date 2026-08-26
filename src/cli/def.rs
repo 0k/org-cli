@@ -154,7 +154,9 @@ pub enum Commands {
 
     /// Run the long-lived TODO index daemon: watch org files, keep the
     /// sqlite index in sync, and serve an HTTP snapshot + SSE push
-    /// stream (`GET /api/todos`, `GET /sse/todos`).
+    /// stream (`GET /api/todos`, `GET /sse/todos`), one on-demand
+    /// heading body + AST read (`GET /api/heading`), and one versioned
+    /// heading mutation (`PATCH /api/heading`).
     ///
     /// When PATHS is omitted, the agenda set is read from
     /// `~/.cache/emacs/org-collect/org-agenda-files.tmp` and the

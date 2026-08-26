@@ -38,6 +38,20 @@
 //! * `GET /sse/todos?sub=` — the live diff stream via
 //!   [`kal_sse::axum::sse_response`]; a missing / empty `sub` yields
 //!   `409 needs_snapshot`, mirroring vigil-watch.
+//!
+//! # Heading detail, deliberately on demand
+//!
+//! * `GET /api/heading?path=&line=&fingerprint=` — one heading's body,
+//!   as raw Org text plus the semantic AST from [`crate::org::ast`].
+//!
+//! Bodies are **not** folded into `/api/todos` or the SSE payload. The
+//! snapshot is the hot path: every client receives every record on
+//! connect and again on every file change, so attaching bodies would
+//! multiply a payload already over a megabyte on a real agenda by the
+//! full text of every task — to render, at any instant, the one heading
+//! a reader expanded. The detail endpoint is a separate, cold request
+//! for exactly the heading asked for.
+
 mod locks;
 
 use std::net::SocketAddr;
@@ -51,12 +65,14 @@ use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, patch};
+use axum::routing::get;
 use kal_sse::EventLog;
 use log::{debug, info, warn};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::index::{TodoEvent, TodoQuery, TodoRecord, TodoStore, records_from_snapshot};
+use crate::org::ast::{OrgAstDocument, parse_ast};
+use crate::org::heading::heading_body;
 use crate::org::heading_edit::{set_keyword, set_priority, write_atomic};
 use crate::org::snapshot::FileSnapshot;
 use crate::org::todo_keywords::TodoKeywords;
@@ -153,6 +169,40 @@ struct HeadingPatchRequest {
     priority: Patch<String>,
 }
 
+/// Snapshot-scoped heading-detail request, as query parameters.
+///
+/// Deliberately the *same* locator triple the mutation endpoint takes in
+/// its JSON body — a client that can address a heading for writing can
+/// address it for reading without learning a second identity scheme.
+/// Unlike the mutation, no `If-Match` is required: this is a read, and
+/// the response reports the ETag of the bytes it actually parsed, so a
+/// caller can tell whether it is looking at the snapshot it expected.
+#[derive(Debug, Deserialize)]
+struct HeadingDetailParams {
+    path: PathBuf,
+    line: usize,
+    fingerprint: String,
+}
+
+/// One heading's own content, parsed on demand.
+#[derive(Debug, Serialize)]
+struct HeadingDetailResponse {
+    /// The daemon's indexed display path, not the client's spelling.
+    path: String,
+    /// 1-based heading line the body belongs to.
+    line: usize,
+    /// The heading-line fingerprint that was matched.
+    fingerprint: String,
+    /// ETag of the exact bytes this body and AST were derived from.
+    etag: String,
+    /// The heading's own lines, verbatim, heading line excluded.
+    body: String,
+    /// `body` parsed by the shared converter — the wire shape the
+    /// renderer consumes. `null` when the heading has no content, so a
+    /// client can distinguish "nothing to show" from an empty document.
+    ast: Option<OrgAstDocument>,
+}
+
 /// File-wide state returned after a successful or stale mutation.
 #[derive(Debug, Serialize)]
 struct HeadingPatchResponse {
@@ -240,7 +290,10 @@ fn spawn_bridge(rx: Receiver<Vec<TodoEvent>>) -> Arc<Mutex<EventLog<TodoEvent>>>
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/todos", get(snapshot_handler))
-        .route("/api/heading", patch(heading_patch_handler))
+        .route(
+            "/api/heading",
+            get(heading_detail_handler).patch(heading_patch_handler),
+        )
         .route("/sse/todos", get(sse_handler))
         .with_state(state)
 }
@@ -284,6 +337,94 @@ async fn snapshot_handler(
         headers.insert("x-sub-id", v);
     }
     Ok((headers, Json(records)))
+}
+
+/// `GET /api/heading?path=&line=&fingerprint=` — one heading's body and
+/// AST, read on demand.
+///
+/// Resolution mirrors the mutation handler exactly — canonicalize, take
+/// the per-file lock, require indexed membership, read once, derive one
+/// coherent [`FileSnapshot`] — so a read cannot observe a half-written
+/// file mid-mutation and cannot address a file the daemon does not index.
+///
+/// The locator is matched but *not* preconditioned: a stale fingerprint
+/// yields `409`, telling the client to resnapshot, rather than silently
+/// returning some other heading that happens to sit on that line now.
+async fn heading_detail_handler(
+    State(state): State<AppState>,
+    Query(params): Query<HeadingDetailParams>,
+) -> Response {
+    let canonical = match std::fs::canonicalize(&params.path) {
+        Ok(canonical) => canonical,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let file_lock = match state.locks.lock_for(&canonical) {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!("heading detail lock lookup failed: {}", error);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let _file_guard = file_lock.lock().await;
+
+    let indexed_path = match state.store.lock() {
+        Ok(store) => match store.indexed_path_for_canonical(&canonical) {
+            Ok(Some(path)) => path,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => {
+                warn!("heading detail membership query failed: {}", error);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let content = match std::fs::read_to_string(&canonical) {
+        Ok(content) => content,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("reading \"{}\": {error}", canonical.display()),
+            )
+                .into_response();
+        }
+    };
+    let snapshot = FileSnapshot::from_content(&content, &TodoKeywords::default());
+
+    let locator_matches = snapshot
+        .headings
+        .iter()
+        .any(|heading| heading.line == params.line && heading.fingerprint == params.fingerprint);
+    if !locator_matches {
+        return (
+            StatusCode::CONFLICT,
+            "heading locator does not match current file",
+        )
+            .into_response();
+    }
+
+    let body = heading_body(&content, params.line).unwrap_or("");
+    let payload = HeadingDetailResponse {
+        path: indexed_path,
+        line: params.line,
+        fingerprint: params.fingerprint,
+        etag: snapshot.etag.clone(),
+        body: body.to_string(),
+        ast: (!body.is_empty()).then(|| parse_ast(body)),
+    };
+
+    let mut response = Json(payload).into_response();
+    match HeaderValue::from_str(&format!("\"{}\"", snapshot.etag)) {
+        Ok(value) => {
+            response.headers_mut().insert("etag", value);
+            response
+        }
+        Err(error) => {
+            warn!("cannot encode snapshot ETag response header: {}", error);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// `PATCH /api/heading` — mutate one snapshot-scoped heading locator.

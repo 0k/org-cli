@@ -25,6 +25,7 @@ dirs = "5"
 fern = "0.6"
 glob = "0.3"
 kal-sse = { git = "https://github.com/0k/kal-sse", rev = "1e1a253e424380bb89b4d4821bcea354f7f06c42", features = ["axum"], optional = true }
+libc = "0.2"
 log = "0.4"
 notify = "6"
 orgize = "0.10.0-alpha.10"

@@ -258,6 +258,17 @@ pub fn run() -> Result<(), String> {
 /// three subcommands, each with a wide option set.
 fn dispatch_link(cmd: def::LinkCommands) -> Result<i32, String> {
     match cmd {
+        def::LinkCommands::Move {
+            old,
+            new,
+            root,
+            write,
+        } => action::link::r#move::run(action::link::r#move::MoveOptions {
+            old,
+            new,
+            root,
+            write,
+        }),
         def::LinkCommands::Check {
             paths,
             nul,

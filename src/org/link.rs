@@ -41,6 +41,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use log::warn;
@@ -63,6 +64,13 @@ pub struct Link {
     /// Raw link text as it appears in the source, e.g.
     /// `"[[file:foo.org::*Heading][My desc]]"`.
     pub raw: String,
+    /// Path bytes exactly as authored between `file:` and any `::`
+    /// anchor. Unlike [`Link::target_path`], this is not percent-decoded.
+    pub raw_target: String,
+    /// Absolute byte range of [`Link::raw_target`] in the complete source
+    /// document. This lets editors replace the path without reconstructing
+    /// descriptions, anchors, or surrounding org syntax.
+    pub target_span: Range<usize>,
     /// Path part, with the `file:` prefix stripped and percent-escapes
     /// decoded. May be relative (resolved against the containing org
     /// file's directory by callers) or absolute.
@@ -346,6 +354,57 @@ pub struct ResolvedTarget {
     pub is_directory_link: bool,
 }
 
+/// One exact file-link path replacement in a source document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkPathRewrite {
+    /// Absolute byte range occupied by the old raw target.
+    pub span: Range<usize>,
+    /// New raw target bytes, excluding `file:` and any anchor.
+    pub replacement: String,
+}
+
+/// Apply non-overlapping file-target rewrites without changing any other byte.
+///
+/// Rewrites are validated and applied from the end of the document towards
+/// the start so each recorded span remains valid. Callers obtain spans from
+/// [`extract_file_links`]; this function deliberately does no link parsing.
+pub fn rewrite_file_link_paths(
+    content: &str,
+    rewrites: &[LinkPathRewrite],
+) -> Result<String, String> {
+    let mut ordered = rewrites.to_vec();
+    ordered.sort_by(|a, b| b.span.start.cmp(&a.span.start));
+
+    let mut previous_start = content.len();
+    for rewrite in &ordered {
+        if rewrite.span.start > rewrite.span.end
+            || rewrite.span.end > content.len()
+            || !content.is_char_boundary(rewrite.span.start)
+            || !content.is_char_boundary(rewrite.span.end)
+        {
+            return Err(format!(
+                "invalid link target byte span {}..{} for {}-byte source",
+                rewrite.span.start,
+                rewrite.span.end,
+                content.len()
+            ));
+        }
+        if rewrite.span.end > previous_start {
+            return Err(format!(
+                "overlapping link target byte spans near {}..{}",
+                rewrite.span.start, rewrite.span.end
+            ));
+        }
+        previous_start = rewrite.span.start;
+    }
+
+    let mut out = content.to_string();
+    for rewrite in ordered {
+        out.replace_range(rewrite.span, &rewrite.replacement);
+    }
+    Ok(out)
+}
+
 /// Resolve a single [`Link`]'s target against a source directory.
 ///
 /// Used by both `link check` (forward link validation) and `link orphans`
@@ -356,16 +415,25 @@ pub struct ResolvedTarget {
 /// otherwise lexically joined. This matches the historical behavior
 /// of `cli::action::link::check::resolve_path`.
 pub fn resolve_target(source_dir: &Path, link: &Link) -> ResolvedTarget {
-    let expanded = expand_tilde(&link.target_path);
-    let joined = if expanded.is_absolute() {
-        expanded
-    } else {
-        source_dir.join(expanded)
-    };
+    let joined = authored_target(source_dir, link);
     let path = fs::canonicalize(&joined).unwrap_or(joined);
     ResolvedTarget {
         path,
         is_directory_link: link.target_is_directory,
+    }
+}
+
+/// Resolve a link as authored, before following filesystem symlinks.
+///
+/// This preserves the lexical location of an entry such as `old/alias`
+/// when `alias` is a symlink to a target outside `old`. Relocation logic
+/// needs both this path and [`resolve_target`]'s canonical identity.
+pub fn authored_target(source_dir: &Path, link: &Link) -> PathBuf {
+    let expanded = expand_tilde(link);
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        source_dir.join(expanded)
     }
 }
 
@@ -381,7 +449,12 @@ pub fn resolve_target(source_dir: &Path, link: &Link) -> ResolvedTarget {
 /// (resolving another user's home needs the password database, which
 /// this tool does not consult), and so is a `~` anywhere but the first
 /// component, which is an ordinary filename character.
-fn expand_tilde(path: &Path) -> PathBuf {
+fn expand_tilde(link: &Link) -> PathBuf {
+    let path = &link.target_path;
+    let authored_tilde = link.raw_target == "~" || link.raw_target.starts_with("~/");
+    if !authored_tilde {
+        return path.to_path_buf();
+    }
     let Some(s) = path.to_str() else {
         return path.to_path_buf();
     };
@@ -555,6 +628,8 @@ fn extract_drawer_links(content: &str) -> Vec<Link> {
                 };
                 let abs = value_offset + offset_of(&parsed.value, link.line, link.column);
                 let (line, column) = offset_to_line_col(content, abs);
+                link.target_span =
+                    (value_offset + link.target_span.start)..(value_offset + link.target_span.end);
                 link.line = line;
                 link.column = column;
                 out.push(link);
@@ -641,9 +716,17 @@ fn build_link(content: &str, link: &OrgLink, origin: LinkOrigin) -> Option<Link>
 
     let offset: usize = link.start().into();
     let (line, column) = offset_to_line_col(content, offset);
+    let raw = link.raw();
+    let target_in_raw = raw.strip_prefix("[[file:")?;
+    if !target_in_raw.starts_with(path_str) {
+        return None;
+    }
+    let target_start = offset + "[[file:".len();
 
     Some(Link {
-        raw: link.raw(),
+        raw,
+        raw_target: path_str.to_string(),
+        target_span: target_start..target_start + path_str.len(),
         target_path,
         target_is_directory,
         anchor,
@@ -745,6 +828,41 @@ mod tests {
         assert_eq!(links[0].target_path, PathBuf::from("foo.org"));
         assert_eq!(links[0].anchor, None);
         assert_eq!(links[0].line, 2);
+    }
+
+    #[test]
+    fn test_link_target_span_is_exact_for_body_and_property_links() {
+        let src = indoc! {"
+            Préface [[file:body old.org::*H][body]].
+            * Node
+            :PROPERTIES:
+            :POINTER: [[file:property old.org::#id][property]]
+            :END:
+        "};
+        let links = extract_file_links(src);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].raw_target, "body old.org");
+        assert_eq!(&src[links[0].target_span.clone()], "body old.org");
+        assert_eq!(links[1].raw_target, "property old.org");
+        assert_eq!(&src[links[1].target_span.clone()], "property old.org");
+    }
+
+    #[test]
+    fn test_rewrite_file_link_paths_changes_only_exact_target_spans() {
+        let src = "Before [[file:old.org::*H][old.org description]] after old.org.\n";
+        let link = extract_file_links(src).remove(0);
+        let rewritten = rewrite_file_link_paths(
+            src,
+            &[LinkPathRewrite {
+                span: link.target_span,
+                replacement: "new.org".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            rewritten,
+            "Before [[file:new.org::*H][old.org description]] after old.org.\n"
+        );
     }
 
     #[test]

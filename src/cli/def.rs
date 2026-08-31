@@ -190,9 +190,42 @@ pub enum Commands {
     },
 }
 
-/// `org-cli link <action>` sub-actions — queries over the link graph.
+/// `org-cli link <action>` sub-actions — query or preserve the link graph.
 #[derive(Subcommand, Debug)]
 pub enum LinkCommands {
+    /// Move one file or directory and rewrite every affected
+    /// `[[file:...]]` target in the explicitly scanned ROOT.
+    ///
+    /// This is a dry-run by default: it prints a deterministic summary and
+    /// unified diffs without changing the filesystem. Pass `--write` to move
+    /// OLD to NEW, atomically rewrite changed org files, and verify the
+    /// resulting all-followable link graph.
+    ///
+    /// `--write` requires a quiescent corpus and path tree. Cooperating
+    /// `org-cli link move` writers serialize only when they use the same
+    /// canonical ROOT; nested or overlapping different roots do not share a
+    /// lock. The command cannot protect against an uncooperative actor changing
+    /// paths between system calls.
+    Move {
+        /// Existing file or directory to move. Must be within ROOT.
+        #[arg(value_name = "OLD")]
+        old: std::path::PathBuf,
+
+        /// New path. Must not exist, must be within ROOT, and its parent must
+        /// already exist.
+        #[arg(value_name = "NEW")]
+        new: std::path::PathBuf,
+
+        /// Explicit corpus root scanned recursively for `*.org` link sources.
+        #[arg(long, value_name = "ROOT")]
+        root: std::path::PathBuf,
+
+        /// Apply under the quiescent-corpus contract. Cooperating moves using
+        /// the same canonical ROOT are serialized; otherwise print a dry-run.
+        #[arg(long)]
+        write: bool,
+    },
+
     /// Check that every `[[file:...]]` link in the given org files
     /// resolves to an existing path (and heading anchor, if any).
     ///

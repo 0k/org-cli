@@ -107,18 +107,67 @@ pub fn run(opts: CheckOptions) -> Result<i32, String> {
     let org_files = collect_org_files(&opts.paths)?;
     debug!("scanning {} org file(s)", org_files.len());
 
+    let broken = collect_broken_links(
+        &org_files,
+        opts.strict,
+        opts.strict_headings,
+        false,
+        opts.first,
+    )?;
+    let broken_count = broken.len();
+    let mut writer = StdoutWriter::new(&opts);
+    if opts.first && broken_count > 0 {
+        writer.emit(&broken[0]).map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
+        return Ok(1);
+    }
+    for record in &broken {
+        writer.emit(record).map_err(|e| e.to_string())?;
+    }
+    writer.finish(broken_count).map_err(|e| e.to_string())?;
+    Ok(if broken_count == 0 { 0 } else { 1 })
+}
+
+/// Validate a prepared corpus without emitting command output.
+///
+/// `link move` uses this after mutation and treats an unreadable source as a
+/// hard verification failure rather than silently skipping it.
+pub(crate) fn validate_corpus(org_files: &[PathBuf]) -> Result<(), String> {
+    let broken = collect_broken_links(org_files, false, false, true, true)?;
+    if let Some(first) = broken.first() {
+        return Err(format!(
+            "broken link in corpus at {}:{}:{}: {} ({})",
+            first.source_file.display(),
+            first.line,
+            first.column,
+            first.resolved_target.display(),
+            first.reason_message
+        ));
+    }
+    Ok(())
+}
+
+fn collect_broken_links(
+    org_files: &[PathBuf],
+    strict: bool,
+    strict_headings: bool,
+    unreadable_is_error: bool,
+    stop_after_first: bool,
+) -> Result<Vec<BrokenLink>, String> {
     // Cache of AnchorIndex per resolved target file, so a target
     // pointed to from many links is parsed at most once.
     let mut anchor_cache: std::collections::HashMap<PathBuf, Option<AnchorIndex>> =
         std::collections::HashMap::new();
 
-    let mut broken_count: usize = 0;
-    let mut writer = StdoutWriter::new(&opts);
+    let mut broken = Vec::new();
 
-    for source_file in &org_files {
+    for source_file in org_files {
         let content = match fs::read_to_string(source_file) {
             Ok(c) => c,
             Err(e) => {
+                if unreadable_is_error {
+                    return Err(format!("cannot read {}: {}", source_file.display(), e));
+                }
                 warn!("cannot read {}: {}", source_file.display(), e);
                 continue;
             }
@@ -135,21 +184,15 @@ pub fn run(opts: CheckOptions) -> Result<i32, String> {
             }
             let resolved = resolve_target(&source_dir, &link).path;
 
-            let break_reason = match validate_link(
-                &link,
-                &resolved,
-                &mut anchor_cache,
-                opts.strict,
-                opts.strict_headings,
-            ) {
-                Ok(()) => continue,
-                Err(r) => r,
-            };
+            let break_reason =
+                match validate_link(&link, &resolved, &mut anchor_cache, strict, strict_headings) {
+                    Ok(()) => continue,
+                    Err(r) => r,
+                };
 
-            broken_count += 1;
             let (origin_tag, origin_drawer, origin_property) =
                 BrokenLink::origin_fields(&link.origin);
-            let record = BrokenLink {
+            broken.push(BrokenLink {
                 source_file: source_file.clone(),
                 line: link.line,
                 column: link.column,
@@ -160,18 +203,13 @@ pub fn run(opts: CheckOptions) -> Result<i32, String> {
                 origin_tag,
                 origin_drawer,
                 origin_property,
-            };
-            writer.emit(&record).map_err(|e| e.to_string())?;
-
-            if opts.first {
-                writer.flush().map_err(|e| e.to_string())?;
-                return Ok(1);
+            });
+            if stop_after_first {
+                return Ok(broken);
             }
         }
     }
-
-    writer.finish(broken_count).map_err(|e| e.to_string())?;
-    Ok(if broken_count == 0 { 0 } else { 1 })
+    Ok(broken)
 }
 
 /// Validate one link. Returns `Ok(())` if the link resolves cleanly.

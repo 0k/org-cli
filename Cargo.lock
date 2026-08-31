@@ -1276,6 +1276,7 @@ dependencies = [
  "glob",
  "indoc",
  "kal-sse",
+ "libc",
  "log",
  "notify",
  "orgize",

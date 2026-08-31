@@ -1,6 +1,6 @@
 //! `link` subcommand family — queries over the org *link graph*.
 //!
-//! The three actions here share one input (every `[[file:...]]` link
+//! The actions here share one input (every `[[file:...]]` link
 //! reachable in the scanned corpus) and one domain module
 //! ([`crate::org::link`]), but make deliberately different promises:
 //!
@@ -9,6 +9,7 @@
 //! | [`check`]     | do all my links point at real files?      |
 //! | [`orphans`]   | which files does nothing point at?        |
 //! | [`backlinks`] | what points at *this* file?               |
+//! | [`move`]      | how do edges survive a path relocation?   |
 //!
 //! Those promises drive different link-origin policies — see
 //! [`crate::org::link::OriginPolicy`].
@@ -24,4 +25,5 @@
 
 pub mod backlinks;
 pub mod check;
+pub mod r#move;
 pub mod orphans;

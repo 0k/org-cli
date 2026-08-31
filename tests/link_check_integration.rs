@@ -236,3 +236,30 @@ fn test_check_clean_tree_reports_no_broken_links() {
         .expect("failed to spawn org-cli");
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn test_check_first_stops_before_reading_later_corpus_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("a-first.org"),
+        "[[file:missing.org][first broken]]\n",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("z-unreadable.org"), [0xff, 0xfe]).unwrap();
+
+    let output = Command::new(bin_path())
+        .args(["link", "check", "--first", "--json"])
+        .arg(temp.path())
+        .output()
+        .expect("failed to spawn org-cli");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let records: Vec<&str> = stdout.lines().collect();
+    assert_eq!(records.len(), 1);
+    assert!(
+        output.stderr.is_empty(),
+        "later unreadable source must not be inspected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

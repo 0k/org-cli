@@ -131,6 +131,52 @@ source subtree is removed. Cross-file moves write the destination
 first, then the source, so a crash between the two writes duplicates
 the subtree rather than losing it.
 
+** =link move= — relocate paths without breaking file links
+
+Move one file or directory inside an explicitly scanned root while
+preserving every supported =[[file:...]]= edge in that corpus. The
+command scans all =.org= files recursively with the same all-followable
+semantics as =link check=, including links in body text, drawers, and
+property values.
+
+The default is a read-only dry-run with a deterministic summary and
+unified diffs. =--write= moves the filesystem object, atomically writes
+each changed org file, and then verifies the resulting link graph. A
+write requires the corpus and its path tree to remain *quiescent*: no
+non-cooperating process may mutate relevant files or paths until the
+command returns.
+
+#+begin_src bash
+# Preview a file relocation and every affected link target
+org-cli link move notes/old.org notes/new.org --root notes
+
+# Move a directory and apply all inbound/outbound link rewrites
+org-cli link move archive/old archive/renamed --root . --write
+#+end_src
+
+=OLD= must exist; =NEW= must not exist; both paths must be inside
+=ROOT=; and =NEW='s parent must already exist. Relative links remain
+relative to each source file's post-move directory, absolute links
+remain absolute, and descriptions and =::= anchors are not rewritten.
+
+On an ordinary I/O or post-write verification failure, the command
+attempts to restore every rewritten file and move =NEW= back to =OLD=.
+On Linux, one nonblocking exclusive =flock= on the canonical =ROOT=
+directory serializes cooperating =org-cli link move= writers without a
+persistent lock file across planning, execution, and postflight. Writers
+serialize only when they use the same canonical =ROOT=; nested or
+overlapping different root values are outside cooperative serialization.
+Both filesystem moves use atomic no-replace semantics.
+=--write= fails safely as unsupported on other platforms. Freshness
+checks reject stale bytes and path entries that have become symlinks;
+rollback likewise refuses a stale or substituted entry and reports
+incomplete restoration instead. These are cooperative serialization
+and boundary detection, not protection against an uncooperative actor
+changing a path between system calls.
+This rollback is tested, but it is not crash recovery: the operation
+does not yet have a durable journal, so process termination or power
+loss can still require manual recovery.
+
 * Development
 
 See [[file:AGENTS.md][AGENTS.md]] for development guidelines.

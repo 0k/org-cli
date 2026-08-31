@@ -261,11 +261,13 @@ fn dispatch_link(cmd: def::LinkCommands) -> Result<i32, String> {
         def::LinkCommands::Move {
             old,
             new,
+            plan,
             root,
             write,
         } => action::link::r#move::run(action::link::r#move::MoveOptions {
             old,
             new,
+            plan,
             root,
             write,
         }),

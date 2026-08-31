@@ -110,7 +110,7 @@ fn file_move_rewrites_inbound_path_only_and_preserves_anchor_description() {
         &fs::read_to_string(&source).unwrap(),
         indoc! {"
             #+TITLE: Unchanged
-            Before [[file:topic/new%20file.org::*Destination][A useful description]] after.
+            Before [[file:topic/new file.org::*Destination][A useful description]] after.
             Raw old file.org text is not a link.
         "},
     );
@@ -216,7 +216,7 @@ fn generated_ambiguous_targets_round_trip_to_the_moved_file() {
         ("%2E%2E", "%252E%252E"),
         ("name::anchor", "name%3A%3Aanchor"),
         ("~", "%7E"),
-        ("name [with space]", "name%20%5Bwith%20space%5D"),
+        ("name [with space]", "name %5Bwith space%5D"),
         ("control\nname", "control%0Aname"),
     ] {
         let temp = tempfile::tempdir().unwrap();

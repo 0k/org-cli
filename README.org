@@ -152,12 +152,40 @@ org-cli link move notes/old.org notes/new.org --root notes
 
 # Move a directory and apply all inbound/outbound link rewrites
 org-cli link move archive/old archive/renamed --root . --write
+
+# Preview/apply one simultaneous strict YAML batch
+org-cli link move --plan renames.yaml --root .
+org-cli link move --plan renames.yaml --root . --write
 #+end_src
+
+The two input modes are mutually exclusive: provide exactly positional
+=OLD NEW= or =--plan YAML=. Batch plans use this strict dash-cased schema
+(unknown keys are errors):
+
+#+begin_src yaml
+moves:
+  - from: visits/old
+    to: visits/new
+#+end_src
+
+Relative =from=/=to= paths are resolved from canonical =ROOT=, not the
+shell's working directory. Absolute paths are accepted only inside
+=ROOT=. Batch mappings are simultaneous: every source and link is
+resolved in the initial tree and mapped at most once into the final
+tree. Preview and execution list moves in YAML order; rewritten files
+are diffed in final-path order.
 
 =OLD= must exist; =NEW= must not exist; both paths must be inside
 =ROOT=; and =NEW='s parent must already exist. Relative links remain
 relative to each source file's post-move directory, absolute links
 remain absolute, and descriptions and =::= anchors are not rewritten.
+Batch mode additionally refuses empty/duplicate/overlapping sources or
+destinations, occupied destinations, destinations inside sources, and
+all FROM/TO cross-collisions (including chains, swaps, and cycles).
+All moves and rewrites form one ordinary-I/O transaction: move failure,
+write failure, or postflight failure restores rewritten files and then
+rolls applied destinations back in reverse move order when freshness
+checks permit.
 
 On an ordinary I/O or post-write verification failure, the command
 attempts to restore every rewritten file and move =NEW= back to =OLD=.

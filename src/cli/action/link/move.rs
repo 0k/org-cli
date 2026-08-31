@@ -1,5 +1,7 @@
-//! `link move` action — relocate one filesystem object while preserving
-//! every supported `[[file:...]]` edge in an explicitly scanned corpus.
+//! `link move` action — relocate one or more filesystem objects while
+//! preserving every supported `[[file:...]]` edge in an explicitly scanned
+//! corpus. Batch mappings are evaluated simultaneously against the initial
+//! tree and produce one final-tree graph; they are never repeated single moves.
 //!
 //! Planning is read-only: it validates boundaries, reads every `.org` source,
 //! resolves links through [`crate::org::link`], and prepares complete rewritten
@@ -20,6 +22,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
+use serde::Deserialize;
 use similar::TextDiff;
 
 use crate::cli::action::walk::collect_org_files;
@@ -36,10 +39,17 @@ const POLICY: OriginPolicy = OriginPolicy::AllFollowable;
 /// CLI options received from `LinkCommands::Move`.
 #[derive(Debug, Clone)]
 pub struct MoveOptions {
-    pub old: PathBuf,
-    pub new: PathBuf,
+    pub old: Option<PathBuf>,
+    pub new: Option<PathBuf>,
+    pub plan: Option<PathBuf>,
     pub root: PathBuf,
     pub write: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedMove {
+    old: PathBuf,
+    new: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -53,10 +63,28 @@ struct PreparedFile {
 #[derive(Debug, Clone)]
 struct MovePlan {
     root: PathBuf,
-    old: PathBuf,
-    new: PathBuf,
+    moves: Vec<PlannedMove>,
     files: Vec<PreparedFile>,
     link_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchYaml {
+    moves: Vec<YamlMove>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlMove {
+    from: String,
+    to: String,
+}
+
+struct MoveRequest {
+    from: PathBuf,
+    to: PathBuf,
+    root_relative: bool,
 }
 
 #[derive(Debug)]
@@ -113,7 +141,23 @@ pub fn run(opts: MoveOptions) -> Result<i32, String> {
     let plan = prepare_plan(&opts)?;
     if opts.write {
         execute_plan(&plan)?;
-        println!("Moved {} -> {}", plan.old.display(), plan.new.display());
+        if plan.moves.len() == 1 {
+            println!(
+                "Moved {} -> {}",
+                plan.moves[0].old.display(),
+                plan.moves[0].new.display()
+            );
+        } else {
+            println!("Moved {} object(s):", plan.moves.len());
+            for (index, movement) in plan.moves.iter().enumerate() {
+                println!(
+                    "  {}: {} -> {}",
+                    index + 1,
+                    movement.old.display(),
+                    movement.new.display()
+                );
+            }
+        }
         println!(
             "Rewrote {} link(s) in {} org file(s)",
             plan.link_count,
@@ -127,67 +171,12 @@ pub fn run(opts: MoveOptions) -> Result<i32, String> {
 
 fn prepare_plan(opts: &MoveOptions) -> Result<MovePlan, String> {
     let root = canonical_root(&opts.root)?;
-
-    let old_input = absolute_authored(&opts.old)?;
-    let old_meta = fs::symlink_metadata(&old_input).map_err(|e| {
-        format!(
-            "OLD does not exist or cannot be inspected: {}: {}",
-            old_input.display(),
-            e
-        )
-    })?;
-    if old_meta.file_type().is_symlink() {
-        return Err(format!("OLD may not be a symlink: {}", old_input.display()));
+    let requests = load_move_requests(opts)?;
+    let mut moves = Vec::with_capacity(requests.len());
+    for (index, request) in requests.into_iter().enumerate() {
+        moves.push(resolve_move_request(&root, request, index + 1)?);
     }
-    if !old_meta.is_file() && !old_meta.is_dir() {
-        return Err(format!(
-            "OLD is neither a file nor directory: {}",
-            old_input.display()
-        ));
-    }
-    let old = fs::canonicalize(&old_input)
-        .map_err(|e| format!("cannot resolve OLD {}: {}", old_input.display(), e))?;
-
-    let new_input = absolute_authored(&opts.new)?;
-    if fs::symlink_metadata(&new_input).is_ok() {
-        return Err(format!("NEW already exists: {}", new_input.display()));
-    }
-    let new_name = new_input
-        .file_name()
-        .ok_or_else(|| format!("NEW has no final path component: {}", new_input.display()))?;
-    let new_parent_input = new_input
-        .parent()
-        .ok_or_else(|| format!("NEW has no destination parent: {}", new_input.display()))?;
-    let new_parent = fs::canonicalize(new_parent_input).map_err(|e| {
-        format!(
-            "destination parent does not exist or cannot be resolved: {}: {}",
-            new_parent_input.display(),
-            e
-        )
-    })?;
-    if !new_parent.is_dir() {
-        return Err(format!(
-            "destination parent is not a directory: {}",
-            new_parent.display()
-        ));
-    }
-    let new = new_parent.join(new_name);
-
-    ensure_within("OLD", &old, &root)?;
-    ensure_within("NEW", &new, &root)?;
-    if old == root {
-        return Err("OLD may not be the scanned root itself".to_string());
-    }
-    if new == old {
-        return Err("OLD and NEW resolve to the same path".to_string());
-    }
-    if old_meta.is_dir() && new.starts_with(&old) {
-        return Err(format!(
-            "NEW may not be inside OLD: {} is under {}",
-            new.display(),
-            old.display()
-        ));
-    }
+    validate_move_set(&moves)?;
 
     let org_files = collect_org_files(std::slice::from_ref(&root))?;
     check::validate_corpus(&org_files)
@@ -204,7 +193,7 @@ fn prepare_plan(opts: &MoveOptions) -> Result<MovePlan, String> {
                 e
             )
         })?;
-        let post_path = map_moved_path(&source_path, &old, &new);
+        let post_path = map_moved_path(&source_path, &moves)?;
         if !post_paths.insert(post_path.clone()) {
             return Err(format!(
                 "ambiguous move maps multiple org sources to {}",
@@ -225,8 +214,8 @@ fn prepare_plan(opts: &MoveOptions) -> Result<MovePlan, String> {
             let authored_unresolved = authored_target(source_dir, &link);
             let authored_tilde = link.raw_target == "~" || link.raw_target.starts_with("~/");
             let source_rebased = source_moved && !link.target_path.is_absolute() && !authored_tilde;
-            let syntactically_moved = authored_unresolved.starts_with(&old);
-            let resolved_moved = resolved_pre.starts_with(&old);
+            let syntactically_moved = matching_move(&authored_unresolved, &moves)?.is_some();
+            let resolved_moved = matching_move(&resolved_pre, &moves)?.is_some();
             if traverses_symlink_before_parent(source_dir, &link)?
                 && (syntactically_moved || resolved_moved || source_rebased)
             {
@@ -238,7 +227,7 @@ fn prepare_plan(opts: &MoveOptions) -> Result<MovePlan, String> {
                 ));
             }
             if let Some((symlink, terminal)) =
-                relative_symlink_component_under(&authored_unresolved, &old)?
+                relative_symlink_component_under(&authored_unresolved, &moves)?
             {
                 let reason = if terminal {
                     "relative terminal symlink under OLD"
@@ -256,11 +245,11 @@ fn prepare_plan(opts: &MoveOptions) -> Result<MovePlan, String> {
             }
 
             let authored_pre = lexical_normalize(&authored_unresolved);
-            let authored_moved = authored_pre.starts_with(&old);
+            let authored_moved = matching_move(&authored_pre, &moves)?.is_some();
             let resolved_post = if authored_moved {
-                map_moved_path(&authored_pre, &old, &new)
+                map_moved_path(&authored_pre, &moves)?
             } else if resolved_moved {
-                map_moved_path(&resolved_pre, &old, &new)
+                map_moved_path(&resolved_pre, &moves)?
             } else {
                 resolved_pre.clone()
             };
@@ -323,11 +312,184 @@ fn prepare_plan(opts: &MoveOptions) -> Result<MovePlan, String> {
     prepared.sort_by(|a, b| a.post_path.cmp(&b.post_path));
     Ok(MovePlan {
         root,
-        old,
-        new,
+        moves,
         files: prepared,
         link_count: total_links,
     })
+}
+
+fn load_move_requests(opts: &MoveOptions) -> Result<Vec<MoveRequest>, String> {
+    match (&opts.old, &opts.new, &opts.plan) {
+        (Some(old), Some(new), None) => Ok(vec![MoveRequest {
+            from: old.clone(),
+            to: new.clone(),
+            root_relative: false,
+        }]),
+        (None, None, Some(plan_path)) => {
+            let content = fs::read_to_string(plan_path)
+                .map_err(|error| format!("cannot read plan {}: {}", plan_path.display(), error))?;
+            let parsed: BatchYaml = serde_yaml::from_str(&content)
+                .map_err(|error| format!("invalid move plan {}: {}", plan_path.display(), error))?;
+            if parsed.moves.is_empty() {
+                return Err("move plan must contain at least one entry in `moves`".to_string());
+            }
+            parsed
+                .moves
+                .into_iter()
+                .enumerate()
+                .map(|(index, movement)| {
+                    if movement.from.trim().is_empty() || movement.to.trim().is_empty() {
+                        return Err(format!(
+                            "move plan entry {} has an empty `from` or `to` path",
+                            index + 1
+                        ));
+                    }
+                    Ok(MoveRequest {
+                        from: PathBuf::from(movement.from),
+                        to: PathBuf::from(movement.to),
+                        root_relative: true,
+                    })
+                })
+                .collect()
+        }
+        _ => Err(
+            "choose exactly one move mode: positional OLD NEW, or --plan YAML (without positionals)"
+                .to_string(),
+        ),
+    }
+}
+
+fn resolve_move_request(
+    root: &Path,
+    request: MoveRequest,
+    index: usize,
+) -> Result<PlannedMove, String> {
+    let from_input = if request.root_relative && !request.from.is_absolute() {
+        root.join(&request.from)
+    } else {
+        absolute_authored(&request.from)?
+    };
+    let to_input = if request.root_relative && !request.to.is_absolute() {
+        root.join(&request.to)
+    } else {
+        absolute_authored(&request.to)?
+    };
+
+    let metadata = fs::symlink_metadata(&from_input).map_err(|error| {
+        format!(
+            "move entry {} FROM does not exist or cannot be inspected: {}: {}",
+            index,
+            from_input.display(),
+            error
+        )
+    })?;
+    if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+        return Err(format!(
+            "move entry {} FROM must be a regular file or directory, not a symlink: {}",
+            index,
+            from_input.display()
+        ));
+    }
+    let old = fs::canonicalize(&from_input).map_err(|error| {
+        format!(
+            "cannot resolve move entry {} FROM {}: {}",
+            index,
+            from_input.display(),
+            error
+        )
+    })?;
+    let name = to_input.file_name().ok_or_else(|| {
+        format!(
+            "move entry {} TO has no final path component: {}",
+            index,
+            to_input.display()
+        )
+    })?;
+    let parent_input = to_input.parent().ok_or_else(|| {
+        format!(
+            "move entry {} TO has no destination parent: {}",
+            index,
+            to_input.display()
+        )
+    })?;
+    let parent = fs::canonicalize(parent_input).map_err(|error| {
+        format!(
+            "move entry {} destination parent does not exist: {}: {}",
+            index,
+            parent_input.display(),
+            error
+        )
+    })?;
+    if !parent.is_dir() {
+        return Err(format!(
+            "move entry {} destination parent is not a directory",
+            index
+        ));
+    }
+    let new = parent.join(name);
+    ensure_within(&format!("move entry {} FROM", index), &old, root)?;
+    ensure_within(&format!("move entry {} TO", index), &new, root)?;
+    if old == root {
+        return Err(format!("move entry {} FROM may not be ROOT", index));
+    }
+    Ok(PlannedMove { old, new })
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn validate_move_set(moves: &[PlannedMove]) -> Result<(), String> {
+    for left in 0..moves.len() {
+        for right in (left + 1)..moves.len() {
+            if paths_overlap(&moves[left].old, &moves[right].old) {
+                return Err(format!(
+                    "move entries {} and {} have overlapping FROM paths",
+                    left + 1,
+                    right + 1
+                ));
+            }
+            if paths_overlap(&moves[left].new, &moves[right].new) {
+                return Err(format!(
+                    "move entries {} and {} have overlapping TO paths",
+                    left + 1,
+                    right + 1
+                ));
+            }
+        }
+    }
+    for (from_index, from) in moves.iter().enumerate() {
+        for (to_index, to) in moves.iter().enumerate() {
+            if paths_overlap(&from.old, &to.new) {
+                return Err(format!(
+                    "move entries {} and {} have a FROM/TO cross-collision (chains, swaps, and cycles are unsupported)",
+                    from_index + 1,
+                    to_index + 1
+                ));
+            }
+        }
+    }
+    for (index, movement) in moves.iter().enumerate() {
+        match fs::symlink_metadata(&movement.new) {
+            Ok(_) => {
+                return Err(format!(
+                    "move entry {} TO already exists: {}",
+                    index + 1,
+                    movement.new.display()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect move entry {} TO {}: {}",
+                    index + 1,
+                    movement.new.display(),
+                    error
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn canonical_root(path: &Path) -> Result<PathBuf, String> {
@@ -412,7 +574,7 @@ fn traverses_symlink_before_parent(source_dir: &Path, link: &Link) -> Result<boo
 
 fn relative_symlink_component_under(
     path: &Path,
-    old: &Path,
+    moves: &[PlannedMove],
 ) -> Result<Option<(PathBuf, bool)>, String> {
     let terminal = lexical_normalize(path);
     let mut current = PathBuf::new();
@@ -422,7 +584,7 @@ fn relative_symlink_component_under(
             Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
                 current.push(component.as_os_str());
                 if !matches!(component, Component::Normal(_))
-                    || !lexical_normalize(&current).starts_with(old)
+                    || matching_move(&lexical_normalize(&current), moves)?.is_none()
                 {
                     continue;
                 }
@@ -479,10 +641,30 @@ fn verify_rendered_target(
     Ok(())
 }
 
-fn map_moved_path(path: &Path, old: &Path, new: &Path) -> PathBuf {
-    path.strip_prefix(old)
-        .map(|suffix| new.join(suffix))
-        .unwrap_or_else(|_| path.to_path_buf())
+fn matching_move<'a>(
+    path: &Path,
+    moves: &'a [PlannedMove],
+) -> Result<Option<&'a PlannedMove>, String> {
+    let mut matches = moves
+        .iter()
+        .filter(|movement| path.starts_with(&movement.old));
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(format!(
+            "path {} maps through more than one move",
+            path.display()
+        ));
+    }
+    Ok(first)
+}
+
+fn map_moved_path(path: &Path, moves: &[PlannedMove]) -> Result<PathBuf, String> {
+    match matching_move(path, moves)? {
+        Some(movement) => Ok(movement
+            .new
+            .join(path.strip_prefix(&movement.old).expect("matching prefix"))),
+        None => Ok(path.to_path_buf()),
+    }
 }
 
 fn relative_path(from_dir: &Path, target: &Path) -> Result<PathBuf, String> {
@@ -539,7 +721,7 @@ fn render_percent_style(raw: &str, original_raw: &str) -> String {
             styled.contains(byte)
                 || byte.is_ascii_control()
                 || *byte == 0x7f
-                || matches!(*byte, b' ' | b'%' | b':' | b'[' | b']' | b'~')
+                || matches!(*byte, b'%' | b':' | b'[' | b']' | b'~')
         });
         if must_encode {
             for byte in bytes {
@@ -565,13 +747,27 @@ fn render_target(path: &Path, original_raw: &str, directory: bool) -> Result<Str
 
 fn present_dry_run(plan: &MovePlan) -> Result<(), String> {
     let mut stdout = io::BufWriter::new(io::stdout());
-    writeln!(
-        stdout,
-        "Move: {} -> {}",
-        plan.old.display(),
-        plan.new.display()
-    )
-    .map_err(|e| e.to_string())?;
+    if plan.moves.len() == 1 {
+        writeln!(
+            stdout,
+            "Move: {} -> {}",
+            plan.moves[0].old.display(),
+            plan.moves[0].new.display()
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        writeln!(stdout, "Moves:").map_err(|e| e.to_string())?;
+        for (index, movement) in plan.moves.iter().enumerate() {
+            writeln!(
+                stdout,
+                "  {}: {} -> {}",
+                index + 1,
+                movement.old.display(),
+                movement.new.display()
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
     writeln!(
         stdout,
         "Rewrites: {} link(s) in {} org file(s)",
@@ -613,40 +809,49 @@ fn execute_plan_with_io(
     writer: &mut impl FnMut(&Path, &str) -> Result<(), String>,
     mover: &mut impl FnMut(&Path, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
-    mover(&plan.old, &plan.new).map_err(|e| {
-        format!(
-            "cannot move {} to {}: {}",
-            plan.old.display(),
-            plan.new.display(),
-            e
-        )
-    })?;
+    let mut applied_moves = Vec::new();
+    for (index, movement) in plan.moves.iter().enumerate() {
+        if let Err(error) = mover(&movement.old, &movement.new) {
+            let rollback = rollback(plan, &[], &applied_moves, writer, mover);
+            return Err(transaction_error(
+                &format!(
+                    "cannot apply move {} ({} -> {}): {}",
+                    index + 1,
+                    movement.old.display(),
+                    movement.new.display(),
+                    error
+                ),
+                rollback,
+            ));
+        }
+        applied_moves.push(index);
+    }
 
-    let mut applied = Vec::new();
+    let mut applied_files = Vec::new();
     for (index, file) in plan.files.iter().enumerate() {
         if let Err(error) = ensure_fresh(
             &file.post_path,
             file.original.as_bytes(),
             "changed after planning",
         ) {
-            let rollback = rollback(plan, &applied, writer, mover);
+            let rollback = rollback(plan, &applied_files, &applied_moves, writer, mover);
             return Err(transaction_error(&error, rollback));
         }
         if let Err(error) = writer(&file.post_path, &file.rewritten) {
-            let rollback = rollback(plan, &applied, writer, mover);
+            let rollback = rollback(plan, &applied_files, &applied_moves, writer, mover);
             return Err(transaction_error(
                 &format!("cannot rewrite {}: {}", file.post_path.display(), error),
                 rollback,
             ));
         }
-        applied.push(index);
+        applied_files.push(index);
     }
 
     let verification = collect_org_files(std::slice::from_ref(&plan.root))
         .and_then(|files| check::validate_corpus(&files));
     if let Err(error) = verification {
         let all: Vec<usize> = (0..plan.files.len()).collect();
-        let rollback = rollback(plan, &all, writer, mover);
+        let rollback = rollback(plan, &all, &applied_moves, writer, mover);
         return Err(transaction_error(
             &format!("post-move link verification failed: {}", error),
             rollback,
@@ -657,12 +862,13 @@ fn execute_plan_with_io(
 
 fn rollback(
     plan: &MovePlan,
-    applied: &[usize],
+    applied_files: &[usize],
+    applied_moves: &[usize],
     writer: &mut impl FnMut(&Path, &str) -> Result<(), String>,
     mover: &mut impl FnMut(&Path, &Path) -> Result<(), String>,
 ) -> Vec<String> {
     let mut errors = Vec::new();
-    for index in applied.iter().rev() {
+    for index in applied_files.iter().rev() {
         let file = &plan.files[*index];
         if let Err(error) = ensure_fresh(
             &file.post_path,
@@ -676,13 +882,16 @@ fn rollback(
             errors.push(format!("restore {}: {}", file.post_path.display(), error));
         }
     }
-    if let Err(error) = mover(&plan.new, &plan.old) {
-        errors.push(format!(
-            "move {} back to {}: {}",
-            plan.new.display(),
-            plan.old.display(),
-            error
-        ));
+    for index in applied_moves.iter().rev() {
+        let movement = &plan.moves[*index];
+        if let Err(error) = mover(&movement.new, &movement.old) {
+            errors.push(format!(
+                "move {} back to {}: {}",
+                movement.new.display(),
+                movement.old.display(),
+                error
+            ));
+        }
     }
     errors
 }
@@ -767,8 +976,9 @@ mod tests {
         fs::write(&first, "[[file:old.org][a]]\n").unwrap();
         fs::write(&second, "[[file:old.org][b]]\n").unwrap();
         let plan = prepare_plan(&MoveOptions {
-            old: old.clone(),
-            new: new.clone(),
+            old: Some(old.clone()),
+            new: Some(new.clone()),
+            plan: None,
             root: root.to_path_buf(),
             write: true,
         })
@@ -801,8 +1011,9 @@ mod tests {
         let new = root.join("new.txt");
         fs::write(&old, "owned by move\n").unwrap();
         let plan = prepare_plan(&MoveOptions {
-            old: old.clone(),
-            new: new.clone(),
+            old: Some(old.clone()),
+            new: Some(new.clone()),
+            plan: None,
             root: root.to_path_buf(),
             write: true,
         })
@@ -820,7 +1031,7 @@ mod tests {
         };
         let error = execute_plan_with_io(&plan, &mut writer, &mut mover).unwrap_err();
 
-        assert!(error.contains("cannot move"));
+        assert!(error.contains("cannot apply move 1"));
         assert_eq!(fs::read_to_string(old).unwrap(), "owned by move\n");
         assert_eq!(fs::read_to_string(new).unwrap(), "foreign destination\n");
     }
@@ -835,8 +1046,9 @@ mod tests {
         fs::write(&old, "* H\n").unwrap();
         fs::write(&source, "[[file:old.org][old]]\n").unwrap();
         let plan = prepare_plan(&MoveOptions {
-            old: old.clone(),
-            new: new.clone(),
+            old: Some(old.clone()),
+            new: Some(new.clone()),
+            plan: None,
             root: root.to_path_buf(),
             write: true,
         })
@@ -866,8 +1078,9 @@ mod tests {
         fs::write(&first, "[[file:old.org][a]]\n").unwrap();
         fs::write(&second, "[[file:old.org][b]]\n").unwrap();
         let plan = prepare_plan(&MoveOptions {
-            old: old.clone(),
-            new: new.clone(),
+            old: Some(old.clone()),
+            new: Some(new.clone()),
+            plan: None,
             root: root.to_path_buf(),
             write: true,
         })
@@ -910,8 +1123,9 @@ mod tests {
         fs::write(&source, source_original).unwrap();
         fs::write(&outside, source_original).unwrap();
         let plan = prepare_plan(&MoveOptions {
-            old: old.clone(),
-            new: new.clone(),
+            old: Some(old.clone()),
+            new: Some(new.clone()),
+            plan: None,
             root: root.to_path_buf(),
             write: true,
         })
@@ -958,8 +1172,9 @@ mod tests {
         let _held = RootLock::acquire(&root).unwrap();
 
         let error = run(MoveOptions {
-            old: old.clone(),
-            new: new.clone(),
+            old: Some(old.clone()),
+            new: Some(new.clone()),
+            plan: None,
             root,
             write: true,
         })
@@ -968,6 +1183,69 @@ mod tests {
         assert!(error.contains("another org-cli link move"));
         assert!(old.exists());
         assert!(!new.exists());
+    }
+
+    #[test]
+    fn batch_lock_is_acquired_before_plan_file_is_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let _held = RootLock::acquire(&root).unwrap();
+        let error = run(MoveOptions {
+            old: None,
+            new: None,
+            plan: Some(root.join("missing.yaml")),
+            root,
+            write: true,
+        })
+        .unwrap_err();
+        assert!(error.contains("another org-cli link move"));
+    }
+
+    #[test]
+    fn batch_second_move_failure_rolls_back_first_without_rewriting_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("a-old")).unwrap();
+        fs::create_dir(root.join("b-old")).unwrap();
+        fs::write(root.join("a-old/a.org"), "* A\n").unwrap();
+        fs::write(root.join("b-old/b.org"), "* B\n").unwrap();
+        let source = root.join("source.org");
+        let original = "[[file:a-old/a.org][a]] [[file:b-old/b.org][b]]\n";
+        fs::write(&source, original).unwrap();
+        let plan_path = root.join("renames.yaml");
+        fs::write(
+            &plan_path,
+            "moves:\n  - from: a-old\n    to: a-new\n  - from: b-old\n    to: b-new\n",
+        )
+        .unwrap();
+        let plan = prepare_plan(&MoveOptions {
+            old: None,
+            new: None,
+            plan: Some(plan_path),
+            root: root.to_path_buf(),
+            write: true,
+        })
+        .unwrap();
+        let mut writer = |path: &Path, content: &str| {
+            write_atomic(path, content).map_err(|error| error.to_string())
+        };
+        let mut calls = 0;
+        let mut mover = |from: &Path, to: &Path| {
+            calls += 1;
+            if calls == 2 {
+                Err("injected second move failure".to_string())
+            } else {
+                rename_no_replace(from, to)
+            }
+        };
+        let error = execute_plan_with_io(&plan, &mut writer, &mut mover).unwrap_err();
+        assert!(error.contains("injected second move failure"));
+        assert!(error.contains("operation rolled back"));
+        assert!(root.join("a-old").exists());
+        assert!(root.join("b-old").exists());
+        assert!(!root.join("a-new").exists());
+        assert!(!root.join("b-new").exists());
+        assert_eq!(fs::read_to_string(source).unwrap(), original);
     }
 
     #[test]
@@ -981,8 +1259,20 @@ mod tests {
     #[test]
     fn percent_encoded_style_is_preserved_when_target_changes() {
         assert_eq!(
+            render_target(Path::new("new file.org"), "old file.org", false).unwrap(),
+            "new file.org"
+        );
+        assert_eq!(
             render_target(Path::new("new file.org"), "old%20file.org", false).unwrap(),
             "new%20file.org"
+        );
+        assert_eq!(
+            render_target(Path::new("new file.org"), "old.org", false).unwrap(),
+            "new file.org"
+        );
+        assert_eq!(
+            render_target(Path::new("name [x]::%~\n file"), "old.org", false).unwrap(),
+            "name %5Bx%5D%3A%3A%25%7E%0A file"
         );
         assert_eq!(
             render_target(Path::new("new.name"), "old%2Ename", false).unwrap(),

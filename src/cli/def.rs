@@ -193,13 +193,14 @@ pub enum Commands {
 /// `org-cli link <action>` sub-actions — query or preserve the link graph.
 #[derive(Subcommand, Debug)]
 pub enum LinkCommands {
-    /// Move one file or directory and rewrite every affected
-    /// `[[file:...]]` target in the explicitly scanned ROOT.
+    /// Move one file/directory, or apply a strict YAML batch plan, while
+    /// rewriting every affected `[[file:...]]` target under ROOT.
     ///
     /// This is a dry-run by default: it prints a deterministic summary and
     /// unified diffs without changing the filesystem. Pass `--write` to move
-    /// OLD to NEW, atomically rewrite changed org files, and verify the
-    /// resulting all-followable link graph.
+    /// OLD to NEW (or every `--plan` mapping), atomically rewrite changed org
+    /// files, and verify the resulting all-followable link graph. Choose
+    /// exactly one mode: positional OLD NEW, or `--plan YAML`.
     ///
     /// `--write` requires a quiescent corpus and path tree. Cooperating
     /// `org-cli link move` writers serialize only when they use the same
@@ -209,12 +210,17 @@ pub enum LinkCommands {
     Move {
         /// Existing file or directory to move. Must be within ROOT.
         #[arg(value_name = "OLD")]
-        old: std::path::PathBuf,
+        old: Option<std::path::PathBuf>,
 
         /// New path. Must not exist, must be within ROOT, and its parent must
         /// already exist.
         #[arg(value_name = "NEW")]
-        new: std::path::PathBuf,
+        new: Option<std::path::PathBuf>,
+
+        /// Strict YAML batch plan (`moves: [{from, to}]`). Paths are relative
+        /// to canonical ROOT; absolute paths must remain within ROOT.
+        #[arg(long, value_name = "YAML")]
+        plan: Option<std::path::PathBuf>,
 
         /// Explicit corpus root scanned recursively for `*.org` link sources.
         #[arg(long, value_name = "ROOT")]

@@ -771,14 +771,51 @@ fn split_anchor(after_scheme: &str) -> (&str, Option<Anchor>) {
 
 fn classify_anchor(raw: &str) -> Anchor {
     if let Some(rest) = raw.strip_prefix('*') {
-        Anchor::Heading(normalize_heading(rest))
+        Anchor::Heading(normalize_heading(&unescape_link(rest)))
     } else if let Some(rest) = raw.strip_prefix('#') {
-        Anchor::CustomId(rest.to_string())
+        Anchor::CustomId(unescape_link(rest))
     } else if let Ok(n) = raw.parse::<usize>() {
         Anchor::LineNumber(n)
     } else {
-        Anchor::Other(raw.to_string())
+        Anchor::Other(unescape_link(raw))
     }
+}
+
+/// Remove org's backslash escapes from a link's search option.
+///
+/// Emacs writes `[` and `]` as `\[` and `\]` inside a link (see
+/// `org-link-escape`), and strips those backslashes with
+/// `org-link-unescape` before searching for the target. Anchors must
+/// therefore be compared against the *unescaped* text: a headline
+/// titled `[2026-07-15] Note` is linked as `::*\[2026-07-15\] Note`.
+///
+/// A backslash escapes `[`, `]`, and another backslash. Before any
+/// other character it is not an escape and is kept verbatim, so a
+/// heading containing `\n` still round-trips.
+///
+/// Applied to anchors only. The path keeps its authored bytes because
+/// [`Link::target_span`] rewrites are byte-offset based.
+fn unescape_link(input: &str) -> String {
+    if !input.contains('\\') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.clone().next() {
+            Some(next @ ('[' | ']' | '\\')) => {
+                out.push(next);
+                chars.next();
+            }
+            // Not an escape sequence: keep the backslash as authored.
+            _ => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Decode percent-escapes in a path. Invalid sequences are left as-is.
@@ -885,6 +922,56 @@ mod tests {
             links[0].anchor,
             Some(Anchor::CustomId("sec-intro".to_string()))
         );
+    }
+
+    /// Emacs escapes `[` and `]` in a link's search option, and strips
+    /// those backslashes with `org-link-unescape` before searching. A
+    /// heading titled `[2026-07-15] Note` is linked as
+    /// `::*\[2026-07-15\] Note`, so the anchor must compare equal to
+    /// the unescaped title, not to the escaped source bytes.
+    #[test]
+    fn test_heading_anchor_unescapes_brackets() {
+        let src = r"[[file:a.org::*\[2026-07-15\] Note][d]]".to_string() + "\n";
+        let links = extract_file_links(&src);
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].anchor,
+            Some(Anchor::Heading("[2026-07-15] Note".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_custom_id_anchor_unescapes_brackets() {
+        let src = r"[[file:a.org::#id\[1\]][d]]".to_string() + "\n";
+        let links = extract_file_links(&src);
+        assert_eq!(links[0].anchor, Some(Anchor::CustomId("id[1]".to_string())));
+    }
+
+    /// `\\` denotes a single literal backslash.
+    #[test]
+    fn test_heading_anchor_unescapes_double_backslash() {
+        let src = r"[[file:a.org::*A\\B][d]]".to_string() + "\n";
+        let links = extract_file_links(&src);
+        assert_eq!(links[0].anchor, Some(Anchor::Heading(r"A\B".to_string())));
+    }
+
+    /// A backslash before any other character is not an escape and is
+    /// preserved, matching `org-link-unescape`.
+    #[test]
+    fn test_heading_anchor_keeps_non_escape_backslash() {
+        let src = r"[[file:a.org::*A\nB][d]]".to_string() + "\n";
+        let links = extract_file_links(&src);
+        assert_eq!(links[0].anchor, Some(Anchor::Heading(r"A\nB".to_string())));
+    }
+
+    /// Unescaping must not disturb the path span used by `link move`:
+    /// the rewrite is byte-offset based, so `raw_target` stays verbatim.
+    #[test]
+    fn test_escaped_anchor_leaves_path_span_intact() {
+        let src = r"[[file:a.org::*\[X\] T][d]]".to_string() + "\n";
+        let links = extract_file_links(&src);
+        assert_eq!(links[0].raw_target, "a.org");
+        assert_eq!(&src[links[0].target_span.clone()], "a.org");
     }
 
     #[test]

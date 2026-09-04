@@ -263,3 +263,89 @@ fn test_check_first_stops_before_reading_later_corpus_sources() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A heading whose title contains `[` / `]` is linked by Emacs with
+/// those brackets backslash-escaped (`org-store-link` emits
+/// `::*\[2026-07-15\] Note`). Two properties must hold together:
+/// the escaped `\]` must not truncate the link — otherwise `check`
+/// silently drops it from the graph and reports a clean tree — and
+/// the anchor must be compared unescaped against the real title.
+#[test]
+fn test_check_follows_heading_anchor_with_escaped_brackets() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("target.org"),
+        "* [2026-07-15] Referral letter\n\nBody.\n\n* Plain\n\nBody.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("source.org"),
+        concat!(
+            r"- ok   [[file:target.org::*\[2026-07-15\] Referral letter][resolves]]",
+            "\n",
+            r"- bad  [[file:target.org::*\[2026-07-99\] Absent heading][broken]]",
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .args(["link", "check", "--json"])
+        .arg(temp.path())
+        .output()
+        .expect("failed to spawn org-cli");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    // Exactly the absent heading is reported: the escaped link that
+    // does resolve must not be flagged, and must not be skipped either.
+    assert_eq!(
+        records.len(),
+        1,
+        "expected only the unresolvable escaped anchor, got: {stdout}"
+    );
+    assert_eq!(records[0]["reason_tag"], "heading-not-found");
+    assert_eq!(
+        records[0]["reason_message"], "heading not found: \"[2026-07-99] Absent heading\"",
+        "anchor must be reported unescaped"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// `link backlinks` shares the extraction path, so an escaped anchor
+/// must make the source appear as a backlink rather than vanish.
+#[test]
+fn test_backlinks_sees_links_with_escaped_brackets() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("target.org"),
+        "* [2026-07-15] Referral letter\n\nBody.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("source.org"),
+        concat!(
+            r"[[file:target.org::*\[2026-07-15\] Referral letter][escaped]]",
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .args(["link", "backlinks"])
+        .arg(temp.path().join("target.org"))
+        .arg(temp.path())
+        .output()
+        .expect("failed to spawn org-cli");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("source.org"),
+        "escaped link must be visible to the link graph, got: {stdout}"
+    );
+}

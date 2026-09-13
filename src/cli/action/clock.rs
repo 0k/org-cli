@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[cfg(test)]
 use chrono::NaiveDate;
@@ -23,11 +24,13 @@ use serde::Serialize;
 
 use crate::cli::action::walk::resolve_input_files;
 use crate::config::Config;
+use crate::index::clock_cache::{ClockCache, Resolved, Verify};
 use crate::org::clock::{
     check_accepted_zones, fix_weekday_in_line, format_clock_line, parse_clock_line,
     recompute_duration_in_line,
 };
 use crate::org::clock_add::{HeadingQuery, apply_add};
+use crate::org::clock_overlap::{Interval, find_overlaps_sorted};
 use crate::org::filter::FilterOptions;
 use crate::org::heading::{Heading, heading_for_line};
 
@@ -185,6 +188,379 @@ impl<'a> StdoutWriter<'a> {
                     "\n{} {}",
                     count.to_string().bright_red(),
                     "CLOCK violation(s) found".bright_red(),
+                )?;
+            }
+        }
+        self.stdout.flush()
+    }
+}
+
+// =====================================================================
+// `clock overlap`
+// =====================================================================
+//
+// The one cross-entry CLOCK rule: you cannot be doing two things at
+// the same time, so any two clocks covering a shared instant mean a
+// bookkeeping error. Unlike every rule in `clock check`, its unit is
+// a *pair*, which is why it reports its own record type instead of
+// reusing `Violation`.
+//
+// The sweep itself is in [`crate::org::clock_overlap`]; this is the
+// orchestration: collect clean intervals, apply exclusions, render.
+
+/// CLI options received from `Commands::Clock { Overlap { … } }`.
+#[derive(Debug, Clone)]
+pub struct OverlapOptions {
+    /// Files or directories to scan. Empty means "use the agenda
+    /// set" (see [`crate::cli::action::walk::read_agenda_set`]).
+    pub paths: Vec<PathBuf>,
+    /// Glob patterns from the command line. Added to the configured
+    /// `clock.overlap.exclude-globs` rather than replacing them.
+    pub exclude_globs: Vec<String>,
+    pub nul: bool,
+    pub json: bool,
+    pub first: bool,
+    /// Re-read and hash every file instead of trusting metadata.
+    pub verify: bool,
+    /// Bypass the cache entirely (read + parse everything).
+    pub no_cache: bool,
+    /// Print a phase-by-phase timing breakdown on stderr.
+    pub timing: bool,
+}
+
+/// One end of an overlapping pair, as reported to the user.
+#[derive(Debug, Clone, Serialize)]
+pub struct OverlapSide {
+    pub file: PathBuf,
+    pub line: usize,
+    /// `YYYY-MM-DDTHH:MM:SS±HH:MM`, as in `clock list`.
+    pub start: String,
+    pub end: String,
+    /// The original line, unmodified, including leading whitespace.
+    pub raw: String,
+}
+
+/// Two CLOCK lines covering at least one shared instant.
+#[derive(Debug, Clone, Serialize)]
+pub struct Overlap {
+    /// The earlier-starting of the two.
+    pub a: OverlapSide,
+    pub b: OverlapSide,
+    /// Size of the shared span, in seconds. Always `> 0`.
+    pub overlap_seconds: i64,
+}
+
+/// Run `clock overlap`. Returns 0 when no overlap was found, 1 when
+/// at least one was reported, `Err` on usage / I/O errors.
+pub fn run_overlap(opts: OverlapOptions) -> Result<i32, String> {
+    // Config globs first, command-line ones appended: `--exclude`
+    // narrows further, it never re-opens what config excluded.
+    let cfg = Config::load_default()?;
+    let mut exclude_globs = cfg.clock.overlap.resolve_exclude_globs()?;
+    exclude_globs.extend(opts.exclude_globs.iter().cloned());
+
+    let t_total = Instant::now();
+    let files = resolve_input_files(&opts.paths, &exclude_globs)?;
+    debug!("scanning {} org file(s) for overlaps", files.len());
+
+    // ---- prepare the sorted interval list ------------------------
+    let t_prep = Instant::now();
+    let resolved = resolve_clocks(&files, &exclude_globs, opts.verify, opts.no_cache)?;
+    let intervals = intervals_from_root(&resolved.root);
+    let cache_timing = (!opts.no_cache).then_some(resolved.timing);
+    let diagnostics = resolved.diagnostics;
+    let prep = t_prep.elapsed();
+    debug!("prepared {} sorted CLOCK interval(s)", intervals.len());
+
+    for (file, diags) in &diagnostics {
+        for d in diags {
+            warn!(
+                "{}:{}: skipping non-canonical CLOCK ({}); run `clock check`",
+                file.display(),
+                d.line,
+                d.tag
+            );
+        }
+    }
+
+    // ---- find overlaps ---------------------------------------------
+    let t_sweep = Instant::now();
+    let pairs = find_overlaps_sorted(&intervals);
+    let sweep = t_sweep.elapsed();
+
+    // ---- render --------------------------------------------------
+    let t_render = Instant::now();
+    let mut writer = OverlapWriter::new(&opts);
+    let mut reported = 0usize;
+    let mut raw_lines = RawLineCache::default();
+    for p in &pairs {
+        let overlap = Overlap {
+            a: side(&intervals[p.a], &mut raw_lines),
+            b: side(&intervals[p.b], &mut raw_lines),
+            overlap_seconds: p.overlap_seconds,
+        };
+        writer.emit(&overlap).map_err(|e| e.to_string())?;
+        reported += 1;
+        if opts.first {
+            break;
+        }
+    }
+    writer.finish(reported).map_err(|e| e.to_string())?;
+    let render = t_render.elapsed();
+
+    if opts.timing {
+        report_timing(
+            files.len(),
+            intervals.len(),
+            pairs.len(),
+            prep,
+            cache_timing.as_ref(),
+            sweep,
+            render,
+            t_total.elapsed(),
+        );
+    }
+
+    Ok(if reported == 0 { 0 } else { 1 })
+}
+
+/// Resolve the sorted interval list through the shared projection and
+/// merge path, with either persistent or invocation-local storage.
+fn resolve_clocks(
+    files: &[PathBuf],
+    exclude_globs: &[String],
+    verify: bool,
+    no_cache: bool,
+) -> Result<Resolved, String> {
+    let mut cache = if no_cache {
+        ClockCache::in_memory()?
+    } else {
+        ClockCache::open(&clock_cache_path()?)?
+    };
+    // The exclusion set changes which files are members, but
+    // membership is already reflected in the bucket digests. Fold the
+    // globs in anyway so a root is never shared across scopes that
+    // could diverge in the future (e.g. per-scope filtering inside
+    // files).
+    let scope = exclude_globs.join("\0");
+    let mode = if verify || no_cache {
+        Verify::Bytes
+    } else {
+        Verify::Metadata
+    };
+    cache.resolve(files, scope.as_bytes(), mode)
+}
+
+/// Where the clock cache lives.
+///
+/// `ORG_CLI_CLOCK_CACHE` overrides the default; integration tests use
+/// it to keep every run isolated from the user's real cache and from
+/// each other.
+pub fn clock_cache_path() -> Result<PathBuf, String> {
+    if let Ok(p) = std::env::var("ORG_CLI_CLOCK_CACHE")
+        && !p.is_empty()
+    {
+        return Ok(PathBuf::from(p));
+    }
+    dirs::cache_dir()
+        .map(|d| d.join("org-cli").join("clock-cache.sqlite"))
+        .ok_or_else(|| "cannot determine cache directory".to_string())
+}
+
+/// Turn the cache's root blob into sweep input.
+///
+/// `raw` is left empty: the sweep does not need it and the cached
+/// list deliberately does not carry it. It is fetched lazily by the
+/// renderer for the (few) pairs that are actually reported.
+fn intervals_from_root(root: &crate::index::clock_blob::Blob) -> Vec<Interval> {
+    root.records
+        .iter()
+        .map(|r| Interval {
+            start: r.start,
+            end: r.end,
+            file: PathBuf::from(&root.strings[r.path_id as usize]),
+            line: r.line as usize,
+            raw: String::new(),
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_timing(
+    files: usize,
+    facts: usize,
+    pairs: usize,
+    prep: std::time::Duration,
+    cache: Option<&crate::index::clock_cache::Timing>,
+    sweep: std::time::Duration,
+    render: std::time::Duration,
+    total: std::time::Duration,
+) {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    eprintln!("timing (ms):");
+    match cache {
+        Some(t) => {
+            eprintln!("  validate   {:>9.2}", ms(t.validate));
+            eprintln!("  l1-miss    {:>9.2}", ms(t.l1_miss));
+            eprintln!("  l2         {:>9.2}", ms(t.l2));
+            eprintln!("  prep-total {:>9.2}", ms(prep));
+        }
+        None => eprintln!(
+            "  prep       {:>9.2}   (no cache: read+parse+sort)",
+            ms(prep)
+        ),
+    }
+    eprintln!(
+        "  sweep      {:>9.2}   <- finding overlapping segments",
+        ms(sweep)
+    );
+    eprintln!("  render     {:>9.2}", ms(render));
+    eprintln!("  total      {:>9.2}", ms(total));
+    eprintln!("counters:");
+    eprintln!("  files      {:>9}", files);
+    if let Some(t) = cache {
+        eprintln!("  l1-hits    {:>9}", t.l1_hits);
+        eprintln!("  l1-misses  {:>9}", t.l1_misses);
+        eprintln!("  buckets-rebuilt {:>4}", t.buckets_rebuilt);
+        eprintln!("  root-hit   {:>9}", t.root_hit);
+    }
+    eprintln!("  facts      {:>9}", facts);
+    eprintln!("  pairs      {:>9}", pairs);
+}
+
+fn side(iv: &Interval, raw_lines: &mut RawLineCache) -> OverlapSide {
+    OverlapSide {
+        file: iv.file.clone(),
+        line: iv.line,
+        start: format_instant(iv.start),
+        end: format_instant(iv.end),
+        raw: if iv.raw.is_empty() {
+            raw_lines.get(&iv.file, iv.line)
+        } else {
+            iv.raw.clone()
+        },
+    }
+}
+
+/// Per-run memo of source files read back for rendering.
+///
+/// The cached list deliberately omits raw CLOCK text, so a reported
+/// pair has to fetch it from disk. Overlaps cluster in a handful of
+/// files, so read each file once and index its lines; the cost is
+/// then `O(distinct files)` reads, not `O(pairs)`.
+#[derive(Default)]
+struct RawLineCache {
+    files: BTreeMap<PathBuf, Vec<String>>,
+}
+
+impl RawLineCache {
+    fn get(&mut self, file: &Path, line: usize) -> String {
+        let lines = self.files.entry(file.to_path_buf()).or_insert_with(|| {
+            fs::read_to_string(file)
+                .map(|c| c.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        });
+        lines
+            .get(line.saturating_sub(1))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Render a UTC-second instant as an RFC3339 UTC timestamp, so an
+/// overlap record can be joined against `clock list` output.
+fn format_instant(era_seconds: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_opt(era_seconds - era_to_unix_offset_seconds(), 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| format!("<instant {}>", era_seconds))
+}
+
+/// Seconds between the chrono *era* origin and the Unix epoch.
+///
+/// [`crate::org::clock::ClockLine::start_utc_seconds`] counts from
+/// the era (via `NaiveDate::num_days_from_ce`), not from 1970. The
+/// offset is derived from chrono rather than hardcoded so it cannot
+/// drift from the convention `num_days_from_ce` actually uses —
+/// which is 1-based, a detail easy to get wrong by one day.
+fn era_to_unix_offset_seconds() -> i64 {
+    use chrono::Datelike;
+    const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+    chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+        .expect("1970-01-01 is a valid date")
+        .num_days_from_ce() as i64
+        * SECONDS_PER_DAY
+}
+
+/// Render a duration in seconds as `H:MM:SS`, for human output.
+fn format_span(seconds: i64) -> String {
+    let h = seconds / 3600;
+    let m = (seconds % 3600) / 60;
+    let s = seconds % 60;
+    format!("{}:{:02}:{:02}", h, m, s)
+}
+
+/// Wraps stdout and selects the right serializer per CLI flags.
+struct OverlapWriter<'a> {
+    opts: &'a OverlapOptions,
+    stdout: io::BufWriter<io::Stdout>,
+}
+
+impl<'a> OverlapWriter<'a> {
+    fn new(opts: &'a OverlapOptions) -> Self {
+        Self {
+            opts,
+            stdout: io::BufWriter::new(io::stdout()),
+        }
+    }
+
+    fn emit(&mut self, o: &Overlap) -> io::Result<()> {
+        if self.opts.json {
+            let line = serde_json::to_string(o).map_err(|e| io::Error::other(e.to_string()))?;
+            writeln!(self.stdout, "{}", line)
+        } else if self.opts.nul {
+            // <a-file>\0<a-line>\0<b-file>\0<b-line>\0<seconds>\0
+            //   <a-raw>\0<b-raw>\0\0
+            write!(
+                self.stdout,
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}\0\0",
+                o.a.file.display(),
+                o.a.line,
+                o.b.file.display(),
+                o.b.line,
+                o.overlap_seconds,
+                o.a.raw,
+                o.b.raw,
+            )
+        } else {
+            writeln!(
+                self.stdout,
+                "{} {} {}\n  {}:{}\n    {}\n  {}:{}\n    {}",
+                "overlap".bright_red(),
+                "->".dimmed(),
+                format!("{} shared", format_span(o.overlap_seconds)).bright_yellow(),
+                o.a.file.display().to_string().bright_blue(),
+                o.a.line,
+                o.a.raw.trim().dimmed(),
+                o.b.file.display().to_string().bright_blue(),
+                o.b.line,
+                o.b.raw.trim().dimmed(),
+            )
+        }
+    }
+
+    fn finish(&mut self, count: usize) -> io::Result<()> {
+        if !self.opts.json && !self.opts.nul {
+            if count == 0 {
+                writeln!(self.stdout, "{}", "No overlapping CLOCK lines.".green())?;
+            } else {
+                writeln!(
+                    self.stdout,
+                    "\n{} {}",
+                    count.to_string().bright_red(),
+                    "overlapping CLOCK pair(s) found".bright_red(),
                 )?;
             }
         }
@@ -1202,6 +1578,198 @@ mod tests {
         let mut o = opts_for(vec![td.path().to_path_buf()]);
         o.exclude_globs.push(format!("{}/**", td.path().display()));
         assert_eq!(run_check(o).unwrap(), 0);
+    }
+
+    // ----- overlap -------------------------------------------------------
+
+    fn overlap_opts(paths: Vec<PathBuf>) -> OverlapOptions {
+        OverlapOptions {
+            paths,
+            exclude_globs: Vec::new(),
+            nul: false,
+            json: true, // json so output is unaffected by colors
+            first: false,
+            verify: false,
+            // Unit tests must not touch the user's real cache file.
+            no_cache: true,
+            timing: false,
+        }
+    }
+
+    #[test]
+    fn overlap_clean_corpus_returns_zero() {
+        let td = TempDir::new("ov-clean");
+        write(
+            &td.path().join("a.org"),
+            indoc! {"
+                * h
+                CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 11:00 +0100] =>  1:00
+                CLOCK: [2026-01-07 Wed 11:00 +0100]--[2026-01-07 Wed 12:00 +0100] =>  1:00
+            "},
+        );
+        assert_eq!(
+            run_overlap(overlap_opts(vec![td.path().to_path_buf()])).unwrap(),
+            0,
+            "adjacent clocks must not be reported"
+        );
+    }
+
+    #[test]
+    fn overlap_detects_conflicting_pair() {
+        let td = TempDir::new("ov-dirty");
+        write(
+            &td.path().join("a.org"),
+            indoc! {"
+                * h
+                CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 12:00 +0100] =>  2:00
+                CLOCK: [2026-01-07 Wed 11:00 +0100]--[2026-01-07 Wed 13:00 +0100] =>  2:00
+            "},
+        );
+        assert_eq!(
+            run_overlap(overlap_opts(vec![td.path().to_path_buf()])).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn overlap_skips_non_canonical_lines() {
+        // A line missing its TZ cannot be placed on a timeline; it
+        // must be skipped, not abort the run, and the remaining
+        // clean pair must still be reported.
+        let td = TempDir::new("ov-skip");
+        write(
+            &td.path().join("a.org"),
+            indoc! {"
+                * h
+                CLOCK: [2026-01-07 Wed 09:57]--[2026-01-07 Wed 12:19] =>  2:22
+                CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 12:00 +0100] =>  2:00
+                CLOCK: [2026-01-07 Wed 11:00 +0100]--[2026-01-07 Wed 13:00 +0100] =>  2:00
+            "},
+        );
+        assert_eq!(
+            run_overlap(overlap_opts(vec![td.path().to_path_buf()])).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn overlap_running_clock_is_ignored() {
+        let td = TempDir::new("ov-running");
+        write(
+            &td.path().join("a.org"),
+            indoc! {"
+                * h
+                CLOCK: [2026-01-07 Wed 10:00 +0100]
+                CLOCK: [2026-01-07 Wed 10:30 +0100]--[2026-01-07 Wed 12:00 +0100] =>  1:30
+            "},
+        );
+        assert_eq!(
+            run_overlap(overlap_opts(vec![td.path().to_path_buf()])).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn overlap_excludes_globs() {
+        let td = TempDir::new("ov-exclude");
+        write(
+            &td.path().join("skip/a.org"),
+            indoc! {"
+                * h
+                CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 12:00 +0100] =>  2:00
+                CLOCK: [2026-01-07 Wed 11:00 +0100]--[2026-01-07 Wed 13:00 +0100] =>  2:00
+            "},
+        );
+        let mut o = overlap_opts(vec![td.path().to_path_buf()]);
+        assert_eq!(
+            run_overlap(o.clone()).unwrap(),
+            1,
+            "sanity: it does overlap"
+        );
+        o.exclude_globs
+            .push(format!("{}/skip/**", td.path().display()));
+        assert_eq!(run_overlap(o).unwrap(), 0, "excluded file must not count");
+    }
+
+    #[test]
+    fn overlap_first_stops_after_one() {
+        let td = TempDir::new("ov-first");
+        // Three mutually-overlapping clocks → 3 pairs; --first
+        // must still exit 1 having emitted only one.
+        write(
+            &td.path().join("a.org"),
+            indoc! {"
+                * h
+                CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 13:00 +0100] =>  3:00
+                CLOCK: [2026-01-07 Wed 11:00 +0100]--[2026-01-07 Wed 14:00 +0100] =>  3:00
+                CLOCK: [2026-01-07 Wed 12:00 +0100]--[2026-01-07 Wed 15:00 +0100] =>  3:00
+            "},
+        );
+        let mut o = overlap_opts(vec![td.path().to_path_buf()]);
+        o.first = true;
+        assert_eq!(run_overlap(o).unwrap(), 1);
+    }
+
+    #[test]
+    fn overlap_across_timezones_uses_instants() {
+        // Same wall-clock text, different offsets: 09:30+0800 is
+        // 01:30Z, 09:30+0200 is 07:30Z — six hours apart, no
+        // overlap despite the identical-looking times.
+        let td = TempDir::new("ov-tz");
+        write(
+            &td.path().join("a.org"),
+            indoc! {"
+                * h
+                CLOCK: [2026-01-07 Wed 09:30 +0800]--[2026-01-07 Wed 10:30 +0800] =>  1:00
+                CLOCK: [2026-01-07 Wed 09:30 +0200]--[2026-01-07 Wed 10:30 +0200] =>  1:00
+            "},
+        );
+        assert_eq!(
+            run_overlap(overlap_opts(vec![td.path().to_path_buf()])).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn format_instant_matches_clock_list_rendering() {
+        // Regression guard: `num_days_from_ce` is 1-based, so the
+        // era→Unix offset is easy to get wrong by exactly one day.
+        // `[2026-01-07 Wed 10:00 +0100]` is 09:00 UTC that day.
+        let p = parse_clock_line(
+            "CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 12:00 +0100] =>  2:00",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            format_instant(p.line.start_utc_seconds()),
+            "2026-01-07T09:00:00Z"
+        );
+        assert_eq!(
+            format_instant(p.line.end_utc_seconds()),
+            "2026-01-07T11:00:00Z"
+        );
+    }
+
+    #[test]
+    fn format_instant_handles_pre_epoch_dates() {
+        // The corpus contains a 1978 CLOCK line; negative Unix
+        // instants must render as real dates, not a fallback.
+        let p = parse_clock_line(
+            "CLOCK: [1978-04-17 Mon 08:00 +0100]--[1978-04-17 Mon 09:00 +0100] =>  1:00",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            format_instant(p.line.start_utc_seconds()),
+            "1978-04-17T07:00:00Z"
+        );
+    }
+
+    #[test]
+    fn format_span_renders_hours_minutes_seconds() {
+        assert_eq!(format_span(3600), "1:00:00");
+        assert_eq!(format_span(5430), "1:30:30");
+        assert_eq!(format_span(59), "0:00:59");
     }
 
     // ----- fix --------------------------------------------------

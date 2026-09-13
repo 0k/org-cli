@@ -1,0 +1,63 @@
+#+TITLE: Non-overlapping CLOCK lines
+
+Every CLOCK line here is canonical AND no two of them share an
+instant. ``clock overlap`` must report nothing and exit 0.
+
+* Back-to-back tasks
+:PROPERTIES:
+:TASK_REF: 1
+:END:
+:LOGBOOK:
+CLOCK: [2026-01-07 Wed 09:00 +0100]--[2026-01-07 Wed 10:00 +0100] =>  1:00
+CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 11:00 +0100] =>  1:00
+CLOCK: [2026-01-07 Wed 11:00 +0100]--[2026-01-07 Wed 12:00 +0100] =>  1:00
+:END:
+
+Adjacency is the normal clock-out/clock-in shape: the shared
+boundary instant belongs to neither interval.
+
+* Separated by gaps
+:PROPERTIES:
+:TASK_REF: 2
+:END:
+:LOGBOOK:
+CLOCK: [2026-01-07 Wed 14:00 +0100]--[2026-01-07 Wed 15:30 +0100] =>  1:30
+CLOCK: [2026-01-07 Wed 16:00 +0100]--[2026-01-07 Wed 17:00 +0100] =>  1:00
+:END:
+
+* Same wall-clock text, different zones
+:PROPERTIES:
+:TASK_REF: 3
+:END:
+:LOGBOOK:
+CLOCK: [2026-01-08 Thu 09:30 +0800]--[2026-01-08 Thu 10:30 +0800] =>  1:00
+CLOCK: [2026-01-08 Thu 09:30 +0100]--[2026-01-08 Thu 10:30 +0100] =>  1:00
+:END:
+
+These look identical but are seven hours apart as instants
+(01:30Z versus 08:30Z), so they do not overlap.
+
+* Zero-length clock inside a long one
+:PROPERTIES:
+:TASK_REF: 4
+:END:
+:LOGBOOK:
+CLOCK: [2026-01-09 Fri 09:00 +0100]--[2026-01-09 Fri 18:00 +0100] =>  9:00
+CLOCK: [2026-01-09 Fri 12:00 +0100]--[2026-01-09 Fri 12:00 +0100] =>  0:00
+:END:
+
+A zero-length interval spans no instant, so it cannot conflict
+with anything. Whether it is *meaningful* is another rule's
+problem.
+
+* Running clock, ignored entirely
+:PROPERTIES:
+:TASK_REF: 5
+:END:
+:LOGBOOK:
+CLOCK: [2026-01-10 Sat 09:00 +0100]
+CLOCK: [2026-01-10 Sat 09:30 +0100]--[2026-01-10 Sat 10:30 +0100] =>  1:00
+:END:
+
+An open range has no end instant and is skipped, so it never
+conflicts with the closed clock that follows it.

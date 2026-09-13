@@ -6,6 +6,8 @@
 pub mod ast;
 pub mod clock;
 pub mod clock_add;
+pub mod clock_overlap;
+pub mod clock_project;
 pub mod filter;
 pub mod heading;
 pub mod heading_edit;

@@ -93,6 +93,62 @@ org-cli clock list -f "billing" -i --has-property TASK_REF -j path/
 With no heading filter, NDJSON output is byte-identical to the
 pre-filter shape — existing consumers are unaffected.
 
+** =clock overlap= — find CLOCK lines covering the same instant
+
+Every =clock check= rule applies to a single line. =clock overlap= is
+the one cross-entry rule: it compares each clean CLOCK entry against
+every other one across the whole corpus, because you cannot be doing
+two things at the same time.
+
+Intervals are *half-open* =[start, end)=: =10:00–11:00= and
+=11:00–12:00= are adjacent, not overlapping — that is exactly the
+shape clocking out of one task and into the next produces. A
+zero-length =⇒ 0:00= clock spans no instant and never conflicts.
+Comparison uses true instants, so =09:30 +0800= and =09:30 +0200= are
+correctly seen as six hours apart.
+
+#+begin_src bash
+# Whole agenda set (exit 1 if any overlap is found)
+org-cli clock overlap
+
+# A subtree, as NDJSON
+org-cli clock overlap -j path/
+
+# Stop at the first conflicting pair
+org-cli clock overlap -1 path/
+#+end_src
+
+Lines that fail =clock check= are skipped with a warning rather than
+aborting the run: a line whose own timestamps are broken cannot be
+placed on a timeline, but the rest still can. Run =clock check= first
+for a corpus that is clean line-by-line.
+
+*** Declaring which CLOCK lines are work logs
+
+Not every CLOCK line records time spent working. Files matching
+=clock.overlap.exclude-globs= contribute no intervals:
+
+#+begin_src yaml
+clock:
+  overlap:
+    exclude-globs:
+      - ~/notes/activity/**    # activity segments
+      - ~/notes/presence/**   # presence windows
+#+end_src
+
+The two classes above are *evidence*, not work logs: segment files are
+the raw material a work log is written from, and a presence window is
+one CLOCK per stay in a place — routinely months long, so it overlaps
+essentially every work clock by construction.
+
+A leading =~/= is expanded to the home directory. The =--exclude= flag
+adds to this list rather than replacing it.
+
+NDJSON records carry =a= and =b= (each with =file=, =line=, =start=,
+=end=, =raw=) plus =overlap_seconds=; =a= is always the
+earlier-starting side. NUL records use
+=a_file\0a_line\0b_file\0b_line\0seconds\0a_raw\0b_raw\0\0=.
+
 ** =heading= — edit headings (set / add / delete / move)
 
 Edit org-mode headings in place. A target heading is addressed either

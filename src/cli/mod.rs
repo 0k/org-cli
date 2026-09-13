@@ -138,6 +138,32 @@ pub fn run() -> Result<(), String> {
                 }
                 Ok(())
             }
+            def::ClockCommands::Overlap {
+                paths,
+                exclude_globs,
+                nul,
+                json,
+                first,
+                verify,
+                no_cache,
+                timing,
+            } => {
+                let opts = action::clock::OverlapOptions {
+                    paths,
+                    exclude_globs,
+                    nul,
+                    json,
+                    first,
+                    verify,
+                    no_cache,
+                    timing,
+                };
+                let exit_code = action::clock::run_overlap(opts)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
             def::ClockCommands::Fix {
                 paths,
                 exclude_globs,

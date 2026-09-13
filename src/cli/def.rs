@@ -427,6 +427,65 @@ pub enum ClockCommands {
         first: bool,
     },
 
+    /// Report pairs of CLOCK lines that cover the same instant.
+    ///
+    /// Unlike ``clock check``, whose rules each apply to a single
+    /// line, this compares every clean CLOCK entry against every
+    /// other one across the whole corpus — you cannot be doing two
+    /// things at the same time, so any overlap is a bookkeeping
+    /// error somewhere.
+    ///
+    /// Intervals are half-open: ``10:00-11:00`` and ``11:00-12:00``
+    /// are adjacent, NOT overlapping, since that is exactly what
+    /// clocking out of one task and into the next produces.
+    ///
+    /// Lines that fail ``clock check`` are skipped with a warning
+    /// (a line whose own timestamps are broken cannot be placed on
+    /// a timeline). Run ``clock check`` first for a clean corpus.
+    ///
+    /// Files matching ``clock.overlap.exclude-globs`` in the config
+    /// contribute no intervals — that is where CLOCK lines which
+    /// record evidence rather than work (activity segments,
+    /// presence windows) are declared. ``--exclude`` adds to that
+    /// list rather than replacing it.
+    Overlap {
+        /// Files or directories to scan. When omitted, the agenda
+        /// set is read from
+        /// `~/.cache/emacs/org-collect/org-agenda-files.tmp`.
+        paths: Vec<std::path::PathBuf>,
+
+        /// Glob patterns matched against candidate file paths;
+        /// matching files are skipped. Repeatable. Added to the
+        /// configured `clock.overlap.exclude-globs`.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude_globs: Vec<String>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per overlapping pair).
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Stop at the first overlapping pair.
+        #[arg(short = '1', long)]
+        first: bool,
+
+        /// Re-read and hash every file instead of trusting size+mtime.
+        /// Slower, but immune to edits that preserve metadata.
+        #[arg(long)]
+        verify: bool,
+
+        /// Bypass the cache: read and parse every file from scratch.
+        #[arg(long = "no-cache")]
+        no_cache: bool,
+
+        /// Print a phase-by-phase timing breakdown on stderr.
+        #[arg(long)]
+        timing: bool,
+    },
+
     /// Apply mechanical fixes to CLOCK lines: rewrite the weekday
     /// token from the date (normalising French abbreviations like
     /// ``mer.`` to English ``Wed``), and recompute the

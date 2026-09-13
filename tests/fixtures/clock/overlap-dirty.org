@@ -1,0 +1,50 @@
+#+TITLE: Overlapping CLOCK lines
+
+Every CLOCK line here is individually canonical (``clock check``
+passes) but several pairs cover the same instant, so
+``clock overlap`` must report them and exit 1.
+
+* Partial overlap
+:PROPERTIES:
+:TASK_REF: 10
+:END:
+:LOGBOOK:
+CLOCK: [2026-02-02 Mon 10:00 +0100]--[2026-02-02 Mon 12:00 +0100] =>  2:00
+CLOCK: [2026-02-02 Mon 11:00 +0100]--[2026-02-02 Mon 13:00 +0100] =>  2:00
+:END:
+
+One hour shared: 11:00 to 12:00.
+
+* Full containment
+:PROPERTIES:
+:TASK_REF: 11
+:END:
+:LOGBOOK:
+CLOCK: [2026-02-03 Tue 09:00 +0100]--[2026-02-03 Tue 18:00 +0100] =>  9:00
+CLOCK: [2026-02-03 Tue 12:00 +0100]--[2026-02-03 Tue 13:00 +0100] =>  1:00
+:END:
+
+The inner hour is entirely inside the outer day.
+
+* Exact duplicate
+:PROPERTIES:
+:TASK_REF: 12
+:END:
+:LOGBOOK:
+CLOCK: [2026-02-04 Wed 14:00 +0100]--[2026-02-04 Wed 15:00 +0100] =>  1:00
+CLOCK: [2026-02-04 Wed 14:00 +0100]--[2026-02-04 Wed 15:00 +0100] =>  1:00
+:END:
+
+The same hour logged twice.
+
+* Overlap across a timezone change
+:PROPERTIES:
+:TASK_REF: 13
+:END:
+:LOGBOOK:
+CLOCK: [2026-02-05 Thu 08:00 +0100]--[2026-02-05 Thu 10:00 +0100] =>  2:00
+CLOCK: [2026-02-05 Thu 15:30 +0800]--[2026-02-05 Thu 17:00 +0800] =>  1:30
+:END:
+
+07:00Z-09:00Z against 07:30Z-09:00Z: the local times look
+unrelated, but the instants collide for ninety minutes.

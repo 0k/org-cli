@@ -10,6 +10,10 @@
 //!   accepted-zones:
 //!     - Europe/Paris
 //!     - Asia/Shanghai
+//!   overlap:
+//!     exclude-globs:
+//!       - ~/notes/activity/**
+//!       - ~/notes/presence/**
 //! todos:
 //!   db-path: ~/.cache/org-cli/todos.sqlite
 //!   serve-addr: 127.0.0.1:7480
@@ -41,6 +45,57 @@ pub struct ClockConfig {
     /// these zones at the line's instant.
     #[serde(default, rename = "accepted-zones")]
     pub accepted_zones: Vec<String>,
+    /// Settings for the cross-entry `clock overlap` check.
+    #[serde(default)]
+    pub overlap: OverlapConfig,
+}
+
+/// `clock.overlap:` sub-section of the config.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OverlapConfig {
+    /// Glob patterns matched against candidate file paths; matching
+    /// files contribute no intervals to the overlap check.
+    ///
+    /// This is where the *work log* versus *evidence* distinction
+    /// gets declared. Not every CLOCK line records time spent
+    /// working:
+    ///
+    /// - `activity/**` holds generated activity segments — the
+    ///   raw material a work log is written *from*, not a work log.
+    /// - `presence/**` holds presence windows: one CLOCK per
+    ///   stay in a place, routinely months long. Such a line
+    ///   overlaps essentially every work clock by construction.
+    ///
+    /// Left empty, no file is excluded and the check still runs —
+    /// it just reports the evidence-versus-work collisions too.
+    ///
+    /// A leading `~/` is expanded to the user's home directory.
+    #[serde(default, rename = "exclude-globs")]
+    pub exclude_globs: Vec<String>,
+}
+
+impl OverlapConfig {
+    /// The configured globs with a leading `~/` expanded against the
+    /// user's home directory.
+    ///
+    /// Expansion happens here rather than at glob-compile time so
+    /// the raw config value stays exactly what the user typed, and
+    /// so a missing home directory is an error the caller can
+    /// report instead of a silently unexpanded pattern that would
+    /// quietly match nothing.
+    pub fn resolve_exclude_globs(&self) -> Result<Vec<String>, String> {
+        self.exclude_globs
+            .iter()
+            .map(|g| match g.strip_prefix("~/") {
+                Some(rest) => {
+                    let home = dirs::home_dir()
+                        .ok_or_else(|| format!("cannot expand {:?}: no home directory", g))?;
+                    Ok(home.join(rest).to_string_lossy().into_owned())
+                }
+                None => Ok(g.clone()),
+            })
+            .collect()
+    }
 }
 
 impl ClockConfig {
@@ -205,6 +260,7 @@ mod tests {
     fn resolve_zones_ok() {
         let cfg = ClockConfig {
             accepted_zones: vec!["Europe/Paris".into(), "Asia/Shanghai".into()],
+            ..Default::default()
         };
         let zones = cfg.resolve_zones().unwrap();
         assert_eq!(zones.len(), 2);
@@ -214,9 +270,114 @@ mod tests {
     fn resolve_zones_rejects_unknown() {
         let cfg = ClockConfig {
             accepted_zones: vec!["Europe/Paris".into(), "Mars/Olympus".into()],
+            ..Default::default()
         };
         let err = cfg.resolve_zones().unwrap_err();
         assert!(err.contains("Mars/Olympus"), "got: {}", err);
+    }
+
+    // ----- clock.overlap ------------------------------------------------
+
+    #[test]
+    fn overlap_exclude_globs_default_to_empty() {
+        let c = Config::default();
+        assert!(c.clock.overlap.exclude_globs.is_empty());
+        assert!(c.clock.overlap.resolve_exclude_globs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_dash_cased_overlap_exclude_globs() {
+        let p = write_temp(
+            "overlap",
+            concat!(
+                "clock:\n",
+                "  overlap:\n",
+                "    exclude-globs:\n",
+                "      - /abs/path/**\n",
+                "      - ~/notes/activity/**\n",
+            ),
+        );
+        let c = Config::load_from(&p).unwrap();
+        assert_eq!(
+            c.clock.overlap.exclude_globs,
+            vec![
+                "/abs/path/**".to_string(),
+                "~/notes/activity/**".to_string()
+            ]
+        );
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn overlap_coexists_with_accepted_zones() {
+        let p = write_temp(
+            "overlap-and-zones",
+            concat!(
+                "clock:\n",
+                "  accepted-zones:\n",
+                "    - Europe/Paris\n",
+                "  overlap:\n",
+                "    exclude-globs:\n",
+                "      - /x/**\n",
+            ),
+        );
+        let c = Config::load_from(&p).unwrap();
+        assert_eq!(c.clock.accepted_zones, vec!["Europe/Paris".to_string()]);
+        assert_eq!(c.clock.overlap.exclude_globs, vec!["/x/**".to_string()]);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn rejects_underscore_overlap_key() {
+        // ``exclude_globs`` (underscored) must be ignored; the
+        // schema demands ``exclude-globs``.
+        let p = write_temp(
+            "overlap-underscore",
+            "clock:\n  overlap:\n    exclude_globs:\n      - /x/**\n",
+        );
+        let c = Config::load_from(&p).unwrap();
+        assert!(c.clock.overlap.exclude_globs.is_empty());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn resolve_exclude_globs_expands_leading_tilde() {
+        let cfg = OverlapConfig {
+            exclude_globs: vec!["~/notes/activity/**".into()],
+        };
+        let resolved = cfg.resolve_exclude_globs().unwrap();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                home.join("notes/activity/**")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_exclude_globs_leaves_absolute_paths_alone() {
+        let cfg = OverlapConfig {
+            exclude_globs: vec!["/abs/**".into(), "relative/**".into()],
+        };
+        let resolved = cfg.resolve_exclude_globs().unwrap();
+        assert_eq!(
+            resolved,
+            vec!["/abs/**".to_string(), "relative/**".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_exclude_globs_does_not_expand_bare_tilde_word() {
+        // Only a ``~/`` prefix is a home reference; ``~foo`` is a
+        // literal path component and must survive untouched.
+        let cfg = OverlapConfig {
+            exclude_globs: vec!["~backup/**".into()],
+        };
+        let resolved = cfg.resolve_exclude_globs().unwrap();
+        assert_eq!(resolved, vec!["~backup/**".to_string()]);
     }
 
     #[test]

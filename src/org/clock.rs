@@ -43,6 +43,23 @@ pub struct ClockLine {
     pub has_seconds: bool,
 }
 
+impl ClockLine {
+    /// Start instant as seconds since the chrono epoch, in UTC.
+    ///
+    /// Exposed so cross-entry rules (see
+    /// [`crate::org::clock_overlap`]) compare true instants rather
+    /// than rendered local times: `09:30 +0800` and `09:30 +0200`
+    /// look alike but are six hours apart.
+    pub fn start_utc_seconds(&self) -> i64 {
+        utc_seconds(&self.start)
+    }
+
+    /// End instant as seconds since the chrono epoch, in UTC.
+    pub fn end_utc_seconds(&self) -> i64 {
+        utc_seconds(&self.end)
+    }
+}
+
 /// A parsed CLOCK line plus the list of semantic violations
 /// observed on it (possibly empty).
 #[derive(Debug, Clone, PartialEq, Eq)]

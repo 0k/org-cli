@@ -15,6 +15,8 @@
 //! and headings from one content value. This module never reimplements that
 //! derivation.
 
+pub mod clock_blob;
+pub mod clock_cache;
 mod store;
 
 pub use store::{TodoEvent, TodoQuery, TodoRecord, TodoStore, records_from_snapshot};

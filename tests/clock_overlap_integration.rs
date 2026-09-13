@@ -6,6 +6,7 @@
 //! `src/cli/action/clock.rs::tests` by catching CLI wiring issues:
 //! flag parsing, exit codes, and the three output formats.
 
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,6 +79,65 @@ fn run_with_cache(cache: &TempDir, args: &[&str]) -> (Option<i32>, String, Strin
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+fn write_sort_fixture(td: &TempDir) -> PathBuf {
+    let file = td.path().join("sort.org");
+    write(
+        &file,
+        indoc! {"
+            * Nested clocks
+            CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 18:00 +0100] =>  8:00
+            CLOCK: [2026-01-07 Wed 11:00 +0100]--[2026-01-07 Wed 14:00 +0100] =>  3:00
+            CLOCK: [2026-01-07 Wed 12:00 +0100]--[2026-01-07 Wed 17:00 +0100] =>  5:00
+            CLOCK: [2026-01-07 Wed 13:00 +0100]--[2026-01-07 Wed 15:00 +0100] =>  2:00
+        "},
+    );
+    file
+}
+
+fn json_records(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON line"))
+        .collect()
+}
+
+fn pair_ids(records: &[serde_json::Value]) -> Vec<(u64, u64)> {
+    records
+        .iter()
+        .map(|record| {
+            (
+                record["a"]["line"].as_u64().unwrap(),
+                record["b"]["line"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn record_field_cmp(a: &serde_json::Value, b: &serde_json::Value, field: &str) -> Ordering {
+    match field {
+        "start" => a["b"]["start"]
+            .as_str()
+            .unwrap()
+            .cmp(b["b"]["start"].as_str().unwrap()),
+        "end" => {
+            let a_end = a["a"]["end"]
+                .as_str()
+                .unwrap()
+                .min(a["b"]["end"].as_str().unwrap());
+            let b_end = b["a"]["end"]
+                .as_str()
+                .unwrap()
+                .min(b["b"]["end"].as_str().unwrap());
+            a_end.cmp(b_end)
+        }
+        "duration" => a["overlap_seconds"]
+            .as_i64()
+            .unwrap()
+            .cmp(&b["overlap_seconds"].as_i64().unwrap()),
+        _ => unreachable!("test field is known"),
+    }
 }
 
 // ----- fixtures ---------------------------------------------------------
@@ -327,6 +387,142 @@ fn first_flag_emits_a_single_record() {
     let (code, stdout, _) = run(&[td.path().to_str().unwrap(), "-j", "-1"]);
     assert_eq!(code, Some(1));
     assert_eq!(stdout.lines().count(), 1, "--first must emit one record");
+}
+
+#[test]
+fn no_sort_preserves_detector_order() {
+    let td = TempDir::new("sort-default");
+    let file = write_sort_fixture(&td);
+    let (code, stdout, stderr) = run(&[file.to_str().unwrap(), "-j"]);
+
+    assert_eq!(code, Some(1), "stderr={stderr}");
+    assert_eq!(
+        pair_ids(&json_records(&stdout)),
+        vec![(2, 3), (2, 4), (3, 4), (2, 5), (3, 5), (4, 5)]
+    );
+}
+
+#[test]
+fn sort_fields_support_implicit_and_explicit_directions() {
+    let td = TempDir::new("sort-fields");
+    let file = write_sort_fixture(&td);
+    let path = file.to_str().unwrap();
+
+    for field in ["start", "end", "duration"] {
+        let implicit = run(&[path, "-j", "--sort", field]);
+        let explicit_asc = run(&[path, "-j", "--sort", &format!("{field}:asc")]);
+        assert_eq!(implicit.0, Some(1), "field={field}: {}", implicit.2);
+        assert_eq!(implicit.1, explicit_asc.1, "field={field}");
+        let records = json_records(&implicit.1);
+        assert!(
+            records
+                .windows(2)
+                .all(|pair| record_field_cmp(&pair[0], &pair[1], field) != Ordering::Greater),
+            "{field}:asc output={}",
+            implicit.1
+        );
+
+        let descending = format!("{field}:desc");
+        let desc = run(&[path, "-j", "--sort", &descending]);
+        assert_eq!(desc.0, Some(1), "field={field}: {}", desc.2);
+        let records = json_records(&desc.1);
+        assert!(
+            records
+                .windows(2)
+                .all(|pair| record_field_cmp(&pair[0], &pair[1], field) != Ordering::Less),
+            "{field}:desc output={}",
+            desc.1
+        );
+    }
+}
+
+#[test]
+fn repeated_sort_keys_are_lexicographic_and_stable() {
+    let td = TempDir::new("sort-multi");
+    let file = write_sort_fixture(&td);
+    let (_, stdout, _) = run(&[
+        file.to_str().unwrap(),
+        "-j",
+        "--sort",
+        "start",
+        "--sort",
+        "duration:desc",
+    ]);
+
+    assert_eq!(
+        pair_ids(&json_records(&stdout)),
+        vec![(2, 3), (2, 4), (3, 4), (2, 5), (4, 5), (3, 5)]
+    );
+}
+
+#[test]
+fn first_is_applied_after_sorting() {
+    let td = TempDir::new("sort-first");
+    let file = write_sort_fixture(&td);
+    let (code, stdout, stderr) = run(&[
+        file.to_str().unwrap(),
+        "-j",
+        "--sort",
+        "duration",
+        "--first",
+    ]);
+
+    assert_eq!(code, Some(1), "stderr={stderr}");
+    assert_eq!(pair_ids(&json_records(&stdout)), vec![(3, 5)]);
+}
+
+#[test]
+fn sorted_order_is_consistent_across_output_modes() {
+    let td = TempDir::new("sort-formats");
+    let file = write_sort_fixture(&td);
+    let path = file.to_str().unwrap();
+    let expected = vec![(3, 5), (3, 4), (2, 5), (4, 5), (2, 3), (2, 4)];
+
+    let (_, json, _) = run(&[path, "-j", "--sort", "duration"]);
+    assert_eq!(pair_ids(&json_records(&json)), expected);
+
+    let (_, nul, _) = run(&[path, "-0", "--sort", "duration"]);
+    let nul_pairs: Vec<(u64, u64)> = nul
+        .split("\0\0")
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let fields: Vec<&str> = record.split('\0').collect();
+            (fields[1].parse().unwrap(), fields[3].parse().unwrap())
+        })
+        .collect();
+    assert_eq!(nul_pairs, expected);
+
+    let (_, human, _) = run(&[path, "--sort", "duration"]);
+    let location_prefix = format!("{}:", file.display());
+    let locations: Vec<u64> = human
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(&location_prefix))
+        .map(|line| line.parse().unwrap())
+        .collect();
+    let human_pairs: Vec<(u64, u64)> = locations
+        .chunks_exact(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect();
+    assert_eq!(human_pairs, expected);
+}
+
+#[test]
+fn invalid_sort_field_and_direction_are_actionable_clap_errors() {
+    let td = TempDir::new("sort-invalid");
+    let file = write_sort_fixture(&td);
+    let path = file.to_str().unwrap();
+
+    let (code, _, stderr) = run(&[path, "--sort", "when"]);
+    assert_eq!(code, Some(2), "stderr={stderr}");
+    for expected in ["when", "start", "end", "duration"] {
+        assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
+    }
+
+    let (code, _, stderr) = run(&[path, "--sort", "start:up"]);
+    assert_eq!(code, Some(2), "stderr={stderr}");
+    for expected in ["up", "asc", "desc"] {
+        assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
+    }
 }
 
 #[test]

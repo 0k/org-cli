@@ -116,7 +116,19 @@ org-cli clock overlap -j path/
 
 # Stop at the first conflicting pair
 org-cli clock overlap -1 path/
+
+# Shortest shared span first; for ties, latest shared start first
+org-cli clock overlap --sort duration --sort start:desc path/
 #+end_src
+
+=--sort FIELD[:asc|desc]= orders results by the shared overlap span.
+Fields are =start= (the later CLOCK start), =end= (the earlier CLOCK
+end), and =duration= (the shared seconds); direction defaults to
+=asc=. The option is repeatable, with earlier keys taking precedence.
+Sorting is stable, so records tied on every requested key retain their
+detector order. Without =--sort=, detector order is unchanged.
+=--first= is applied after sorting, and human, NUL, and NDJSON output
+all use the same resulting order.
 
 Lines that fail =clock check= are skipped with a warning rather than
 aborting the run: a line whose own timestamps are broken cannot be

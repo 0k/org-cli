@@ -8,10 +8,12 @@
 //! `--exclude` globs, formats violations, and prints the canonical
 //! line for `fmt`.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Instant;
 
 #[cfg(test)]
@@ -330,12 +332,70 @@ pub struct OverlapOptions {
     pub nul: bool,
     pub json: bool,
     pub first: bool,
+    /// Ordered presentation keys. Empty preserves detector order.
+    pub sort: Vec<OverlapSort>,
     /// Re-read and hash every file instead of trusting metadata.
     pub verify: bool,
     /// Bypass the cache entirely (read + parse everything).
     pub no_cache: bool,
     /// Print a phase-by-phase timing breakdown on stderr.
     pub timing: bool,
+}
+
+/// One user-selected ordering key for an overlap result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlapSort {
+    field: OverlapSortField,
+    direction: SortDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlapSortField {
+    Start,
+    End,
+    Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDirection {
+    Asc,
+    Desc,
+}
+
+impl FromStr for OverlapSort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (field, direction) = match value.split_once(':') {
+            Some((field, direction)) if !direction.contains(':') => (field, direction),
+            Some(_) => {
+                return Err(format!(
+                    "invalid sort value `{value}`; expected FIELD[:asc|desc]"
+                ));
+            }
+            None => (value, "asc"),
+        };
+        let field = match field {
+            "start" => OverlapSortField::Start,
+            "end" => OverlapSortField::End,
+            "duration" => OverlapSortField::Duration,
+            _ => {
+                return Err(format!(
+                    "invalid sort field `{field}`; expected one of: start, end, duration"
+                ));
+            }
+        };
+        let direction = match direction {
+            "asc" => SortDirection::Asc,
+            "desc" => SortDirection::Desc,
+            _ => {
+                return Err(format!(
+                    "invalid sort direction `{direction}`; expected asc or desc"
+                ));
+            }
+        };
+        Ok(Self { field, direction })
+    }
 }
 
 /// One end of an overlapping pair, as reported to the user.
@@ -395,7 +455,10 @@ pub fn run_overlap(opts: OverlapOptions) -> Result<i32, String> {
 
     // ---- find overlaps ---------------------------------------------
     let t_sweep = Instant::now();
-    let pairs = find_overlaps_sorted(&intervals);
+    let mut pairs = find_overlaps_sorted(&intervals);
+    if !opts.sort.is_empty() {
+        pairs.sort_by(|a, b| compare_overlap_pairs(a, b, &intervals, &opts.sort));
+    }
     let sweep = t_sweep.elapsed();
 
     // ---- render --------------------------------------------------
@@ -432,6 +495,35 @@ pub fn run_overlap(opts: OverlapOptions) -> Result<i32, String> {
     }
 
     Ok(if reported == 0 { 0 } else { 1 })
+}
+
+fn compare_overlap_pairs(
+    a: &crate::org::clock_overlap::OverlapPair,
+    b: &crate::org::clock_overlap::OverlapPair,
+    intervals: &[Interval],
+    sort: &[OverlapSort],
+) -> Ordering {
+    for key in sort {
+        let ordering = match key.field {
+            OverlapSortField::Start => intervals[a.a]
+                .start
+                .max(intervals[a.b].start)
+                .cmp(&intervals[b.a].start.max(intervals[b.b].start)),
+            OverlapSortField::End => intervals[a.a]
+                .end
+                .min(intervals[a.b].end)
+                .cmp(&intervals[b.a].end.min(intervals[b.b].end)),
+            OverlapSortField::Duration => a.overlap_seconds.cmp(&b.overlap_seconds),
+        };
+        let ordering = match key.direction {
+            SortDirection::Asc => ordering,
+            SortDirection::Desc => ordering.reverse(),
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
 }
 
 /// Resolve the sorted interval list through the shared projection and
@@ -1723,6 +1815,7 @@ mod tests {
             nul: false,
             json: true, // json so output is unaffected by colors
             first: false,
+            sort: Vec::new(),
             verify: false,
             // Unit tests must not touch the user's real cache file.
             no_cache: true,

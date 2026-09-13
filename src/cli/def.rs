@@ -484,6 +484,11 @@ pub enum ClockCommands {
         #[arg(short = '1', long)]
         first: bool,
 
+        /// Sort by a shared-overlap field. Repeatable; earlier keys
+        /// take precedence. DIRECTION defaults to `asc`.
+        #[arg(long, value_name = "FIELD[:asc|desc]")]
+        sort: Vec<crate::cli::action::clock::OverlapSort>,
+
         /// Re-read and hash every file instead of trusting size+mtime.
         /// Slower, but immune to edits that preserve metadata.
         #[arg(long)]

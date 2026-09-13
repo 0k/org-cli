@@ -382,3 +382,135 @@ fn fmt_round_trips_through_check() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ----- orgize-driven discovery ------------------------------------------
+
+fn scratch(tag: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "org-cli-clock-it-{}-{}-{}",
+        tag,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+/// `--first` must stop after ONE emitted record, even when the first
+/// offending line carries several violations.
+#[test]
+fn check_first_emits_a_single_record() {
+    let dir = scratch("first");
+    std::fs::write(
+        dir.join("a.org"),
+        "CLOCK: [2024-11-13 Mon 15:00 +0100]--[2024-11-13 Mon 15:45 +0100] => 720:45\n",
+    )
+    .unwrap();
+    let out = Command::new(bin_path())
+        .args(["clock", "check", "-j", "-1"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().count(),
+        1,
+        "stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A CLOCK sample inside `#+begin_src` is documentation: `check`
+/// must not lint it, `list` must not emit or reject on it, `fix`
+/// must not rewrite it.
+#[test]
+fn src_block_samples_are_invisible_to_check_list_and_fix() {
+    let dir = scratch("srcblock");
+    let f = dir.join("a.org");
+    let body = "* h\n\
+                :LOGBOOK:\n\
+                CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 12:00 +0100] =>  2:00\n\
+                :END:\n\
+                #+begin_src org\n\
+                CLOCK: [2024-04-16 Mon 14:15 +0200]--[2024-04-16 Mon 14:30 +0200] =>  0:15\n\
+                CLOCK: [2026-01-07 Wed 09:57]--[2026-01-07 Wed 12:19] =>  2:22\n\
+                #+end_src\n";
+    std::fs::write(&f, body).unwrap();
+
+    let chk = Command::new(bin_path())
+        .args(["clock", "check", "-j"])
+        .arg(&f)
+        .output()
+        .unwrap();
+    assert_eq!(chk.status.code(), Some(0), "check must be clean");
+    assert!(chk.stdout.is_empty());
+
+    let lst = Command::new(bin_path())
+        .args(["clock", "list", "-j"])
+        .arg(&f)
+        .output()
+        .unwrap();
+    assert_eq!(
+        lst.status.code(),
+        Some(0),
+        "list must not reject the missing-tz sample"
+    );
+    assert_eq!(String::from_utf8_lossy(&lst.stdout).lines().count(), 1);
+
+    let fix = Command::new(bin_path())
+        .args(["clock", "fix", "--write"])
+        .arg(&f)
+        .output()
+        .unwrap();
+    assert_eq!(fix.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        body,
+        "fix must leave the file byte-identical"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file that is not valid UTF-8 is warned about and decoded
+/// lossily: its CLOCK lines still count, on both the cached and the
+/// uncached path. Fix rewrites only the CLOCK line; the invalid bytes
+/// on other lines are carried through untouched.
+#[test]
+fn non_utf8_file_is_decoded_lossily_with_warning() {
+    let dir = scratch("utf8");
+    let bad = dir.join("bad.org");
+    let bad_bytes: Vec<u8> =
+        b"* caf\xe9\nCLOCK: [2024-04-16 Mon 14:15 +0200]--[2024-04-16 Mon 14:30 +0200] =>  0:15\n"
+            .to_vec();
+    std::fs::write(&bad, &bad_bytes).unwrap();
+
+    for (sub, want_exit) in [("check", 1), ("list", 1)] {
+        for extra in [&[][..], &["--no-cache"][..]] {
+            let out = Command::new(bin_path())
+                .env("ORG_CLI_CLOCK_CACHE", dir.join("cache.sqlite"))
+                .args(["clock", sub, "-j"])
+                .args(extra)
+                .arg(&bad)
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&out.stderr);
+            // The warning is logged only when the file is actually
+            // decoded; a warm cache hit does not re-read it. The
+            // observable contract is the exit code.
+            if extra.contains(&"--no-cache") {
+                assert!(err.contains("not valid UTF-8"), "{sub} {extra:?}: {err}");
+            }
+            assert_eq!(
+                out.status.code(),
+                Some(want_exit),
+                "{sub} {extra:?}: the weekday-broken clock must be seen; stderr={err}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

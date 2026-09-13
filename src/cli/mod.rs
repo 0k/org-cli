@@ -124,6 +124,9 @@ pub fn run() -> Result<(), String> {
                 nul,
                 json,
                 first,
+                verify,
+                no_cache,
+                timing,
             } => {
                 let opts = action::clock::CheckOptions {
                     paths,
@@ -131,6 +134,9 @@ pub fn run() -> Result<(), String> {
                     nul,
                     json,
                     first,
+                    verify,
+                    no_cache,
+                    timing,
                 };
                 let exit_code = action::clock::run_check(opts)?;
                 if exit_code != 0 {
@@ -189,6 +195,9 @@ pub fn run() -> Result<(), String> {
                 ignore_case,
                 has_property,
                 json,
+                verify,
+                no_cache,
+                timing,
             } => {
                 let opts = action::clock::ListOptions {
                     paths,
@@ -197,6 +206,9 @@ pub fn run() -> Result<(), String> {
                     ignore_case,
                     has_property,
                     json,
+                    verify,
+                    no_cache,
+                    timing,
                 };
                 let exit_code = action::clock::run_list(opts)?;
                 if exit_code != 0 {

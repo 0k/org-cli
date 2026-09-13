@@ -19,21 +19,37 @@ pub struct FilterOptions {
 
 impl FilterOptions {
     pub fn matches(&self, heading: &Heading) -> bool {
+        self.matches_parts(
+            &heading.title,
+            &heading.properties,
+            heading.keyword.as_deref(),
+        )
+    }
+
+    /// The same predicate over bare parts, for callers that hold a
+    /// heading's metadata without a full [`Heading`] (the clock cache
+    /// keeps title and properties per clocked heading but no keyword;
+    /// pass `None` and the keyword-sensitive clauses fall back to
+    /// their "no keyword" behaviour, which is what `clock list`'s
+    /// filters — title and properties only — actually consult).
+    pub fn matches_parts(
+        &self,
+        title: &str,
+        properties: &std::collections::BTreeMap<String, String>,
+        keyword: Option<&str>,
+    ) -> bool {
         let pattern_matches = self
             .pattern
             .as_ref()
-            .map(|pattern| pattern.is_match(&heading.title))
+            .map(|pattern| pattern.is_match(title))
             .unwrap_or(true);
         let properties_match = self
             .has_properties
             .iter()
-            .all(|name| heading.properties.contains_key(name));
+            .all(|name| properties.contains_key(name));
         let keyword_match = self.keywords.is_empty()
-            || heading
-                .keyword
-                .as_ref()
-                .is_some_and(|keyword| self.keywords.contains(keyword));
-        let todo_match = !self.todo_only || heading.keyword.is_some();
+            || keyword.is_some_and(|keyword| self.keywords.iter().any(|k| k == keyword));
+        let todo_match = !self.todo_only || keyword.is_some();
 
         pattern_matches && properties_match && keyword_match && todo_match
     }

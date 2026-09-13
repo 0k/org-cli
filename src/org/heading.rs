@@ -48,7 +48,7 @@ pub struct Heading {
 ///
 /// Offsets are byte offsets into the original content; returned line numbers
 /// are 1-based.
-struct LineIndex {
+pub struct LineIndex {
     /// Byte offsets of every `\n` in the content, in ascending order.
     newline_offsets: Vec<usize>,
 }
@@ -56,7 +56,7 @@ struct LineIndex {
 impl LineIndex {
     /// Build an index over `content` by recording the byte offset of every
     /// newline.
-    fn new(content: &str) -> Self {
+    pub fn new(content: &str) -> Self {
         let newline_offsets = content
             .bytes()
             .enumerate()
@@ -71,7 +71,7 @@ impl LineIndex {
     /// An offset that lands exactly on a `\n` byte belongs to the line that
     /// the newline terminates (i.e. the line before the break). Offsets past
     /// the end of the content resolve to the final line without panicking.
-    fn line_at(&self, offset: usize) -> usize {
+    pub fn line_at(&self, offset: usize) -> usize {
         self.newline_offsets.partition_point(|&pos| pos < offset) + 1
     }
 
@@ -145,26 +145,70 @@ pub fn iter_headings_with<'a>(
 /// The containing heading is the most recent heading whose starting line is
 /// less than or equal to `line`, up to (but not including) the next heading at
 /// the same or shallower level.
+///
+/// Parses `content` on every call. For repeated lookups in one file
+/// build a [`HeadingIndex`] once instead.
 pub fn heading_for_line(content: &str, line: usize) -> Option<Heading> {
-    if line == 0 {
-        return None;
+    HeadingIndex::new(content).heading_for_line(line)
+}
+
+/// All headings of one file, parsed once, with each heading's
+/// enclosing line range precomputed.
+///
+/// [`heading_for_line`] re-parses the whole document per call, which
+/// is quadratic when a caller asks about every CLOCK line of a large
+/// file. This does the parse and the range computation once and
+/// answers each lookup by binary search on the heading start lines.
+pub struct HeadingIndex {
+    /// Document order.
+    headings: Vec<Heading>,
+    /// `ends[i]` is the last line (inclusive) owned by `headings[i]`.
+    ends: Vec<usize>,
+}
+
+impl HeadingIndex {
+    /// Parse `content` once with the default TODO keyword set.
+    pub fn new(content: &str) -> Self {
+        let headings: Vec<Heading> = iter_headings(content).collect();
+        // Each heading ends just before the next heading at the same
+        // or a shallower level. A stack of (level, index) gives that
+        // in one linear pass.
+        let mut ends = vec![usize::MAX; headings.len()];
+        let mut open: Vec<usize> = Vec::new();
+        for (i, h) in headings.iter().enumerate() {
+            while let Some(&j) = open.last() {
+                if headings[j].level >= h.level {
+                    ends[j] = h.line.saturating_sub(1);
+                    open.pop();
+                } else {
+                    break;
+                }
+            }
+            open.push(i);
+        }
+        Self { headings, ends }
     }
 
-    let headings: Vec<_> = iter_headings(content).collect();
-    for (index, heading) in headings.iter().enumerate().rev() {
-        let end_line = headings
-            .iter()
-            .skip(index + 1)
-            .find(|next| next.level <= heading.level)
-            .map(|next| next.line.saturating_sub(1))
-            .unwrap_or(usize::MAX);
-
-        if heading.line <= line && line <= end_line {
-            return Some(heading.clone());
+    /// Enclosing heading of a 1-based `line`, if any.
+    pub fn heading_for_line(&self, line: usize) -> Option<Heading> {
+        if line == 0 {
+            return None;
+        }
+        // Last heading starting at or before `line`; then walk up
+        // the ancestry until one whose range still covers `line`.
+        let idx = self.headings.partition_point(|h| h.line <= line);
+        let mut i = idx.checked_sub(1)?;
+        loop {
+            if self.ends[i] >= line {
+                return Some(self.headings[i].clone());
+            }
+            // The heading at `i` closed before `line`; its enclosing
+            // ancestor is the nearest previous heading of shallower
+            // level.
+            let level = self.headings[i].level;
+            i = (0..i).rev().find(|&j| self.headings[j].level < level)?;
         }
     }
-
-    None
 }
 
 fn build_heading(content: &str, line_index: &LineIndex, headline: OrgHeadline) -> Option<Heading> {

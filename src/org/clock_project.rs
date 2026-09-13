@@ -28,16 +28,20 @@
 //! grammar in the crate. This module hands it the exact source line
 //! orgize identified; it never re-implements timestamp parsing.
 
+use orgize::ast::Headline as OrgHeadline;
 use orgize::rowan::ast::AstNode;
 use orgize::{Org, SyntaxKind, SyntaxNode};
 
+use std::collections::BTreeMap;
+
 use crate::index::clock_blob::{Blob, FLAG_HAS_SECONDS, Interner, NO_HEADING, Record};
 use crate::org::clock::parse_clock_line;
+use crate::org::heading::LineIndex;
 
 /// Bump when the *meaning* of a produced record or diagnostic changes
 /// — e.g. a new flag, a changed instant epoch, a different heading
 /// attribution rule. Folded into every cache key.
-pub const PROJECTION_ABI: u16 = 2;
+pub const PROJECTION_ABI: u16 = 5;
 
 /// Bump when the patched `orgize` fork changes in a way that could
 /// alter which lines become `CLOCK` nodes. Folded into every cache
@@ -60,6 +64,25 @@ pub struct Diagnostic {
     pub raw: String,
 }
 
+/// The enclosing heading of at least one CLOCK fact, with the
+/// metadata a heading filter needs.
+///
+/// Only *clocked* headings are recorded — the same lazy rule as the
+/// interned title — so this stays small on a file with thousands of
+/// headings and a handful of clocks. Keyed by the [`Record`]'s
+/// `heading_id`, which identifies the heading by *position* (so two
+/// headings with the same title stay distinct); the title lives in
+/// [`ClockedHeading::title`], not in the string table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockedHeading {
+    pub level: u32,
+    /// 1-based line of the headline.
+    pub line: u32,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub properties: BTreeMap<String, String>,
+}
+
 /// Everything layer 1 stores for one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Projection {
@@ -68,6 +91,35 @@ pub struct Projection {
     pub blob: Blob,
     /// Lines that looked like a CLOCK but were rejected.
     pub diagnostics: Vec<Diagnostic>,
+    /// Headings that own at least one record, keyed by the record's
+    /// `heading_id`. Empty for files with no clocked heading.
+    pub headings: BTreeMap<u32, ClockedHeading>,
+}
+
+impl Projection {
+    /// Every source line orgize identified as a CLOCK candidate —
+    /// clean facts and rejected lines alike — as 1-based line
+    /// numbers in **source order**, each at most once.
+    ///
+    /// This is the discovery surface for the per-line commands
+    /// (`check`, `list`, `fix`): they iterate these lines instead of
+    /// scanning every line for `CLOCK:`, so a sample inside
+    /// `#+begin_src` is never a candidate. They then re-run
+    /// [`crate::org::clock::parse_clock_line`] on the exact source
+    /// text, because the blob does not carry a `ParsedClockLine` and
+    /// the `unaccepted-tz` rule needs live config.
+    pub fn candidate_lines(&self) -> Vec<u32> {
+        let mut lines: Vec<u32> = self
+            .blob
+            .records
+            .iter()
+            .map(|r| r.line)
+            .chain(self.diagnostics.iter().map(|d| d.line))
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
 }
 
 /// Project `content` (the exact bytes of `canonical_path`) into
@@ -76,28 +128,53 @@ pub struct Projection {
 /// `canonical_path` is interned as string 0; every record's
 /// `path_id` is 0. Layer 2 re-keys it on merge.
 pub fn project(canonical_path: &str, content: &str) -> Projection {
-    let org = Org::parse(content);
-    let root = org.document().syntax().clone();
-
     let mut interner = Interner::default();
     let path_id = interner.intern(canonical_path);
     debug_assert_eq!(path_id, 0);
 
+    // A file with no `CLOCK:` substring anywhere cannot yield a fact
+    // or a diagnostic; both require that literal token. Skip the
+    // parse. This is a pre-filter on the *result*, not a discovery
+    // rule — it never decides whether a candidate that IS present
+    // counts. On the real corpus ~70% of files take this path.
+    if !content.contains("CLOCK:") {
+        return Projection {
+            blob: Blob {
+                projection_abi: PROJECTION_ABI,
+                parser_abi: PARSER_ABI,
+                records: Vec::new(),
+                strings: interner.into_strings(),
+            },
+            diagnostics: Vec::new(),
+            headings: BTreeMap::new(),
+        };
+    }
+
+    let org = Org::parse(content);
+    let root = org.document().syntax().clone();
+    // One linear scan; every candidate then resolves its line by
+    // binary search instead of re-counting newlines from offset 0.
+    let line_index = LineIndex::new(content);
+
     let mut records = Vec::new();
     let mut diagnostics = Vec::new();
-    // (level, title). Titles are interned lazily, only when a CLOCK
-    // is actually filed under them: a corpus has vastly more
-    // headings than clocked headings, and interning every title
-    // would make the string table dwarf the records it serves.
-    let mut heading_stack: Vec<(u32, String)> = Vec::new();
+    let mut headings: BTreeMap<u32, ClockedHeading> = BTreeMap::new();
+    // (level, headline node). The title is extracted and interned
+    // lazily, only when a CLOCK is actually filed under it: a corpus
+    // has vastly more headings than clocked headings, and building a
+    // String per headline (let alone interning it) dominated the
+    // walk before this was made lazy.
+    let mut heading_stack: Vec<(u32, SyntaxNode)> = Vec::new();
 
     walk(
         &root,
         content,
+        &line_index,
         &mut interner,
         &mut heading_stack,
         &mut records,
         &mut diagnostics,
+        &mut headings,
     );
 
     records.sort_by_key(Record::sort_key);
@@ -111,17 +188,21 @@ pub fn project(canonical_path: &str, content: &str) -> Projection {
             strings: interner.into_strings(),
         },
         diagnostics,
+        headings,
     }
 }
 
 /// Depth-first walk that stops at literal blocks.
+#[allow(clippy::too_many_arguments)]
 fn walk(
     node: &SyntaxNode,
     content: &str,
+    line_index: &LineIndex,
     interner: &mut Interner,
-    heading_stack: &mut Vec<(u32, String)>,
+    heading_stack: &mut Vec<(u32, SyntaxNode)>,
     records: &mut Vec<Record>,
     diagnostics: &mut Vec<Diagnostic>,
+    headings: &mut BTreeMap<u32, ClockedHeading>,
 ) {
     for child in node.children() {
         match child.kind() {
@@ -137,16 +218,17 @@ fn walk(
 
             SyntaxKind::HEADLINE => {
                 let level = headline_level(&child);
-                let title = headline_title(&child);
                 heading_stack.retain(|(l, _)| *l < level);
-                heading_stack.push((level, title));
+                heading_stack.push((level, child.clone()));
                 walk(
                     &child,
                     content,
+                    line_index,
                     interner,
                     heading_stack,
                     records,
                     diagnostics,
+                    headings,
                 );
                 heading_stack.retain(|(l, _)| *l < level);
             }
@@ -159,11 +241,12 @@ fn walk(
                 classify(
                     offset,
                     raw,
-                    content,
+                    line_index,
                     heading_stack,
                     interner,
                     records,
                     diagnostics,
+                    headings,
                 );
             }
 
@@ -173,21 +256,38 @@ fn walk(
             SyntaxKind::PARAGRAPH => {
                 let start: usize = child.text_range().start().into();
                 let end: usize = child.text_range().end().into();
+                // Most paragraphs hold no CLOCK at all; one substring
+                // scan over the span skips the per-line split for
+                // them. The per-line pass only runs on the rare hit.
+                if !content[start..end].contains("CLOCK:") {
+                    continue;
+                }
+                // A paragraph's range starts at its first character,
+                // which for a list item is AFTER the bullet: the
+                // `CLOCK:` token can sit at that offset while the
+                // *source line* begins with `  - `. Hand the strict
+                // parser the whole physical line, exactly as `check`
+                // always did, so a bulleted mention is judged the
+                // same way on both paths (it fails the leading
+                // `CLOCK:` test and is ignored).
                 let mut pos = start;
-                for line in content[start..end].split_inclusive('\n') {
-                    if line.contains("CLOCK:") {
-                        let raw = line.trim_end_matches(['\n', '\r']);
+                for seg in content[start..end].split_inclusive('\n') {
+                    if seg.contains("CLOCK:") {
+                        let line_start = content[..pos].rfind('\n').map_or(0, |i| i + 1);
+                        let line_end = pos + seg.len();
+                        let raw = content[line_start..line_end].trim_end_matches(['\n', '\r']);
                         classify(
-                            pos,
+                            line_start,
                             raw,
-                            content,
+                            line_index,
                             heading_stack,
                             interner,
                             records,
                             diagnostics,
+                            headings,
                         );
                     }
-                    pos += line.len();
+                    pos += seg.len();
                 }
                 // Paragraphs contain no elements; nothing to descend into.
             }
@@ -195,32 +295,48 @@ fn walk(
             _ => walk(
                 &child,
                 content,
+                line_index,
                 interner,
                 heading_stack,
                 records,
                 diagnostics,
+                headings,
             ),
         }
     }
 }
 
 /// Run the strict grammar on one candidate line and file the result.
+#[allow(clippy::too_many_arguments)]
 fn classify(
     byte_offset: usize,
     raw: &str,
-    content: &str,
-    heading_stack: &[(u32, String)],
+    line_index: &LineIndex,
+    heading_stack: &[(u32, SyntaxNode)],
     interner: &mut Interner,
     records: &mut Vec<Record>,
     diagnostics: &mut Vec<Diagnostic>,
+    headings: &mut BTreeMap<u32, ClockedHeading>,
 ) {
-    let line = line_number_at(content, byte_offset);
+    let line = line_index.line_at(byte_offset) as u32;
     // Intern here, not at headline entry: only clocked headings
-    // earn a string-table slot.
-    let heading_id = heading_stack
-        .last()
-        .map(|(_, title)| interner.intern(title))
-        .unwrap_or(NO_HEADING);
+    // earn a string-table slot — and only they get their tags and
+    // properties extracted, which is the expensive part.
+    // Key the record on the heading's *position*, not its title:
+    // several headings may share a title (a recurring "réunion du
+    // lundi") and each must resolve to its own line and drawer. The
+    // interner is asked for a string that no title can collide with.
+    let heading_id = match heading_stack.last() {
+        None => NO_HEADING,
+        Some((level, node)) => {
+            let start: usize = node.text_range().start().into();
+            let id = interner.intern(&format!("\0h@{}", start));
+            headings
+                .entry(id)
+                .or_insert_with(|| clocked_heading(node, *level, line_index));
+            id
+        }
+    };
     match parse_clock_line(raw) {
         // Running clock or not a closed range at all: neither fact
         // nor diagnostic, exactly as `clock check` treats it.
@@ -271,14 +387,6 @@ fn node_line<'a>(node: &SyntaxNode, content: &'a str) -> (usize, &'a str) {
     (start, raw)
 }
 
-fn line_number_at(content: &str, byte_offset: usize) -> u32 {
-    (content[..byte_offset]
-        .bytes()
-        .filter(|&b| b == b'\n')
-        .count()
-        + 1) as u32
-}
-
 fn headline_level(node: &SyntaxNode) -> u32 {
     node.children_with_tokens()
         .find_map(|t| match t.kind() {
@@ -286,6 +394,35 @@ fn headline_level(node: &SyntaxNode) -> u32 {
             _ => None,
         })
         .unwrap_or(1)
+}
+
+/// Capture what a heading filter and a `HeadingSummary` need,
+/// through orgize's typed accessors (same source of truth as
+/// [`crate::org::heading::Heading`]).
+fn clocked_heading(node: &SyntaxNode, level: u32, line_index: &LineIndex) -> ClockedHeading {
+    let start: usize = node.text_range().start().into();
+    let line = line_index.line_at(start) as u32;
+    let title = headline_title(node);
+    let (tags, properties) = match OrgHeadline::cast(node.clone()) {
+        Some(h) => (
+            h.tags().map(|t| t.to_string()).collect(),
+            h.properties()
+                .map(|d| {
+                    d.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
+        ),
+        None => (Vec::new(), BTreeMap::new()),
+    };
+    ClockedHeading {
+        level,
+        line,
+        title,
+        tags,
+        properties,
+    }
 }
 
 fn headline_title(node: &SyntaxNode) -> String {
@@ -436,12 +573,14 @@ mod tests {
             CLOCK: [2026-01-08 Thu 10:00 +0100]--[2026-01-08 Thu 12:00 +0100] =>  2:00
         "};
         let p = project(P, c);
-        let title = |r: &Record| p.blob.strings[r.heading_id as usize].clone();
+        let title = |r: &Record| p.headings[&r.heading_id].title.clone();
         assert_eq!(p.blob.records.len(), 2);
         // orgize's HEADLINE_TITLE excludes the TODO keyword, matching
         // the `keyword` / `title` split in `crate::org::heading`.
         assert_eq!(title(&p.blob.records[0]), "The task");
         assert_eq!(title(&p.blob.records[1]), "Other");
+        assert_eq!(p.headings[&p.blob.records[0].heading_id].line, 2);
+        assert_eq!(p.headings[&p.blob.records[1].heading_id].line, 6);
     }
 
     #[test]
@@ -495,5 +634,57 @@ mod tests {
         let r = facts(c);
         assert_eq!(r.len(), 1);
         assert_ne!(r[0].flags & FLAG_HAS_SECONDS, 0);
+    }
+
+    // Regression: a `CLOCK:` mention inside a list item starts a
+    // paragraph AFTER the bullet, so the paragraph slice began with
+    // `CLOCK:` and the strict parser accepted it — while the line
+    // scanner (which sees `  - CLOCK:`) never did. Both must agree.
+    #[test]
+    fn bulleted_clock_mention_is_neither_fact_nor_diagnostic() {
+        let c = indoc! {"
+            * h
+              - CLOCK: [2026-01-23 Fri 06:30 +0100]--[2026-01-23 Fri 07:00 +0100] => 0:30 (note)
+        "};
+        assert!(facts(c).is_empty());
+        assert!(diags(c).is_empty(), "{:?}", diags(c));
+    }
+
+    #[test]
+    fn same_titled_headings_stay_distinct() {
+        let c = indoc! {"
+            ** DONE réunion du lundi
+            CLOCK: [2026-01-05 Mon 09:00 +0100]--[2026-01-05 Mon 09:30 +0100] =>  0:30
+            ** DONE réunion du lundi
+            CLOCK: [2026-01-12 Mon 09:00 +0100]--[2026-01-12 Mon 09:30 +0100] =>  0:30
+        "};
+        let p = project(P, c);
+        assert_eq!(p.blob.records.len(), 2);
+        let (a, b) = (&p.blob.records[0], &p.blob.records[1]);
+        assert_ne!(
+            a.heading_id, b.heading_id,
+            "identical titles must not merge"
+        );
+        assert_eq!(p.headings[&a.heading_id].line, 1);
+        assert_eq!(p.headings[&b.heading_id].line, 3);
+    }
+
+    #[test]
+    fn candidate_lines_are_source_ordered_and_deduplicated() {
+        // Line 4 is a clean fact; line 2 carries TWO violations
+        // (weekday on both sides) → two diagnostics, one candidate.
+        // Line 6 is in a src block → not a candidate at all.
+        let c = indoc! {"
+            * h
+            CLOCK: [2026-01-07 Mon 10:00 +0100]--[2026-01-07 Mon 11:00 +0100] =>  1:00
+            :LOGBOOK:
+            CLOCK: [2026-01-07 Wed 12:00 +0100]--[2026-01-07 Wed 13:00 +0100] =>  1:00
+            #+begin_src org
+            CLOCK: [2026-01-07 Wed 14:00 +0100]--[2026-01-07 Wed 15:00 +0100] =>  1:00
+            #+end_src
+        "};
+        let p = project(P, c);
+        assert!(p.diagnostics.len() >= 2, "{:?}", p.diagnostics);
+        assert_eq!(p.candidate_lines(), vec![2, 4]);
     }
 }

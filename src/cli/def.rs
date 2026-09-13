@@ -425,6 +425,18 @@ pub enum ClockCommands {
         /// Stop at the first violation.
         #[arg(short = '1', long)]
         first: bool,
+
+        /// Re-read and hash every file instead of trusting size+mtime.
+        #[arg(long)]
+        verify: bool,
+
+        /// Bypass the cache: read and parse every file from scratch.
+        #[arg(long = "no-cache")]
+        no_cache: bool,
+
+        /// Print a phase-by-phase timing breakdown on stderr.
+        #[arg(long)]
+        timing: bool,
     },
 
     /// Report pairs of CLOCK lines that cover the same instant.
@@ -550,6 +562,18 @@ pub enum ClockCommands {
         /// NDJSON output (currently the only supported shape).
         #[arg(short = 'j', long, default_value_t = true)]
         json: bool,
+
+        /// Re-read and hash every file instead of trusting size+mtime.
+        #[arg(long)]
+        verify: bool,
+
+        /// Bypass the cache: read and parse every file from scratch.
+        #[arg(long = "no-cache")]
+        no_cache: bool,
+
+        /// Print a phase-by-phase timing breakdown on stderr.
+        #[arg(long)]
+        timing: bool,
     },
 
     /// Find a heading in FILE and insert one canonical CLOCK

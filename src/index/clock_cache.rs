@@ -41,9 +41,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::index::clock_blob::Blob;
-use crate::org::clock_project::{Diagnostic, PARSER_ABI, PROJECTION_ABI, project};
+use crate::org::clock_project::{
+    ClockedHeading, Diagnostic, PARSER_ABI, PROJECTION_ABI, Projection, project,
+};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS l1 (
@@ -57,6 +59,7 @@ CREATE TABLE IF NOT EXISTS l1 (
     blob_digest  BLOB    NOT NULL,
     blob         BLOB    NOT NULL,
     diagnostics  BLOB    NOT NULL,
+    headings     BLOB    NOT NULL,
     PRIMARY KEY (path_id)
 );
 CREATE TABLE IF NOT EXISTS l2 (
@@ -159,27 +162,26 @@ impl ClockCache {
         Ok(Self { conn })
     }
 
-    /// Resolve the globally sorted CLOCK list for `files`.
+    /// Bring every selected file's L1 entry up to date and return the
+    /// per-file projections in the caller's order.
     ///
-    /// `scope` is any caller-defined bytes that change the meaning of
-    /// the result (the exclusion set, typically). It is folded into
-    /// the root digest so two scopes never share a root.
-    pub fn resolve(
-        &mut self,
-        files: &[PathBuf],
-        scope: &[u8],
-        verify: Verify,
-    ) -> Result<Resolved, String> {
+    /// This is the whole of layer 1. `resolve` layers the bucket/root
+    /// merge on top; `resolve_per_file` returns this directly for
+    /// commands that report per file in source order and have no use
+    /// for a globally sorted list.
+    fn sync_l1(&mut self, files: &[PathBuf], verify: Verify) -> Result<(L1Sync, Timing), String> {
         let mut timing = Timing {
             files_selected: files.len(),
             ..Default::default()
         };
-
-        // ---- L1: bring every selected file up to date -------------
         let t0 = Instant::now();
         let mut members: BTreeMap<[u8; 8], L1Row> = BTreeMap::new();
-        let mut dirty_buckets = [false; 256];
-        let mut all_diags: Vec<(PathBuf, Vec<Diagnostic>)> = Vec::new();
+        let mut out: Vec<(PathBuf, Projection)> = Vec::with_capacity(files.len());
+
+        // One scan of the L1 table beats ~7k point queries: SQLite's
+        // per-statement overhead dominated the warm path (60 ms for
+        // 6.8k files against 3 ms of stat).
+        let mut existing_rows = self.load_all_l1()?;
 
         for file in files {
             let canonical = canonical_string(file)?;
@@ -194,7 +196,7 @@ impl ClockCache {
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0);
 
-            let existing = self.load_l1(&pid)?;
+            let existing = existing_rows.remove(&pid);
 
             // Fast path: metadata unchanged and ABIs match.
             if verify == Verify::Metadata
@@ -205,7 +207,15 @@ impl ClockCache {
                 && row.parser_abi == PARSER_ABI
             {
                 timing.l1_hits += 1;
-                all_diags.push((file.clone(), decode_diags(&row.diagnostics)?));
+                let blob = Blob::decode(&row.blob).map_err(|e| e.to_string())?;
+                out.push((
+                    file.clone(),
+                    Projection {
+                        blob,
+                        diagnostics: decode_diags(&row.diagnostics)?,
+                        headings: decode_headings(&row.headings)?,
+                    },
+                ));
                 members.insert(pid, row.clone());
                 continue;
             }
@@ -241,7 +251,15 @@ impl ClockCache {
                 let mut row = row.clone();
                 row.size = size;
                 row.mtime_ns = mtime_ns;
-                all_diags.push((file.clone(), decode_diags(&row.diagnostics)?));
+                let blob = Blob::decode(&row.blob).map_err(|e| e.to_string())?;
+                out.push((
+                    file.clone(),
+                    Projection {
+                        blob,
+                        diagnostics: decode_diags(&row.diagnostics)?,
+                        headings: decode_headings(&row.headings)?,
+                    },
+                ));
                 members.insert(pid, row);
                 continue;
             }
@@ -260,12 +278,12 @@ impl ClockCache {
                 blob_digest: sha256(&blob_bytes),
                 blob: blob_bytes,
                 diagnostics: encode_diags(&projection.diagnostics),
+                headings: encode_headings(&projection.headings),
             };
             self.store_l1(&pid, &row)?;
             timing.l1_miss += t_miss.elapsed();
             timing.l1_misses += 1;
-            dirty_buckets[pid[0] as usize] = true;
-            all_diags.push((file.clone(), projection.diagnostics));
+            out.push((file.clone(), projection));
             members.insert(pid, row);
         }
         // `validate` = everything in the L1 loop that is not
@@ -274,6 +292,45 @@ impl ClockCache {
         // above; replace it with the loop total minus projection so
         // it is not counted twice.
         timing.validate = t0.elapsed().saturating_sub(timing.l1_miss);
+
+        Ok((
+            L1Sync {
+                members,
+                files: out,
+            },
+            timing,
+        ))
+    }
+
+    /// Per-file projections for `files`, in the given order, from the
+    /// cache. No bucket or root work is done.
+    pub fn resolve_per_file(
+        &mut self,
+        files: &[PathBuf],
+        verify: Verify,
+    ) -> Result<(Vec<(PathBuf, Projection)>, Timing), String> {
+        let (l1, timing) = self.sync_l1(files, verify)?;
+        Ok((l1.files, timing))
+    }
+
+    /// Resolve the globally sorted CLOCK list for `files`.
+    ///
+    /// `scope` is any caller-defined bytes that change the meaning of
+    /// the result (the exclusion set, typically). It is folded into
+    /// the root digest so two scopes never share a root.
+    pub fn resolve(
+        &mut self,
+        files: &[PathBuf],
+        scope: &[u8],
+        verify: Verify,
+    ) -> Result<Resolved, String> {
+        let (l1, mut timing) = self.sync_l1(files, verify)?;
+        let members = l1.members;
+        let mut all_diags: Vec<(PathBuf, Vec<Diagnostic>)> = l1
+            .files
+            .into_iter()
+            .map(|(f, p)| (f, p.diagnostics))
+            .collect();
 
         // ---- L2: buckets, then root -------------------------------
         let t2 = Instant::now();
@@ -354,11 +411,51 @@ impl ClockCache {
 
     // ---- persistence -------------------------------------------------
 
+    fn load_all_l1(&self) -> Result<std::collections::HashMap<[u8; 8], L1Row>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT path_id, canonical, content_sha, proj_abi, parser_abi, size, mtime_ns,
+                        blob_digest, blob, diagnostics, headings
+                 FROM l1",
+            )
+            .map_err(|e| format!("preparing l1 scan: {}", e))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let pid: Vec<u8> = r.get(0)?;
+                let sha: Vec<u8> = r.get(2)?;
+                let bd: Vec<u8> = r.get(7)?;
+                Ok((
+                    pid.try_into().unwrap_or([0; 8]),
+                    L1Row {
+                        canonical: r.get(1)?,
+                        content_sha: sha.try_into().unwrap_or([0; 32]),
+                        proj_abi: r.get::<_, i64>(3)? as u16,
+                        parser_abi: r.get::<_, i64>(4)? as u16,
+                        size: r.get(5)?,
+                        mtime_ns: r.get(6)?,
+                        blob_digest: bd.try_into().unwrap_or([0; 32]),
+                        blob: r.get(8)?,
+                        diagnostics: r.get(9)?,
+                        headings: r.get(10)?,
+                    },
+                ))
+            })
+            .map_err(|e| format!("scanning l1: {}", e))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (pid, r) = row.map_err(|e| format!("reading l1 row: {}", e))?;
+            map.insert(pid, r);
+        }
+        Ok(map)
+    }
+
+    #[allow(dead_code)]
     fn load_l1(&self, pid: &[u8; 8]) -> Result<Option<L1Row>, String> {
         self.conn
             .query_row(
                 "SELECT canonical, content_sha, proj_abi, parser_abi, size, mtime_ns,
-                        blob_digest, blob, diagnostics
+                        blob_digest, blob, diagnostics, headings
                  FROM l1 WHERE path_id = ?1",
                 params![pid.as_slice()],
                 |r| {
@@ -374,6 +471,7 @@ impl ClockCache {
                         blob_digest: bd.try_into().unwrap_or([0; 32]),
                         blob: r.get(7)?,
                         diagnostics: r.get(8)?,
+                        headings: r.get(9)?,
                     })
                 },
             )
@@ -386,8 +484,8 @@ impl ClockCache {
             .execute(
                 "INSERT OR REPLACE INTO l1
                  (path_id, canonical, content_sha, proj_abi, parser_abi, size, mtime_ns,
-                  blob_digest, blob, diagnostics)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                  blob_digest, blob, diagnostics, headings)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     pid.as_slice(),
                     row.canonical,
@@ -399,6 +497,7 @@ impl ClockCache {
                     row.blob_digest.as_slice(),
                     row.blob,
                     row.diagnostics,
+                    row.headings,
                 ],
             )
             .map(|_| ())
@@ -466,6 +565,11 @@ impl ClockCache {
     }
 }
 
+struct L1Sync {
+    members: BTreeMap<[u8; 8], L1Row>,
+    files: Vec<(PathBuf, Projection)>,
+}
+
 #[derive(Debug, Clone)]
 struct L1Row {
     canonical: String,
@@ -477,6 +581,7 @@ struct L1Row {
     blob_digest: [u8; 32],
     blob: Vec<u8>,
     diagnostics: Vec<u8>,
+    headings: Vec<u8>,
 }
 
 fn canonical_string(p: &Path) -> Result<String, String> {
@@ -503,6 +608,71 @@ fn encode_diags(d: &[Diagnostic]) -> Vec<u8> {
         out.push(0);
     }
     out
+}
+
+/// Clocked headings: `id\0level\0line\0title\0tags(,)\0props(k=v;)\0`.
+/// Tags cannot contain `,` and property keys cannot contain `=` or
+/// `;` in Org, so the flat encoding is unambiguous.
+fn encode_headings(h: &BTreeMap<u32, ClockedHeading>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (id, ch) in h {
+        for field in [
+            id.to_string(),
+            ch.level.to_string(),
+            ch.line.to_string(),
+            ch.title.clone(),
+            ch.tags.join(","),
+            ch.properties
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(";"),
+        ] {
+            out.extend_from_slice(field.as_bytes());
+            out.push(0);
+        }
+    }
+    out
+}
+
+fn decode_headings(bytes: &[u8]) -> Result<BTreeMap<u32, ClockedHeading>, String> {
+    let mut out = BTreeMap::new();
+    if bytes.is_empty() {
+        return Ok(out);
+    }
+    let fields: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
+    let fields = &fields[..fields.len().saturating_sub(1)];
+    if !fields.len().is_multiple_of(6) {
+        return Err("corrupt headings blob".into());
+    }
+    let s = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| "corrupt headings utf8");
+    for c in fields.chunks(6) {
+        let id: u32 = s(c[0])?.parse().map_err(|_| "corrupt headings id")?;
+        let tags_s = s(c[4])?;
+        let props_s = s(c[5])?;
+        out.insert(
+            id,
+            ClockedHeading {
+                level: s(c[1])?.parse().map_err(|_| "corrupt headings level")?,
+                line: s(c[2])?.parse().map_err(|_| "corrupt headings line")?,
+                title: s(c[3])?,
+                tags: if tags_s.is_empty() {
+                    Vec::new()
+                } else {
+                    tags_s.split(',').map(str::to_owned).collect()
+                },
+                properties: props_s
+                    .split(';')
+                    .filter(|kv| !kv.is_empty())
+                    .filter_map(|kv| {
+                        kv.split_once('=')
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    })
+                    .collect(),
+            },
+        );
+    }
+    Ok(out)
 }
 
 fn decode_diags(bytes: &[u8]) -> Result<Vec<Diagnostic>, String> {

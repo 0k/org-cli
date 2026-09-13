@@ -282,19 +282,33 @@ pub fn check_accepted_zones(
     parsed: &ParsedClockLine,
     zones: &[chrono_tz::Tz],
 ) -> Option<ClockViolation> {
-    if zones.is_empty() {
-        return None;
-    }
     // The line carries the same TZ on both sides (a TzMismatch
     // line would already be flagged separately); use the start.
-    let want_minutes = parsed.line.start.tz_minutes;
-    // Build a NaiveDateTime for the start instant.
     let s = &parsed.line.start;
     let naive = chrono::NaiveDateTime::new(
         s.date,
         chrono::NaiveTime::from_hms_opt(s.hour, s.minute, s.second.unwrap_or(0))
             .expect("in-range time"),
     );
+    check_accepted_zones_at(naive, s.tz_minutes, zones)
+}
+
+/// The accepted-zones rule on a bare `(local start, offset)` pair.
+///
+/// This is the form a cached record can answer without re-parsing
+/// its source line: the cache stores the UTC instant and the offset,
+/// and the local wall time is `instant + offset`. Kept separate from
+/// [`check_accepted_zones`] so the two cannot drift.
+pub fn check_accepted_zones_at(
+    naive_local_start: chrono::NaiveDateTime,
+    tz_minutes: i32,
+    zones: &[chrono_tz::Tz],
+) -> Option<ClockViolation> {
+    if zones.is_empty() {
+        return None;
+    }
+    let want_minutes = tz_minutes;
+    let naive = naive_local_start;
     use chrono::{Offset, TimeZone};
     let any_match = zones.iter().any(|tz| {
         // Resolve the local instant in this zone. ``single()``

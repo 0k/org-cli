@@ -31,8 +31,9 @@ use crate::org::clock::{
 };
 use crate::org::clock_add::{HeadingQuery, apply_add};
 use crate::org::clock_overlap::{Interval, find_overlaps_sorted};
+use crate::org::clock_project::{ClockedHeading, Projection, project};
 use crate::org::filter::FilterOptions;
-use crate::org::heading::{Heading, heading_for_line};
+use crate::org::heading::Heading;
 
 // =====================================================================
 // `clock check`
@@ -50,6 +51,12 @@ pub struct CheckOptions {
     pub nul: bool,
     pub json: bool,
     pub first: bool,
+    /// Re-read and hash every file instead of trusting metadata.
+    pub verify: bool,
+    /// Bypass the cache: read and project every file from scratch.
+    pub no_cache: bool,
+    /// Print a phase-by-phase timing breakdown on stderr.
+    pub timing: bool,
 }
 
 /// One violation, format-agnostic.
@@ -65,74 +72,177 @@ pub struct Violation {
 /// Run `clock check`. Returns 0 on a clean run, 1 when violations
 /// were reported, `Err` on usage / I/O errors.
 pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
+    let t_total = Instant::now();
     let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
-    debug!("scanning {} org file(s)", files.len());
+    debug!("checking {} org file(s)", files.len());
 
     // Load accepted zones once. Empty list → the
     // ``unaccepted-tz`` check is silently disabled.
     let cfg = Config::load_default()?;
     let zones = cfg.clock.resolve_zones()?;
 
+    // Everything `check` reports is already in the per-file
+    // projection: structural and semantic diagnostics carry their
+    // raw line and message; clean records carry the instant and the
+    // offset the zone rule needs. On a warm cache this reads no
+    // source file at all.
+    let t_prep = Instant::now();
+    let per_file = per_file_projections(&files, opts.verify, opts.no_cache)?;
+    let prep = t_prep.elapsed();
+
     let mut violation_count: usize = 0;
     let mut writer = StdoutWriter::new(&opts);
+    let t_emit = Instant::now();
 
-    'files: for file in &files {
-        let content = match fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("cannot read {}: {}", file.display(), e);
-                continue;
+    'files: for (file, proj) in &per_file.files {
+        // Merge diagnostics and zone-rule hits in source order so
+        // output is byte-identical to the old per-line walk.
+        let mut hits: Vec<(u32, &'static str, String, &str)> = Vec::new();
+        for d in &proj.diagnostics {
+            hits.push((d.line, d.tag, d.message.clone(), d.raw.as_str()));
+        }
+        let mut zone_hits: Vec<(u32, &'static str, String)> = Vec::new();
+        for r in &proj.blob.records {
+            if let Some(v) = zone_violation_for_record(r, &zones) {
+                zone_hits.push((r.line, v.tag(), v.message()));
             }
+        }
+        // Zone hits need the raw line; fetch lazily and only if any.
+        let raw_lines = if zone_hits.is_empty() {
+            None
+        } else {
+            Some(per_file.raw_lines(file))
         };
+        let zone_hits: Vec<(u32, &'static str, String, &str)> = zone_hits
+            .into_iter()
+            .map(|(l, t, m)| {
+                let raw = raw_lines
+                    .as_ref()
+                    .and_then(|ls| ls.get(l as usize - 1))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                (l, t, m, raw)
+            })
+            .collect();
+        hits.extend(zone_hits);
+        // Stable: diagnostics for one line keep parser order, zone
+        // hit comes after them, exactly like the old code path.
+        hits.sort_by_key(|h| h.0);
 
-        for (idx, raw) in content.lines().enumerate() {
-            // Cheap pre-filter so we don't allocate for every line.
-            if !raw.contains("CLOCK:") {
-                continue;
-            }
-            // Emit ONE violation record per axis. A line may carry
-            // several (e.g. weekday-mismatch + duration-mismatch).
-            let mut emit_one = |tag: &'static str, message: String| -> Result<bool, String> {
-                violation_count += 1;
-                let v = Violation {
-                    file: file.clone(),
-                    line: idx + 1,
-                    raw: raw.to_string(),
-                    tag,
-                    message,
-                };
-                writer.emit(&v).map_err(|e| e.to_string())?;
-                Ok(opts.first)
+        for (line, tag, message, raw) in hits {
+            violation_count += 1;
+            let v = Violation {
+                file: file.to_path_buf(),
+                line: line as usize,
+                raw: raw.to_string(),
+                tag,
+                message,
             };
-            match parse_clock_line(raw) {
-                Ok(None) => continue,
-                Ok(Some(p)) => {
-                    for v in &p.violations {
-                        if emit_one(v.tag(), v.message())? {
-                            break 'files;
-                        }
-                    }
-                    // Accepted-zones check rides on top of the
-                    // structural violations; emit it only when the
-                    // line otherwise structurally parses (it does
-                    // here — we're inside Ok(Some)).
-                    if let Some(v) = check_accepted_zones(&p, &zones)
-                        && emit_one(v.tag(), v.message())?
-                    {
-                        break 'files;
-                    }
-                }
-                Err(err) => {
-                    if emit_one(err.tag(), err.message())? {
-                        break 'files;
-                    }
-                }
+            writer.emit(&v).map_err(|e| e.to_string())?;
+            if opts.first {
+                break 'files;
             }
         }
     }
 
     writer.finish(violation_count).map_err(|e| e.to_string())?;
+    let emit = t_emit.elapsed();
+
+    if opts.timing {
+        report_prep_timing("check", &per_file, prep, emit, t_total.elapsed());
+    }
     Ok(if violation_count == 0 { 0 } else { 1 })
+}
+
+/// The `unaccepted-tz` rule evaluated on a cached record.
+///
+/// The record stores the UTC instant and the line's offset; the
+/// local wall time the rule needs is their sum. Seconds are folded
+/// in already, so `has_seconds` does not matter here.
+fn zone_violation_for_record(
+    r: &crate::index::clock_blob::Record,
+    zones: &[chrono_tz::Tz],
+) -> Option<crate::org::clock::ClockViolation> {
+    if zones.is_empty() {
+        return None;
+    }
+    let local_secs = r.start + r.tz_minutes as i64 * 60 - era_to_unix_offset_seconds();
+    let naive = chrono::DateTime::from_timestamp(local_secs, 0)?.naive_utc();
+    crate::org::clock::check_accepted_zones_at(naive, r.tz_minutes as i32, zones)
+}
+
+/// Per-file projections for the per-line commands, in the caller's
+/// file order, either from the cache (default) or freshly computed.
+struct PerFile {
+    files: Vec<(PathBuf, Projection)>,
+    timing: Option<crate::index::clock_cache::Timing>,
+}
+
+impl PerFile {
+    /// Source lines of `file`, read on demand. Only the few lines a
+    /// report actually prints are ever requested, so this is a cold
+    /// read per *printed* file, not per scanned file.
+    fn raw_lines(&self, file: &Path) -> Vec<String> {
+        // Decode exactly as the projection did, so line numbers and
+        // text line up for files that are not valid UTF-8.
+        fs::read(file)
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn per_file_projections(
+    files: &[PathBuf],
+    verify: bool,
+    no_cache: bool,
+) -> Result<PerFile, String> {
+    let mut cache = if no_cache {
+        ClockCache::in_memory()?
+    } else {
+        ClockCache::open(&clock_cache_path()?)?
+    };
+    let mode = if verify || no_cache {
+        Verify::Bytes
+    } else {
+        Verify::Metadata
+    };
+    let (per_file, timing) = cache.resolve_per_file(files, mode)?;
+    Ok(PerFile {
+        files: per_file,
+        timing: (!no_cache).then_some(timing),
+    })
+}
+
+fn report_prep_timing(
+    cmd: &str,
+    per_file: &PerFile,
+    prep: std::time::Duration,
+    emit: std::time::Duration,
+    total: std::time::Duration,
+) {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    eprintln!("timing (ms) [{}]:", cmd);
+    match &per_file.timing {
+        Some(t) => {
+            eprintln!("  validate   {:>9.2}", ms(t.validate));
+            eprintln!("  l1-miss    {:>9.2}", ms(t.l1_miss));
+            eprintln!("  prep-total {:>9.2}", ms(prep));
+        }
+        None => eprintln!("  prep       {:>9.2}   (no cache: read+parse)", ms(prep)),
+    }
+    eprintln!("  emit       {:>9.2}", ms(emit));
+    eprintln!("  total      {:>9.2}", ms(total));
+    eprintln!("counters:");
+    eprintln!("  files      {:>9}", per_file.files.len());
+    if let Some(t) = &per_file.timing {
+        eprintln!("  l1-hits    {:>9}", t.l1_hits);
+        eprintln!("  l1-misses  {:>9}", t.l1_misses);
+    }
 }
 
 /// Wraps stdout and selects the right serializer per CLI flags.
@@ -633,11 +743,28 @@ pub fn run_fix(opts: FixOptions) -> Result<i32, String> {
             }
         };
 
+        // Only lines orgize recognises as CLOCK candidates may be
+        // rewritten. Everything else — including a CLOCK-shaped
+        // sample inside a literal block — is copied through verbatim.
+        // Diagnostics are part of the candidate set on purpose: a
+        // weekday- or duration-broken line is precisely what `fix`
+        // exists to repair, and it is absent from the clean records.
+        let projection = project(&file.to_string_lossy(), &content);
+        let candidates: std::collections::BTreeSet<usize> = projection
+            .candidate_lines()
+            .into_iter()
+            .map(|l| (l as usize).saturating_sub(1))
+            .collect();
+
         let mut new_content = String::with_capacity(content.len());
         let mut file_records: Vec<FixRecord> = Vec::new();
         // `split_inclusive` preserves each line's newline state so
         // we can write the file back byte-faithfully.
         for (idx, chunk) in content.split_inclusive('\n').enumerate() {
+            if !candidates.contains(&idx) {
+                new_content.push_str(chunk);
+                continue;
+            }
             let (orig, eol) = match chunk.strip_suffix('\n') {
                 Some(stripped) => (stripped, "\n"),
                 None => (chunk, ""),
@@ -788,6 +915,12 @@ pub struct ListOptions {
     pub has_property: Vec<String>,
     /// NDJSON output (currently the only supported shape).
     pub json: bool,
+    /// Re-read and hash every file instead of trusting metadata.
+    pub verify: bool,
+    /// Bypass the cache: read and project every file from scratch.
+    pub no_cache: bool,
+    /// Print a phase-by-phase timing breakdown on stderr.
+    pub timing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -864,6 +997,7 @@ struct ListReject {
 /// as "fix the rejected line then re-run, the inventory is
 /// incomplete".
 pub fn run_list(opts: ListOptions) -> Result<i32, String> {
+    let t_total = Instant::now();
     let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
     debug!("listing CLOCK lines from {} org file(s)", files.len());
 
@@ -871,176 +1005,224 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
     let zones = cfg.clock.resolve_zones()?;
     let heading_filter = build_heading_filter(&opts)?;
 
-    if heading_filter.is_empty() {
-        return run_list_unfiltered(&files, &zones, opts.json);
-    }
+    // Facts and diagnostics come from the cache; on a warm run no
+    // file is parsed. Source is still read for the fields the cache
+    // deliberately does not hold — the raw line, and the enclosing
+    // heading when a filter is active — but reading is ~10× cheaper
+    // than parsing and is only done for files that have a record.
+    let t_prep = Instant::now();
+    let per_file = per_file_projections(&files, opts.verify, opts.no_cache)?;
+    let prep = t_prep.elapsed();
 
-    run_list_filtered(&files, &zones, opts.json, &heading_filter)
-}
-
-fn run_list_unfiltered(
-    files: &[PathBuf],
-    zones: &[chrono_tz::Tz],
-    json: bool,
-) -> Result<i32, String> {
     let mut stdout = io::BufWriter::new(io::stdout());
     let mut stderr = io::BufWriter::new(io::stderr());
+    let t_emit = Instant::now();
 
-    for file in files {
-        let content = match fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("cannot read {}: {}", file.display(), e);
-                continue;
-            }
-        };
+    for (file, proj) in &per_file.files {
+        // Contract: abort on the FIRST non-canonical line in source
+        // order, before emitting anything after it from this file.
+        // Diagnostics and clean records are merged by line to honour
+        // that ordering exactly.
+        let first_bad = proj.diagnostics.iter().map(|d| d.line).min();
+        let mut records: Vec<&crate::index::clock_blob::Record> =
+            proj.blob.records.iter().collect();
+        records.sort_by_key(|r| r.line);
 
-        for (idx, raw) in content.lines().enumerate() {
-            if !raw.contains("CLOCK:") {
-                continue;
-            }
-            match parse_clock_line(raw) {
-                Ok(None) => continue,
-                Ok(Some(p)) if p.violations.is_empty() => {
-                    if let Some(v) = check_accepted_zones(&p, zones) {
-                        let rej = ListReject {
-                            file: file.clone(),
-                            line: idx + 1,
-                            raw: raw.to_string(),
-                            tag: v.tag(),
-                            message: v.message(),
-                        };
-                        return abort_list(&mut stdout, &mut stderr, &rej);
-                    }
-                    let rec = build_clock_record(file, idx + 1, raw, &p, None);
-                    if json {
-                        let line = serde_json::to_string(&rec)
-                            .map_err(|e| format!("serializing record: {}", e))?;
-                        writeln!(stdout, "{}", line).map_err(|e| e.to_string())?;
-                    }
-                }
-                Ok(Some(p)) => {
-                    let v = &p.violations[0];
-                    let rej = ListReject {
-                        file: file.clone(),
-                        line: idx + 1,
-                        raw: raw.to_string(),
-                        tag: v.tag(),
-                        message: v.message(),
-                    };
-                    return abort_list(&mut stdout, &mut stderr, &rej);
-                }
-                Err(err) => {
-                    let rej = ListReject {
-                        file: file.clone(),
-                        line: idx + 1,
-                        raw: raw.to_string(),
-                        tag: err.tag(),
-                        message: err.message(),
-                    };
-                    return abort_list(&mut stdout, &mut stderr, &rej);
-                }
-            }
+        if records.is_empty() && first_bad.is_none() {
+            continue;
         }
+        let lines = per_file.raw_lines(file);
+        let mut pending: Vec<ClockRecord> = Vec::new();
+        for r in records {
+            if let Some(bad) = first_bad
+                && r.line > bad
+            {
+                break;
+            }
+            let raw = lines
+                .get(r.line as usize - 1)
+                .map(String::as_str)
+                .unwrap_or("");
+            if let Some(v) = zone_violation_for_record(r, &zones) {
+                let rej = ListReject {
+                    file: file.clone(),
+                    line: r.line as usize,
+                    raw: raw.to_string(),
+                    tag: v.tag(),
+                    message: v.message(),
+                };
+                // Unfiltered listing streams; filtered listing buffers
+                // per file. Both flush what precedes the rejection.
+                flush_records(&mut stdout, &pending, opts.json)?;
+                return abort_list(&mut stdout, &mut stderr, &rej);
+            }
+            // A filter needs the enclosing heading; the projection
+            // stored it for every clocked heading, so no source parse
+            // is required here.
+            let heading = if heading_filter.is_empty() {
+                None
+            } else {
+                let Some(h) = proj.headings.get(&r.heading_id) else {
+                    continue;
+                };
+                if !heading_filter.matches_parts(&h.title, &h.properties, None) {
+                    continue;
+                }
+                Some(h)
+            };
+            pending.push(record_from_cached(file, r, raw, heading));
+        }
+
+        if let Some(bad) = first_bad {
+            let d = proj
+                .diagnostics
+                .iter()
+                .find(|d| d.line == bad)
+                .expect("min came from this list");
+            let rej = ListReject {
+                file: file.clone(),
+                line: d.line as usize,
+                raw: d.raw.clone(),
+                tag: d.tag,
+                message: d.message.clone(),
+            };
+            // Filtered listing historically discarded the whole file's
+            // records on rejection; unfiltered streamed the earlier
+            // ones. Preserve both.
+            if heading_filter.is_empty() {
+                flush_records(&mut stdout, &pending, opts.json)?;
+            }
+            return abort_list(&mut stdout, &mut stderr, &rej);
+        }
+        flush_records(&mut stdout, &pending, opts.json)?;
     }
 
     stdout.flush().map_err(|e| e.to_string())?;
     stderr.flush().map_err(|e| e.to_string())?;
-    Ok(0)
-}
-
-fn run_list_filtered(
-    files: &[PathBuf],
-    zones: &[chrono_tz::Tz],
-    json: bool,
-    heading_filter: &FilterOptions,
-) -> Result<i32, String> {
-    let mut stdout = io::BufWriter::new(io::stdout());
-    let mut stderr = io::BufWriter::new(io::stderr());
-
-    for file in files {
-        let content = match fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("cannot read {}: {}", file.display(), e);
-                continue;
-            }
-        };
-
-        let records = match collect_filtered_clock_records(file, &content, zones, heading_filter) {
-            Ok(records) => records,
-            Err(rej) => return abort_list(&mut stdout, &mut stderr, &rej),
-        };
-
-        if json {
-            for rec in records {
-                let line = serde_json::to_string(&rec)
-                    .map_err(|e| format!("serializing record: {}", e))?;
-                writeln!(stdout, "{}", line).map_err(|e| e.to_string())?;
-            }
-        }
+    let emit = t_emit.elapsed();
+    if opts.timing {
+        report_prep_timing("list", &per_file, prep, emit, t_total.elapsed());
     }
-
-    stdout.flush().map_err(|e| e.to_string())?;
-    stderr.flush().map_err(|e| e.to_string())?;
     Ok(0)
 }
 
+fn flush_records<W: Write>(out: &mut W, recs: &[ClockRecord], json: bool) -> Result<(), String> {
+    if !json {
+        return Ok(());
+    }
+    for rec in recs {
+        let line = serde_json::to_string(rec).map_err(|e| format!("serializing record: {}", e))?;
+        writeln!(out, "{}", line).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Build a `ClockRecord` from a cached fact plus the raw source line.
+///
+/// Field-for-field identical to `build_clock_record`: both local
+/// timestamps are reconstructed from the UTC instant and the offset,
+/// which is exact because a line whose two sides carry different
+/// offsets is a `tz-mismatch` and never becomes a record.
+fn record_from_cached(
+    file: &Path,
+    r: &crate::index::clock_blob::Record,
+    raw: &str,
+    heading: Option<&ClockedHeading>,
+) -> ClockRecord {
+    let local = |instant: i64| -> chrono::NaiveDateTime {
+        let unix = instant + r.tz_minutes as i64 * 60 - era_to_unix_offset_seconds();
+        chrono::DateTime::from_timestamp(unix, 0)
+            .expect("cached instant in range")
+            .naive_utc()
+    };
+    use chrono::{Datelike, Timelike};
+    let iso = |t: chrono::NaiveDateTime| {
+        format_iso(
+            chrono::NaiveDate::from_ymd_opt(t.year(), t.month(), t.day()).expect("valid"),
+            t.hour(),
+            t.minute(),
+            t.second(),
+            r.tz_minutes as i32,
+        )
+    };
+    ClockRecord {
+        file: file.to_path_buf(),
+        line: r.line as usize,
+        start: iso(local(r.start)),
+        end: iso(local(r.end)),
+        tz_minutes: r.tz_minutes as i32,
+        has_seconds: r.flags & crate::index::clock_blob::FLAG_HAS_SECONDS != 0,
+        duration_seconds: r.end - r.start,
+        raw: raw.to_string(),
+        heading: heading.map(|h| HeadingSummary {
+            level: h.level,
+            line: h.line as usize,
+            title: h.title.clone(),
+            tags: h.tags.clone(),
+            properties: h.properties.clone(),
+        }),
+    }
+}
+
+/// Filtered records for one file's content, without the cache.
+///
+/// Used by unit tests that hand in content directly; `run_list`
+/// goes through the cache and the shared `record_from_cached` path.
+/// Both apply the same order of checks: zone rule, then enclosing
+/// heading, then filter.
+#[cfg(test)]
 fn collect_filtered_clock_records(
     file: &Path,
     content: &str,
     zones: &[chrono_tz::Tz],
     heading_filter: &FilterOptions,
 ) -> Result<Vec<ClockRecord>, ListReject> {
-    let mut records = Vec::new();
+    let proj = project(&file.to_string_lossy(), content);
+    let lines: Vec<&str> = content.lines().collect();
+    let first_bad = proj.diagnostics.iter().map(|d| d.line).min();
+    let mut records: Vec<&crate::index::clock_blob::Record> = proj.blob.records.iter().collect();
+    records.sort_by_key(|r| r.line);
 
-    for (idx, raw) in content.lines().enumerate() {
-        if !raw.contains("CLOCK:") {
+    let mut out = Vec::new();
+    for r in records {
+        if let Some(bad) = first_bad
+            && r.line > bad
+        {
+            break;
+        }
+        let raw = lines.get(r.line as usize - 1).copied().unwrap_or("");
+        if let Some(v) = zone_violation_for_record(r, zones) {
+            return Err(ListReject {
+                file: file.to_path_buf(),
+                line: r.line as usize,
+                raw: raw.to_string(),
+                tag: v.tag(),
+                message: v.message(),
+            });
+        }
+        let Some(h) = proj.headings.get(&r.heading_id) else {
+            continue;
+        };
+        if !heading_filter.matches_parts(&h.title, &h.properties, None) {
             continue;
         }
-        match parse_clock_line(raw) {
-            Ok(None) => continue,
-            Ok(Some(p)) if p.violations.is_empty() => {
-                if let Some(v) = check_accepted_zones(&p, zones) {
-                    return Err(ListReject {
-                        file: file.to_path_buf(),
-                        line: idx + 1,
-                        raw: raw.to_string(),
-                        tag: v.tag(),
-                        message: v.message(),
-                    });
-                }
-                let Some(heading) = heading_for_line(content, idx + 1) else {
-                    continue;
-                };
-                if !heading_filter.matches(&heading) {
-                    continue;
-                }
-                records.push(build_clock_record(file, idx + 1, raw, &p, Some(&heading)));
-            }
-            Ok(Some(p)) => {
-                let v = &p.violations[0];
-                return Err(ListReject {
-                    file: file.to_path_buf(),
-                    line: idx + 1,
-                    raw: raw.to_string(),
-                    tag: v.tag(),
-                    message: v.message(),
-                });
-            }
-            Err(err) => {
-                return Err(ListReject {
-                    file: file.to_path_buf(),
-                    line: idx + 1,
-                    raw: raw.to_string(),
-                    tag: err.tag(),
-                    message: err.message(),
-                });
-            }
-        }
+        out.push(record_from_cached(file, r, raw, Some(h)));
     }
-
-    Ok(records)
+    if let Some(bad) = first_bad {
+        let d = proj
+            .diagnostics
+            .iter()
+            .find(|d| d.line == bad)
+            .expect("min came from this list");
+        return Err(ListReject {
+            file: file.to_path_buf(),
+            line: d.line as usize,
+            raw: d.raw.clone(),
+            tag: d.tag,
+            message: d.message.clone(),
+        });
+    }
+    Ok(out)
 }
 
 fn build_heading_filter(opts: &ListOptions) -> Result<FilterOptions, String> {
@@ -1082,41 +1264,6 @@ fn abort_list<W1: Write, W2: Write>(
     Ok(1)
 }
 
-fn build_clock_record(
-    file: &Path,
-    line_no: usize,
-    raw: &str,
-    p: &crate::org::clock::ParsedClockLine,
-    heading: Option<&Heading>,
-) -> ClockRecord {
-    let start_iso = format_iso(
-        p.line.start.date,
-        p.line.start.hour,
-        p.line.start.minute,
-        p.line.start.second.unwrap_or(0),
-        p.line.start.tz_minutes,
-    );
-    let end_iso = format_iso(
-        p.line.end.date,
-        p.line.end.hour,
-        p.line.end.minute,
-        p.line.end.second.unwrap_or(0),
-        p.line.end.tz_minutes,
-    );
-    let dur_seconds = duration_seconds_of(&p.line);
-    ClockRecord {
-        file: file.to_path_buf(),
-        line: line_no,
-        start: start_iso,
-        end: end_iso,
-        tz_minutes: p.line.start.tz_minutes,
-        has_seconds: p.line.has_seconds,
-        duration_seconds: dur_seconds,
-        raw: raw.to_string(),
-        heading: heading.map(HeadingSummary::from),
-    }
-}
-
 /// Format an instant as `YYYY-MM-DDTHH:MM:SS±HH:MM`.
 fn format_iso(
     date: chrono::NaiveDate,
@@ -1137,23 +1284,6 @@ fn format_iso(
         abs / 60,
         abs % 60,
     )
-}
-
-fn duration_seconds_of(line: &crate::org::clock::ClockLine) -> i64 {
-    use chrono::NaiveDateTime;
-    let to_naive = |t: &crate::org::clock::Timestamp| -> NaiveDateTime {
-        NaiveDateTime::new(
-            t.date,
-            chrono::NaiveTime::from_hms_opt(t.hour, t.minute, t.second.unwrap_or(0))
-                .expect("in-range time"),
-        )
-    };
-    let s = to_naive(&line.start);
-    let e = to_naive(&line.end);
-    // Both sides have the same TZ at this point (parser would
-    // have flagged otherwise), so naive subtraction yields the
-    // wall-clock delta which equals the UTC delta.
-    (e - s).num_seconds()
 }
 
 fn emit_reject<W: Write>(out: &mut W, r: &ListReject) -> io::Result<()> {
@@ -1525,6 +1655,10 @@ mod tests {
             nul: false,
             json: true, // tests use json so output is unaffected by colors
             first: false,
+            verify: false,
+            // Unit tests must not touch the user's real cache file.
+            no_cache: true,
+            timing: false,
         }
     }
 
@@ -1944,6 +2078,9 @@ mod tests {
             ignore_case: false,
             has_property: Vec::new(),
             json: true,
+            verify: false,
+            no_cache: true,
+            timing: false,
         }
     }
 
@@ -1962,6 +2099,9 @@ mod tests {
                 .map(|name| (*name).to_string())
                 .collect(),
             json: true,
+            verify: false,
+            no_cache: true,
+            timing: false,
         }
     }
 
@@ -2283,6 +2423,111 @@ mod tests {
             "Asia/Shanghai".parse().unwrap(),
         ];
         assert!(guard_accepted_zone_at(dt, 330, &zones).is_err());
+    }
+
+    // ----- orgize-driven discovery, shared by check / list / fix --------
+
+    /// A dirty CLOCK outside any block, plus a byte-identical dirty
+    /// CLOCK inside a src block. Only the former may be seen.
+    const SRC_SAMPLE: &str = indoc! {"
+        * h
+        :LOGBOOK:
+        CLOCK: [2024-04-16 Mon 14:15 +0200]--[2024-04-16 Mon 14:30 +0200] =>  0:15
+        :END:
+        #+begin_src org
+        CLOCK: [2024-04-16 Mon 14:15 +0200]--[2024-04-16 Mon 14:30 +0200] =>  0:15
+        #+end_src
+    "};
+
+    #[test]
+    fn check_ignores_clock_inside_src_block() {
+        let td = TempDir::new("check-src");
+        write(&td.path().join("a.org"), SRC_SAMPLE);
+        // Exit 1 (the real line is dirty) is the sanity half; the
+        // contract half is asserted via the integration test that
+        // counts emitted records, since `run_check` writes to stdout.
+        assert_eq!(
+            run_check(opts_for(vec![td.path().to_path_buf()])).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn list_ignores_clock_inside_src_block() {
+        let td = TempDir::new("list-src");
+        write(
+            &td.path().join("a.org"),
+            indoc! {"
+                * h
+                CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 12:00 +0100] =>  2:00
+                #+begin_src org
+                CLOCK: [2026-01-07 Wed 09:57]--[2026-01-07 Wed 12:19] =>  2:22
+                #+end_src
+            "},
+        );
+        // The src-block sample is missing its TZ; were it visible,
+        // list would abort with exit 1. It must be invisible.
+        assert_eq!(
+            run_list(list_opts(vec![td.path().to_path_buf()])).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn fix_leaves_src_block_sample_untouched_byte_for_byte() {
+        let td = TempDir::new("fix-src");
+        let f = td.path().join("a.org");
+        write(&f, SRC_SAMPLE);
+        assert_eq!(run_fix(fix_opts(vec![f.clone()], true)).unwrap(), 0);
+        let after = fs::read_to_string(&f).unwrap();
+        let lines: Vec<&str> = after.lines().collect();
+        let real = lines[2];
+        let sample = lines[5];
+        assert!(real.contains("Tue"), "real line must be fixed: {}", real);
+        assert!(
+            sample.contains("Mon"),
+            "src-block sample must be untouched: {}",
+            sample
+        );
+    }
+
+    #[test]
+    fn fix_preserves_crlf_terminators() {
+        let td = TempDir::new("fix-crlf");
+        let f = td.path().join("a.org");
+        let before = "* h\r\n\
+                      CLOCK: [2024-04-16 Mon 14:15 +0200]--[2024-04-16 Mon 14:30 +0200] =>  0:15\r\n\
+                      tail\r\n";
+        fs::write(&f, before).unwrap();
+        assert_eq!(run_fix(fix_opts(vec![f.clone()], true)).unwrap(), 0);
+        let after = fs::read(&f).unwrap();
+        let expected = "* h\r\n\
+                        CLOCK: [2024-04-16 Tue 14:15 +0200]--[2024-04-16 Tue 14:30 +0200] =>  0:15\r\n\
+                        tail\r\n";
+        assert_eq!(
+            after,
+            expected.as_bytes(),
+            "CR must survive: {:?}",
+            String::from_utf8_lossy(&after)
+        );
+    }
+
+    #[test]
+    fn check_first_emits_exactly_one_record() {
+        // Regression guard the old `check_first_short_circuits` did
+        // not provide: `--first` stops after ONE violation, even when
+        // the first offending line carries several.
+        let td = TempDir::new("check-first-one");
+        write(
+            &td.path().join("a.org"),
+            "CLOCK: [2024-11-13 Mon 15:00 +0100]--[2024-11-13 Mon 15:45 +0100] => 720:45\n",
+        );
+        let mut o = opts_for(vec![td.path().to_path_buf()]);
+        o.first = true;
+        // Two axes are wrong (weekday ×2, duration); with --first the
+        // exit is still 1 and the run must not panic or over-emit.
+        // Record count is pinned by the integration test.
+        assert_eq!(run_check(o).unwrap(), 1);
     }
 
     // ----- fmt ----------------------------------------------------------

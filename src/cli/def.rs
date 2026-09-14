@@ -19,6 +19,14 @@ pub struct Args {
     #[arg(long)]
     pub log_time: bool,
 
+    /// Force color output (defaults to automatic TTY detection)
+    #[arg(long, global = true)]
+    pub color: bool,
+
+    /// Force plain output (defaults to automatic TTY detection)
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
     /// Subcommand to execute
     #[command(subcommand)]
     pub command: Option<Commands>,

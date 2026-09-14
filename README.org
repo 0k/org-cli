@@ -33,6 +33,21 @@ cargo build --release
 org-cli --help
 #+end_src
 
+** Color control
+
+Human output uses color automatically when stdout is a terminal and respects
+the =NO_COLOR= environment variable. Use the global =--color= or =--no-color=
+flag to override that behavior; global flags work before or after nested
+commands.
+
+#+begin_src bash
+org-cli --color syntax check notes.org
+org-cli syntax check --no-color notes.org
+#+end_src
+
+Using both flags is an error. NDJSON and NUL records remain ANSI-free even
+with =--color=.
+
 * Commands
 
 ** =headings= — list headings, optionally filtered

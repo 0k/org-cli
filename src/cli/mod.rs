@@ -21,6 +21,16 @@ fn setup_logging_and_colors(cli: &def::Args) -> Result<(), String> {
 
     log::setup(cli.verbose, logs, cli.log_time)?;
 
+    if cli.color && cli.no_color {
+        return Err("Cannot use both --color and --no-color".to_string());
+    }
+
+    if cli.color {
+        colored::control::set_override(true);
+    } else if cli.no_color {
+        colored::control::set_override(false);
+    }
+
     Ok(())
 }
 

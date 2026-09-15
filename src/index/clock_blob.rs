@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! Header   64 bytes   magic, ABI versions, counts, body digest
-//! Records  N × 36     sorted by (start, end, path_id, byte_offset)
+//! Records  N × 40     sorted by (start, end, path_id, byte_offset)
 //! Strings  var        length-prefixed UTF-8, deduplicated
 //! ```
 //!
@@ -45,7 +45,7 @@ pub const MAGIC: &[u8; 4] = b"OCLK";
 
 /// Bump when the byte layout of header, record, or string table
 /// changes.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 
 /// Bump when the sort key changes. Consumers assume records are
 /// ordered by this key and will misbehave on a different order.
@@ -53,18 +53,24 @@ pub const SORT_ABI: u16 = 1;
 
 const HEADER_LEN: usize = 64;
 /// `i64 start, i64 end, u32 path, u32 heading, u32 offset, u32 line,
-/// i16 tz, u16 flags` — exactly 36 bytes, no padding on the wire.
-const RECORD_LEN: usize = 36;
+/// i16 tz, u16 flags, u32 tag` — exactly 40 bytes, no padding on the wire.
+const RECORD_LEN: usize = 40;
 
 /// Sentinel for "no heading" in [`Record::heading_id`].
 pub const NO_HEADING: u32 = u32::MAX;
 
+/// Sentinel for "no customer tag" in [`Record::tag_id`].
+pub const NO_TAG: u32 = u32::MAX;
+
 /// Bit in [`Record::flags`]: the source line carried seconds.
 pub const FLAG_HAS_SECONDS: u16 = 1 << 0;
 
-/// One CLOCK fact, reduced to what a sorted global list needs.
+/// Bit in [`Record::flags`]: the source line uses the `FILED:` keyword.
+pub const FLAG_FILED: u16 = 1 << 1;
+
+/// One CLOCK or FILED fact, reduced to what a sorted global list needs.
 ///
-/// `path_id` and `heading_id` index the blob's string table; they
+/// `path_id`, `heading_id`, and `tag_id` index the blob's string table; they
 /// are only meaningful together with the [`Blob`] they came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Record {
@@ -77,7 +83,7 @@ pub struct Record {
     pub path_id: u32,
     /// Index of the enclosing heading title, or [`NO_HEADING`].
     pub heading_id: u32,
-    /// Byte offset of the CLOCK line's first byte within the file.
+    /// Byte offset of the source line's first byte within the file.
     pub byte_offset: u32,
     /// 1-based line number, for human-facing reports only.
     pub line: u32,
@@ -85,6 +91,8 @@ pub struct Record {
     pub tz_minutes: i16,
     /// Bit flags; see `FLAG_*`.
     pub flags: u16,
+    /// Index of the FILED customer tag, or [`NO_TAG`] for CLOCK records.
+    pub tag_id: u32,
 }
 
 impl Record {
@@ -109,7 +117,7 @@ pub struct Blob {
     pub parser_abi: u16,
     /// Records, sorted by [`Record::sort_key`].
     pub records: Vec<Record>,
-    /// Interned strings referenced by `path_id` / `heading_id`.
+    /// Interned strings referenced by `path_id`, `heading_id`, or `tag_id`.
     pub strings: Vec<String>,
 }
 
@@ -198,7 +206,9 @@ impl Blob {
     fn strings_resolve(&self) -> bool {
         let n = self.strings.len();
         self.records.iter().all(|r| {
-            (r.path_id as usize) < n && (r.heading_id == NO_HEADING || (r.heading_id as usize) < n)
+            (r.path_id as usize) < n
+                && (r.heading_id == NO_HEADING || (r.heading_id as usize) < n)
+                && (r.tag_id == NO_TAG || (r.tag_id as usize) < n)
         })
     }
 
@@ -225,6 +235,7 @@ impl Blob {
             body.extend_from_slice(&r.line.to_le_bytes());
             body.extend_from_slice(&r.tz_minutes.to_le_bytes());
             body.extend_from_slice(&r.flags.to_le_bytes());
+            body.extend_from_slice(&r.tag_id.to_le_bytes());
         }
         let string_table_offset =
             u32::try_from(HEADER_LEN + body.len()).map_err(|_| EncodeError::TooLarge)?;
@@ -306,6 +317,7 @@ impl Blob {
                 line: u32_r(28),
                 tz_minutes: i16::from_le_bytes([r[32], r[33]]),
                 flags: u16::from_le_bytes([r[34], r[35]]),
+                tag_id: u32_r(36),
             });
         }
 
@@ -385,6 +397,11 @@ impl Blob {
                             NO_HEADING
                         } else {
                             map[r.heading_id as usize]
+                        },
+                        tag_id: if r.tag_id == NO_TAG {
+                            NO_TAG
+                        } else {
+                            map[r.tag_id as usize]
                         },
                         ..*r
                     })
@@ -472,6 +489,7 @@ mod tests {
             line: 1,
             tz_minutes: 60,
             flags: 0,
+            tag_id: NO_TAG,
         }
     }
 
@@ -501,6 +519,15 @@ mod tests {
         let bytes = b.encode().unwrap();
         let back = Blob::decode(&bytes).unwrap();
         assert_eq!(back, b);
+    }
+
+    #[test]
+    fn round_trip_preserves_filed_tag_reference() {
+        let mut b = sample();
+        b.strings.push("lok".into());
+        b.records[0].flags |= FLAG_FILED;
+        b.records[0].tag_id = 3;
+        assert_eq!(Blob::decode(&b.encode().unwrap()).unwrap(), b);
     }
 
     // C1 (empty is a first-class value)
@@ -541,6 +568,16 @@ mod tests {
             Blob::decode(&bytes),
             Err(DecodeError::UnsupportedSort(_))
         ));
+    }
+
+    #[test]
+    fn rejects_previous_format_version() {
+        let mut bytes = sample().encode().unwrap();
+        bytes[4..6].copy_from_slice(&(FORMAT_VERSION - 1).to_le_bytes());
+        assert_eq!(
+            Blob::decode(&bytes),
+            Err(DecodeError::UnsupportedFormat(FORMAT_VERSION - 1))
+        );
     }
 
     // C3 (payload tamper is caught by the digest, not by luck)
@@ -629,6 +666,37 @@ mod tests {
         let m = Blob::merge(&[&a, &b]);
         assert_eq!(m.strings, vec!["/shared.org".to_string()]);
         assert!(m.records.iter().all(|r| r.path_id == 0));
+    }
+
+    #[test]
+    fn merge_rekeys_filed_tag_ids() {
+        let a = Blob {
+            projection_abi: 1,
+            parser_abi: 1,
+            records: vec![Record {
+                flags: FLAG_FILED,
+                tag_id: 1,
+                ..rec(1, 2, 0, 0)
+            }],
+            strings: vec!["/a.org".into(), "lok".into()],
+        };
+        let b = Blob {
+            projection_abi: 1,
+            parser_abi: 1,
+            records: vec![Record {
+                flags: FLAG_FILED,
+                tag_id: 1,
+                ..rec(3, 4, 0, 0)
+            }],
+            strings: vec!["/b.org".into(), "acme".into()],
+        };
+        let merged = Blob::merge(&[&a, &b]);
+        let tags: Vec<&str> = merged
+            .records
+            .iter()
+            .map(|r| merged.strings[r.tag_id as usize].as_str())
+            .collect();
+        assert_eq!(tags, vec!["lok", "acme"]);
     }
 
     #[test]

@@ -41,6 +41,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::index::clock_blob::Blob;
+use crate::org::clock::ClockKeyword;
 use crate::org::clock_project::{
     ClockedHeading, Diagnostic, PARSER_ABI, PROJECTION_ABI, Projection, project,
 };
@@ -600,6 +601,8 @@ fn encode_diags(d: &[Diagnostic]) -> Vec<u8> {
         out.push(0);
         out.extend_from_slice(x.byte_offset.to_string().as_bytes());
         out.push(0);
+        out.extend_from_slice(x.keyword.as_str().as_bytes());
+        out.push(0);
         out.extend_from_slice(x.tag.as_bytes());
         out.push(0);
         out.extend_from_slice(x.message.as_bytes());
@@ -682,19 +685,25 @@ fn decode_diags(bytes: &[u8]) -> Result<Vec<Diagnostic>, String> {
     let fields: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
     // split() yields a trailing empty slice after the final NUL.
     let fields = &fields[..fields.len().saturating_sub(1)];
-    if !fields.len().is_multiple_of(5) {
+    if !fields.len().is_multiple_of(6) {
         return Err("corrupt diagnostics blob".into());
     }
     let s = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| "corrupt diagnostics utf8");
-    let mut out = Vec::with_capacity(fields.len() / 5);
-    for c in fields.chunks(5) {
-        let tag_owned = s(c[2])?;
+    let mut out = Vec::with_capacity(fields.len() / 6);
+    for c in fields.chunks(6) {
+        let keyword = match s(c[2])?.as_str() {
+            "CLOCK" => ClockKeyword::Clock,
+            "FILED" => ClockKeyword::Filed,
+            _ => return Err("corrupt diagnostics keyword".into()),
+        };
+        let tag_owned = s(c[3])?;
         out.push(Diagnostic {
             line: s(c[0])?.parse().map_err(|_| "corrupt diagnostics line")?,
             byte_offset: s(c[1])?.parse().map_err(|_| "corrupt diagnostics offset")?,
+            keyword,
             tag: intern_tag(&tag_owned),
-            message: s(c[3])?,
-            raw: s(c[4])?,
+            message: s(c[4])?,
+            raw: s(c[5])?,
         });
     }
     Ok(out)
@@ -714,6 +723,9 @@ fn intern_tag(s: &str) -> &'static str {
         "start-after-end" => "start-after-end",
         "duration-mismatch" => "duration-mismatch",
         "spacing-mismatch" => "spacing-mismatch",
+        "missing-tag" => "missing-tag",
+        "invalid-tag" => "invalid-tag",
+        "unexpected-tag" => "unexpected-tag",
         "unaccepted-tz" => "unaccepted-tz",
         _ => "unknown",
     }
@@ -1092,13 +1104,24 @@ mod tests {
 
     #[test]
     fn diags_round_trip() {
-        let d = vec![Diagnostic {
-            line: 3,
-            byte_offset: 42,
-            tag: "missing-tz",
-            message: "start has no ±HHMM".into(),
-            raw: "  CLOCK: [x]".into(),
-        }];
+        let d = vec![
+            Diagnostic {
+                keyword: ClockKeyword::Clock,
+                line: 3,
+                byte_offset: 42,
+                tag: "missing-tz",
+                message: "start has no ±HHMM".into(),
+                raw: "  CLOCK: [x]".into(),
+            },
+            Diagnostic {
+                keyword: ClockKeyword::Filed,
+                line: 4,
+                byte_offset: 84,
+                tag: "invalid-tag",
+                message: "invalid customer tag".into(),
+                raw: "  FILED: [x]  # Bad.Tag".into(),
+            },
+        ];
         assert_eq!(decode_diags(&encode_diags(&d)).unwrap(), d);
         assert!(decode_diags(&[]).unwrap().is_empty());
     }

@@ -28,7 +28,7 @@ use crate::cli::action::walk::resolve_input_files;
 use crate::config::Config;
 use crate::index::clock_cache::{ClockCache, Resolved, Verify};
 use crate::org::clock::{
-    check_accepted_zones, fix_weekday_in_line, format_clock_line, parse_clock_line,
+    ClockKeyword, check_accepted_zones, fix_weekday_in_line, format_clock_line, parse_clock_line,
     recompute_duration_in_line,
 };
 use crate::org::clock_add::{HeadingQuery, apply_add};
@@ -44,6 +44,8 @@ use crate::org::heading::Heading;
 /// CLI options received from `Commands::Clock { Check { … } }`.
 #[derive(Debug, Clone)]
 pub struct CheckOptions {
+    /// Keyword whose lines this invocation checks.
+    pub kind: ClockKeyword,
     /// Files or directories to scan. Empty means "use the agenda
     /// set" (see [`read_agenda_set`]).
     pub paths: Vec<PathBuf>,
@@ -76,7 +78,11 @@ pub struct Violation {
 pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
     let t_total = Instant::now();
     let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
-    debug!("checking {} org file(s)", files.len());
+    debug!(
+        "checking {} lines in {} org file(s)",
+        opts.kind.as_str(),
+        files.len()
+    );
 
     // Load accepted zones once. Empty list → the
     // ``unaccepted-tz`` check is silently disabled.
@@ -100,11 +106,16 @@ pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
         // Merge diagnostics and zone-rule hits in source order so
         // output is byte-identical to the old per-line walk.
         let mut hits: Vec<(u32, &'static str, String, &str)> = Vec::new();
-        for d in &proj.diagnostics {
+        for d in proj.diagnostics.iter().filter(|d| d.keyword == opts.kind) {
             hits.push((d.line, d.tag, d.message.clone(), d.raw.as_str()));
         }
         let mut zone_hits: Vec<(u32, &'static str, String)> = Vec::new();
-        for r in &proj.blob.records {
+        for r in proj
+            .blob
+            .records
+            .iter()
+            .filter(|r| record_matches_kind(r, opts.kind))
+        {
             if let Some(v) = zone_violation_for_record(r, &zones) {
                 zone_hits.push((r.line, v.tag(), v.message()));
             }
@@ -151,7 +162,12 @@ pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
     let emit = t_emit.elapsed();
 
     if opts.timing {
-        report_prep_timing("check", &per_file, prep, emit, t_total.elapsed());
+        let command = if opts.kind == ClockKeyword::Filed {
+            "check-filed"
+        } else {
+            "check"
+        };
+        report_prep_timing(command, &per_file, prep, emit, t_total.elapsed());
     }
     Ok(if violation_count == 0 { 0 } else { 1 })
 }
@@ -293,13 +309,17 @@ impl<'a> StdoutWriter<'a> {
     fn finish(&mut self, count: usize) -> io::Result<()> {
         if !self.opts.json && !self.opts.nul {
             if count == 0 {
-                writeln!(self.stdout, "{}", "All CLOCK lines OK.".green())?;
+                writeln!(
+                    self.stdout,
+                    "{}",
+                    format!("All {} lines OK.", self.opts.kind.as_str()).green()
+                )?;
             } else {
                 writeln!(
                     self.stdout,
                     "\n{} {}",
                     count.to_string().bright_red(),
-                    "CLOCK violation(s) found".bright_red(),
+                    format!("{} violation(s) found", self.opts.kind.as_str()).bright_red(),
                 )?;
             }
         }
@@ -443,7 +463,7 @@ pub fn run_overlap(opts: OverlapOptions) -> Result<i32, String> {
     debug!("prepared {} sorted CLOCK interval(s)", intervals.len());
 
     for (file, diags) in &diagnostics {
-        for d in diags {
+        for d in diags.iter().filter(|d| d.keyword == ClockKeyword::Clock) {
             warn!(
                 "{}:{}: skipping non-canonical CLOCK ({}); run `clock check`",
                 file.display(),
@@ -577,6 +597,7 @@ pub fn clock_cache_path() -> Result<PathBuf, String> {
 fn intervals_from_root(root: &crate::index::clock_blob::Blob) -> Vec<Interval> {
     root.records
         .iter()
+        .filter(|r| r.flags & crate::index::clock_blob::FLAG_FILED == 0)
         .map(|r| Interval {
             start: r.start,
             end: r.end,
@@ -994,6 +1015,8 @@ fn emit_fix_record(
 /// CLI options for `clock list`.
 #[derive(Debug, Clone)]
 pub struct ListOptions {
+    /// Keyword whose valid records this invocation lists.
+    pub kind: ClockKeyword,
     /// Files or directories to scan. Empty → agenda set.
     pub paths: Vec<PathBuf>,
     /// Glob patterns matched against candidate file paths;
@@ -1005,6 +1028,10 @@ pub struct ListOptions {
     pub ignore_case: bool,
     /// Keep only CLOCKs whose enclosing heading has all these properties.
     pub has_property: Vec<String>,
+    /// Keep only FILED records for this customer tag.
+    pub customer: Option<String>,
+    /// NUL-separated fixed-field records.
+    pub nul: bool,
     /// NDJSON output (currently the only supported shape).
     pub json: bool,
     /// Re-read and hash every file instead of trusting metadata.
@@ -1061,6 +1088,20 @@ pub struct ClockRecord {
     pub heading: Option<HeadingSummary>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct FiledMachineRecord {
+    file: PathBuf,
+    line: usize,
+    start: i64,
+    end: i64,
+    tag: String,
+}
+
+struct ListRecord {
+    clock: ClockRecord,
+    filed: Option<FiledMachineRecord>,
+}
+
 /// One rejection diagnostic, written to stderr when a CLOCK line
 /// fails to pass strict canonical validation.
 #[derive(Debug, Clone)]
@@ -1091,7 +1132,11 @@ struct ListReject {
 pub fn run_list(opts: ListOptions) -> Result<i32, String> {
     let t_total = Instant::now();
     let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
-    debug!("listing CLOCK lines from {} org file(s)", files.len());
+    debug!(
+        "listing {} lines from {} org file(s)",
+        opts.kind.as_str(),
+        files.len()
+    );
 
     let cfg = Config::load_default()?;
     let zones = cfg.clock.resolve_zones()?;
@@ -1115,16 +1160,31 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
         // order, before emitting anything after it from this file.
         // Diagnostics and clean records are merged by line to honour
         // that ordering exactly.
-        let first_bad = proj.diagnostics.iter().map(|d| d.line).min();
-        let mut records: Vec<&crate::index::clock_blob::Record> =
-            proj.blob.records.iter().collect();
+        let first_bad = proj
+            .diagnostics
+            .iter()
+            .filter(|d| d.keyword == opts.kind)
+            .map(|d| d.line)
+            .min();
+        let mut records: Vec<&crate::index::clock_blob::Record> = proj
+            .blob
+            .records
+            .iter()
+            .filter(|r| record_matches_kind(r, opts.kind))
+            .filter(|r| {
+                opts.customer.as_ref().is_none_or(|customer| {
+                    r.tag_id != crate::index::clock_blob::NO_TAG
+                        && proj.blob.strings[r.tag_id as usize] == *customer
+                })
+            })
+            .collect();
         records.sort_by_key(|r| r.line);
 
         if records.is_empty() && first_bad.is_none() {
             continue;
         }
         let lines = per_file.raw_lines(file);
-        let mut pending: Vec<ClockRecord> = Vec::new();
+        let mut pending: Vec<ListRecord> = Vec::new();
         for r in records {
             if let Some(bad) = first_bad
                 && r.line > bad
@@ -1145,8 +1205,8 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
                 };
                 // Unfiltered listing streams; filtered listing buffers
                 // per file. Both flush what precedes the rejection.
-                flush_records(&mut stdout, &pending, opts.json)?;
-                return abort_list(&mut stdout, &mut stderr, &rej);
+                flush_records(&mut stdout, &pending, &opts)?;
+                return abort_list(&mut stdout, &mut stderr, &rej, opts.kind);
             }
             // A filter needs the enclosing heading; the projection
             // stored it for every clocked heading, so no source parse
@@ -1162,14 +1222,28 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
                 }
                 Some(h)
             };
-            pending.push(record_from_cached(file, r, raw, heading));
+            let tag = (r.tag_id != crate::index::clock_blob::NO_TAG)
+                .then(|| proj.blob.strings[r.tag_id as usize].as_str());
+            let filed = (opts.kind == ClockKeyword::Filed).then(|| FiledMachineRecord {
+                file: file.clone(),
+                line: r.line as usize,
+                start: r.start - era_to_unix_offset_seconds(),
+                end: r.end - era_to_unix_offset_seconds(),
+                tag: tag
+                    .expect("FILED cache record has a customer tag")
+                    .to_string(),
+            });
+            pending.push(ListRecord {
+                clock: record_from_cached(file, r, raw, heading),
+                filed,
+            });
         }
 
         if let Some(bad) = first_bad {
             let d = proj
                 .diagnostics
                 .iter()
-                .find(|d| d.line == bad)
+                .find(|d| d.line == bad && d.keyword == opts.kind)
                 .expect("min came from this list");
             let rej = ListReject {
                 file: file.clone(),
@@ -1182,29 +1256,66 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
             // records on rejection; unfiltered streamed the earlier
             // ones. Preserve both.
             if heading_filter.is_empty() {
-                flush_records(&mut stdout, &pending, opts.json)?;
+                flush_records(&mut stdout, &pending, &opts)?;
             }
-            return abort_list(&mut stdout, &mut stderr, &rej);
+            return abort_list(&mut stdout, &mut stderr, &rej, opts.kind);
         }
-        flush_records(&mut stdout, &pending, opts.json)?;
+        flush_records(&mut stdout, &pending, &opts)?;
     }
 
     stdout.flush().map_err(|e| e.to_string())?;
     stderr.flush().map_err(|e| e.to_string())?;
     let emit = t_emit.elapsed();
     if opts.timing {
-        report_prep_timing("list", &per_file, prep, emit, t_total.elapsed());
+        let command = if opts.kind == ClockKeyword::Filed {
+            "list-filed"
+        } else {
+            "list"
+        };
+        report_prep_timing(command, &per_file, prep, emit, t_total.elapsed());
     }
     Ok(0)
 }
 
-fn flush_records<W: Write>(out: &mut W, recs: &[ClockRecord], json: bool) -> Result<(), String> {
-    if !json {
-        return Ok(());
-    }
+fn flush_records<W: Write>(
+    out: &mut W,
+    recs: &[ListRecord],
+    opts: &ListOptions,
+) -> Result<(), String> {
     for rec in recs {
-        let line = serde_json::to_string(rec).map_err(|e| format!("serializing record: {}", e))?;
-        writeln!(out, "{}", line).map_err(|e| e.to_string())?;
+        if opts.kind == ClockKeyword::Filed && opts.json {
+            let line = serde_json::to_string(rec.filed.as_ref().expect("FILED machine record"))
+                .map_err(|e| format!("serializing record: {}", e))?;
+            writeln!(out, "{}", line).map_err(|e| e.to_string())?;
+        } else if opts.kind == ClockKeyword::Filed && opts.nul {
+            let filed = rec.filed.as_ref().expect("FILED machine record");
+            write!(
+                out,
+                "{}\0{}\0{}\0{}\0{}\0\0",
+                filed.file.display(),
+                filed.line,
+                filed.start,
+                filed.end,
+                filed.tag,
+            )
+            .map_err(|e| e.to_string())?;
+        } else if opts.kind == ClockKeyword::Filed {
+            let filed = rec.filed.as_ref().expect("FILED machine record");
+            writeln!(
+                out,
+                "{}:{}  {} -- {}  {}",
+                rec.clock.file.display(),
+                rec.clock.line,
+                rec.clock.start,
+                rec.clock.end,
+                filed.tag
+            )
+            .map_err(|e| e.to_string())?;
+        } else if opts.json {
+            let line = serde_json::to_string(&rec.clock)
+                .map_err(|e| format!("serializing record: {}", e))?;
+            writeln!(out, "{}", line).map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -1256,6 +1367,11 @@ fn record_from_cached(
     }
 }
 
+fn record_matches_kind(r: &crate::index::clock_blob::Record, kind: ClockKeyword) -> bool {
+    let filed = r.flags & crate::index::clock_blob::FLAG_FILED != 0;
+    filed == (kind == ClockKeyword::Filed)
+}
+
 /// Filtered records for one file's content, without the cache.
 ///
 /// Used by unit tests that hand in content directly; `run_list`
@@ -1271,8 +1387,18 @@ fn collect_filtered_clock_records(
 ) -> Result<Vec<ClockRecord>, ListReject> {
     let proj = project(&file.to_string_lossy(), content);
     let lines: Vec<&str> = content.lines().collect();
-    let first_bad = proj.diagnostics.iter().map(|d| d.line).min();
-    let mut records: Vec<&crate::index::clock_blob::Record> = proj.blob.records.iter().collect();
+    let first_bad = proj
+        .diagnostics
+        .iter()
+        .filter(|d| d.keyword == ClockKeyword::Clock)
+        .map(|d| d.line)
+        .min();
+    let mut records: Vec<&crate::index::clock_blob::Record> = proj
+        .blob
+        .records
+        .iter()
+        .filter(|r| record_matches_kind(r, ClockKeyword::Clock))
+        .collect();
     records.sort_by_key(|r| r.line);
 
     let mut out = Vec::new();
@@ -1304,7 +1430,7 @@ fn collect_filtered_clock_records(
         let d = proj
             .diagnostics
             .iter()
-            .find(|d| d.line == bad)
+            .find(|d| d.line == bad && d.keyword == ClockKeyword::Clock)
             .expect("min came from this list");
         return Err(ListReject {
             file: file.to_path_buf(),
@@ -1343,13 +1469,19 @@ fn abort_list<W1: Write, W2: Write>(
     stdout: &mut W1,
     stderr: &mut W2,
     rej: &ListReject,
+    kind: ClockKeyword,
 ) -> Result<i32, String> {
     stdout.flush().map_err(|e| e.to_string())?;
     emit_reject(stderr, rej).map_err(|e| e.to_string())?;
     writeln!(
         stderr,
-        "\nstopped on first rejection. Use ``org-cli clock check`` \
+        "\nstopped on first rejection. Use ``org-cli clock {}`` \
          for the complete inventory.",
+        if kind == ClockKeyword::Filed {
+            "check-filed"
+        } else {
+            "check"
+        },
     )
     .map_err(|e| e.to_string())?;
     stderr.flush().map_err(|e| e.to_string())?;
@@ -1459,7 +1591,8 @@ pub fn run_add(opts: AddOptions) -> Result<i32, String> {
     let zones = cfg.clock.resolve_zones()?;
     guard_accepted_zone_at(start, tz, &zones)?;
 
-    let clock_line = format_clock_line(start, end, &tz_str, opts.seconds);
+    let clock_line =
+        format_clock_line(ClockKeyword::Clock, start, end, &tz_str, opts.seconds, None);
 
     let content = fs::read_to_string(&opts.file)
         .map_err(|e| format!("cannot read {}: {}", opts.file.display(), e))?;
@@ -1575,7 +1708,7 @@ pub fn run_fmt(opts: FmtOptions) -> Result<(), String> {
     let zones = cfg.clock.resolve_zones()?;
     guard_accepted_zone_at(start, tz, &zones)?;
 
-    let line = format_clock_line(start, end, &tz_str, opts.seconds);
+    let line = format_clock_line(ClockKeyword::Clock, start, end, &tz_str, opts.seconds, None);
     println!("{}", line);
     Ok(())
 }
@@ -1742,6 +1875,7 @@ mod tests {
 
     fn opts_for(paths: Vec<PathBuf>) -> CheckOptions {
         CheckOptions {
+            kind: ClockKeyword::Clock,
             paths,
             exclude_globs: Vec::new(),
             nul: false,
@@ -2165,11 +2299,14 @@ mod tests {
 
     fn list_opts(paths: Vec<PathBuf>) -> ListOptions {
         ListOptions {
+            kind: ClockKeyword::Clock,
             paths,
             exclude_globs: Vec::new(),
             filter: None,
             ignore_case: false,
             has_property: Vec::new(),
+            customer: None,
+            nul: false,
             json: true,
             verify: false,
             no_cache: true,
@@ -2183,6 +2320,7 @@ mod tests {
         has_property: &[&str],
     ) -> ListOptions {
         ListOptions {
+            kind: ClockKeyword::Clock,
             paths: Vec::new(),
             exclude_globs: Vec::new(),
             filter: filter.map(str::to_string),
@@ -2191,6 +2329,8 @@ mod tests {
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect(),
+            customer: None,
+            nul: false,
             json: true,
             verify: false,
             no_cache: true,
@@ -2630,6 +2770,7 @@ mod tests {
         // Capture the function output indirectly: we exercise the
         // pure formatter, since `run_fmt` writes to stdout.
         let s = format_clock_line(
+            ClockKeyword::Clock,
             NaiveDate::from_ymd_opt(2025, 6, 6)
                 .unwrap()
                 .and_hms_opt(9, 30, 0)
@@ -2640,6 +2781,7 @@ mod tests {
                 .unwrap(),
             "+0200",
             false,
+            None,
         );
         assert_eq!(
             s,
@@ -2650,6 +2792,7 @@ mod tests {
     #[test]
     fn fmt_second_precision() {
         let s = format_clock_line(
+            ClockKeyword::Clock,
             NaiveDate::from_ymd_opt(2026, 1, 7)
                 .unwrap()
                 .and_hms_opt(9, 57, 20)
@@ -2660,6 +2803,7 @@ mod tests {
                 .unwrap(),
             "+0100",
             true,
+            None,
         );
         assert_eq!(
             s,

@@ -651,7 +651,7 @@ mod tests {
         // validation. We build it via the canonical formatter
         // and assert the result of `apply_add` still parses
         // clean when re-read.
-        use crate::org::clock::{format_clock_line, parse_clock_line};
+        use crate::org::clock::{ClockKeyword, format_clock_line, parse_clock_line};
         use chrono::{NaiveDate, NaiveDateTime};
         let s = NaiveDateTime::new(
             NaiveDate::from_ymd_opt(2025, 6, 6).unwrap(),
@@ -661,7 +661,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2025, 6, 6).unwrap(),
             chrono::NaiveTime::from_hms_opt(11, 45, 0).unwrap(),
         );
-        let clock = format_clock_line(s, e, "+0200", false);
+        let clock = format_clock_line(ClockKeyword::Clock, s, e, "+0200", false, None);
 
         let (new, rec) = apply_add(
             "** WIP target\n",

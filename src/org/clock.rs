@@ -1,11 +1,16 @@
-//! Parser and validator for org-mode `CLOCK` lines.
+//! Parser and validator for org-mode `CLOCK` and `FILED` lines.
 //!
-//! A *closed-range* CLOCK line is the only thing this module
-//! recognises. Its canonical shape is:
+//! A *closed-range* clock-family line is the only thing this module
+//! recognises. Its canonical shapes are:
 //!
 //! ```text
 //! CLOCK: [YYYY-MM-DD Day HH:MM[:SS] ±ZZZZ]--[YYYY-MM-DD Day HH:MM[:SS] ±ZZZZ] =>  H:MM[:SS]
+//! FILED: [YYYY-MM-DD Day HH:MM[:SS] ±ZZZZ]--[YYYY-MM-DD Day HH:MM[:SS] ±ZZZZ] =>  H:MM[:SS]  # customer
 //! ```
+//!
+//! A `FILED` line records a segment declared to a customer's
+//! accounting system and frozen there. It is not work time and must
+//! never be counted, summed, or checked for overlap.
 //!
 //! Mandatory invariants (see `doc/plan/05-clock-subcommand.md`):
 //!
@@ -18,9 +23,9 @@
 //!    in shape (`=> …`). Running clocks are not in scope.
 //!
 //! [`parse_clock_line`] returns `Ok(None)` when the line does not
-//! look like a CLOCK closed range at all (caller should ignore),
+//! look like a supported closed range at all (caller should ignore),
 //! `Ok(Some(ClockLine))` when it is fully valid, and
-//! `Err(ClockError)` when it *is* a closed-range CLOCK line but
+//! `Err(ClockError)` when it *is* a supported closed-range line but
 //! violates one of the invariants above.
 
 use std::fmt;
@@ -29,7 +34,26 @@ use std::sync::OnceLock;
 use chrono::{Datelike, NaiveDate, Weekday};
 use regex::Regex;
 
-/// One successfully-parsed closed-range CLOCK line.
+/// Org-mode line keyword handled by the shared clock grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockKeyword {
+    /// Work time tracked by Org's native `CLOCK:` element.
+    Clock,
+    /// Time declared to a customer's accounting system and frozen there.
+    Filed,
+}
+
+impl ClockKeyword {
+    /// Keyword text without the trailing colon.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clock => "CLOCK",
+            Self::Filed => "FILED",
+        }
+    }
+}
+
+/// One successfully-parsed closed-range `CLOCK:` or `FILED:` line.
 ///
 /// "Parsed" only means the structural shape is recoverable
 /// (`[…]--[…] => …` with valid date/time/numerical-TZ on both
@@ -37,10 +61,14 @@ use regex::Regex;
 /// [`ParsedClockLine`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClockLine {
+    /// Keyword found at the start of the line.
+    pub keyword: ClockKeyword,
     pub start: Timestamp,
     pub end: Timestamp,
     /// Whether both timestamps carry seconds.
     pub has_seconds: bool,
+    /// Customer tag on a `FILED:` line; absent on `CLOCK:` lines.
+    pub tag: Option<String>,
 }
 
 impl ClockLine {
@@ -60,13 +88,13 @@ impl ClockLine {
     }
 }
 
-/// A parsed CLOCK line plus the list of semantic violations
+/// A parsed clock-family line plus the list of semantic violations
 /// observed on it (possibly empty).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedClockLine {
     pub line: ClockLine,
     /// The exact suffix the line carries, starting at the `=>`
-    /// arrow and ending at end-of-line (trailing whitespace
+    /// arrow and ending before a customer suffix (trailing whitespace
     /// stripped). Used to assess [`ClockViolation::SpacingMismatch`]
     /// and [`ClockViolation::DurationMismatch`].
     pub raw_duration_suffix: String,
@@ -169,6 +197,12 @@ pub enum ClockViolation {
     /// The spacing of the `=> H:MM[:SS]` suffix doesn't match
     /// Emacs' canonical `printf("=> %2d:%02d")` form.
     SpacingMismatch { found: String, expected: String },
+    /// A `FILED:` line has no mandatory `  # customer` suffix.
+    MissingTag,
+    /// A `FILED:` customer tag does not match `[a-z0-9][a-z0-9_-]*`.
+    InvalidTag { found: String },
+    /// A `CLOCK:` line carries a customer-tag suffix reserved for `FILED:`.
+    UnexpectedTag { found: String },
     /// The line's embedded numerical offset matches no
     /// configured accepted IANA zone at its instant. Emitted
     /// only when the user has populated
@@ -193,6 +227,9 @@ impl ClockViolation {
             ClockViolation::TzMismatch { .. } => "tz-mismatch",
             ClockViolation::DurationMismatch { .. } => "duration-mismatch",
             ClockViolation::SpacingMismatch { .. } => "spacing-mismatch",
+            ClockViolation::MissingTag => "missing-tag",
+            ClockViolation::InvalidTag { .. } => "invalid-tag",
+            ClockViolation::UnexpectedTag { .. } => "unexpected-tag",
             ClockViolation::UnacceptedTz { .. } => "unaccepted-tz",
         }
     }
@@ -227,6 +264,17 @@ impl ClockViolation {
             ClockViolation::SpacingMismatch { found, expected } => format!(
                 "duration suffix has non-canonical spacing {:?} (expected {:?})",
                 found, expected
+            ),
+            ClockViolation::MissingTag => {
+                "FILED line is missing the mandatory `  # customer` suffix".into()
+            }
+            ClockViolation::InvalidTag { found } => format!(
+                "invalid FILED customer tag {:?} (expected [a-z0-9][a-z0-9_-]*)",
+                found
+            ),
+            ClockViolation::UnexpectedTag { found } => format!(
+                "CLOCK line carries unexpected customer tag suffix {:?} (use FILED:)",
+                found
             ),
             ClockViolation::UnacceptedTz {
                 tz_minutes,
@@ -348,10 +396,14 @@ pub fn check_accepted_zones_at(
 ///   timestamps are recoverable, so no semantic violations can
 ///   be reported on the same line.
 pub fn parse_clock_line(line: &str) -> Result<Option<ParsedClockLine>, ClockError> {
-    // Find the `CLOCK:` prefix, accepting arbitrary leading
+    // Find a supported prefix, accepting arbitrary leading
     // whitespace (LOGBOOK indentation varies in real files).
     let trimmed = line.trim_start();
-    let Some(rest) = trimmed.strip_prefix("CLOCK:") else {
+    let (keyword, rest) = if let Some(rest) = trimmed.strip_prefix("CLOCK:") {
+        (ClockKeyword::Clock, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("FILED:") {
+        (ClockKeyword::Filed, rest)
+    } else {
         return Ok(None);
     };
     let rest = rest.trim_start();
@@ -382,10 +434,49 @@ pub fn parse_clock_line(line: &str) -> Result<Option<ParsedClockLine>, ClockErro
 
     // Capture the raw `=> …` suffix exactly as it appears so we
     // can report SpacingMismatch / DurationMismatch precisely.
-    let raw_duration_suffix = line
+    let raw_suffix = line
         .rfind("=>")
         .map(|i| line[i..].trim_end().to_string())
         .unwrap_or_default();
+
+    let mut tag = None;
+    let mut tag_violation = None;
+    let raw_duration_suffix = match raw_suffix.rsplit_once("  # ") {
+        Some((duration, candidate)) => {
+            if keyword == ClockKeyword::Clock {
+                tag_violation = Some(ClockViolation::UnexpectedTag {
+                    found: candidate.to_string(),
+                });
+            } else if valid_customer_tag(candidate) {
+                tag = Some(candidate.to_string());
+            } else {
+                tag_violation = Some(ClockViolation::InvalidTag {
+                    found: candidate.to_string(),
+                });
+            }
+            duration.trim_end().to_string()
+        }
+        None => match raw_suffix.rsplit_once('#') {
+            Some((duration, candidate)) => {
+                tag_violation = Some(if keyword == ClockKeyword::Clock {
+                    ClockViolation::UnexpectedTag {
+                        found: candidate.trim().to_string(),
+                    }
+                } else {
+                    ClockViolation::InvalidTag {
+                        found: candidate.trim().to_string(),
+                    }
+                });
+                duration.trim_end().to_string()
+            }
+            None => {
+                if keyword == ClockKeyword::Filed {
+                    tag_violation = Some(ClockViolation::MissingTag);
+                }
+                raw_suffix.clone()
+            }
+        },
+    };
 
     // Structural parse of both timestamps. Failures here are
     // `ClockError` (return Err and bail; semantic checks impossible).
@@ -415,10 +506,16 @@ pub fn parse_clock_line(line: &str) -> Result<Option<ParsedClockLine>, ClockErro
         violations.push(ClockViolation::StartAfterEnd);
     }
 
+    if let Some(v) = tag_violation {
+        violations.push(v);
+    }
+
     let clock = ClockLine {
+        keyword,
         has_seconds: start.second.is_some() && end.second.is_some(),
         start,
         end,
+        tag,
     };
 
     // Duration / spacing checks — only meaningful if start ≤ end
@@ -458,6 +555,12 @@ pub fn parse_clock_line(line: &str) -> Result<Option<ParsedClockLine>, ClockErro
         raw_duration_suffix,
         violations,
     }))
+}
+
+fn valid_customer_tag(tag: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[a-z0-9][a-z0-9_-]*$").unwrap())
+        .is_match(tag)
 }
 
 /// Find the closing `]` matching a leading `[`. Returns `(inner,
@@ -653,7 +756,7 @@ pub struct WeekdayRewrite {
 /// Lines that don't match the closed-range silhouette are left
 /// alone (returned as-is with empty `rewrites`).
 pub fn fix_weekday_in_line(line: &str) -> WeekdayFix {
-    if !is_closed_range_clock(line) {
+    if !is_closed_range(line, ClockKeyword::Clock) {
         return WeekdayFix {
             line: line.to_string(),
             rewrites: Vec::new(),
@@ -700,13 +803,19 @@ pub fn fix_weekday_in_line(line: &str) -> WeekdayFix {
     }
 }
 
-/// True when `line` looks like a closed-range CLOCK (`CLOCK:` +
-/// `[…]--[…]` silhouette + `=>` arrow). Used as a cheap pre-filter
-/// so we don't run the rewrite regex on every line of every file.
-fn is_closed_range_clock(line: &str) -> bool {
+/// True when `line` has the selected keyword and a closed-range
+/// `[…]--[…] =>` silhouette.
+fn is_closed_range(line: &str, keyword: ClockKeyword) -> bool {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix(keyword.as_str()) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(':') else {
+        return false;
+    };
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"^\s*CLOCK:\s*\[[^\]]+\]--\[[^\]]+\]\s*=>").unwrap());
-    re.is_match(line)
+    RE.get_or_init(|| Regex::new(r"^\s*\[[^\]]+\]--\[[^\]]+\]\s*=>").unwrap())
+        .is_match(rest)
 }
 
 /// Result of [`recompute_duration_in_line`]: a mutated line plus
@@ -744,7 +853,7 @@ pub struct DurationChange {
 /// which axis carries the truth on a line that is otherwise
 /// suspect.
 pub fn recompute_duration_in_line(line: &str) -> DurationFix {
-    if !is_closed_range_clock(line) {
+    if !is_closed_range(line, ClockKeyword::Clock) {
         return DurationFix {
             line: line.to_string(),
             change: None,
@@ -848,9 +957,7 @@ pub fn format_timestamp(dt: chrono::NaiveDateTime, tz: &str, with_seconds: bool)
     }
 }
 
-/// Build a complete canonical `CLOCK:` line from a (start, end)
-/// pair of [`chrono::NaiveDateTime`]s plus the numerical TZ
-/// string they share.
+/// Build a complete canonical `CLOCK:` or `FILED:` line.
 ///
 /// Both timestamps are emitted with the same `tz` string and the
 /// same precision (driven by `with_seconds`). The duration suffix
@@ -865,21 +972,36 @@ pub fn format_timestamp(dt: chrono::NaiveDateTime, tz: &str, with_seconds: bool)
 ///   instant* (chrono's local zone at that date), so winter and
 ///   summer dates produce winter and summer offsets respectively.
 ///
-/// Output (no trailing newline):
+/// `tag` is appended only for [`ClockKeyword::Filed`]; callers must
+/// provide a tag matching `[a-z0-9][a-z0-9_-]*` to produce a valid
+/// FILED line. Output has no trailing newline.
 ///
 /// ```text
 /// CLOCK: [2025-06-06 Fri 09:30 +0200]--[2025-06-06 Fri 11:45 +0200] =>  2:15
 /// ```
 pub fn format_clock_line(
+    keyword: ClockKeyword,
     start: chrono::NaiveDateTime,
     end: chrono::NaiveDateTime,
     tz: &str,
     with_seconds: bool,
+    tag: Option<&str>,
 ) -> String {
     let s_ts = format_timestamp(start, tz, with_seconds);
     let e_ts = format_timestamp(end, tz, with_seconds);
     let dur = format_duration_suffix((end - start).num_seconds(), with_seconds);
-    format!("CLOCK: [{}]--[{}] {}", s_ts, e_ts, dur)
+    let suffix = match (keyword, tag) {
+        (ClockKeyword::Filed, Some(tag)) => format!("  # {}", tag),
+        _ => String::new(),
+    };
+    format!(
+        "{}: [{}]--[{}] {}{}",
+        keyword.as_str(),
+        s_ts,
+        e_ts,
+        dur,
+        suffix
+    )
 }
 
 /// `end - start` in whole seconds, taking each side's timezone
@@ -958,6 +1080,91 @@ mod tests {
         assert!(parsed.line.has_seconds);
         assert_eq!(parsed.line.start.second, Some(20));
         assert_eq!(parsed.line.end.second, Some(25));
+    }
+
+    #[test]
+    fn parses_filed_with_minute_and_second_precision() {
+        for (line, has_seconds) in [
+            (
+                "FILED: [2026-08-24 Mon 10:00 +0200]--[2026-08-24 Mon 11:00 +0200] =>  1:00  # lok",
+                false,
+            ),
+            (
+                "FILED: [2026-08-24 Mon 10:00:05 +0200]--[2026-08-24 Mon 11:00:10 +0200] =>  1:00:05  # acme-2",
+                true,
+            ),
+        ] {
+            let parsed = parsed_clean(line);
+            assert_eq!(parsed.line.keyword, ClockKeyword::Filed);
+            assert_eq!(parsed.line.has_seconds, has_seconds);
+            assert!(parsed.line.tag.is_some());
+        }
+    }
+
+    #[test]
+    fn filed_requires_a_valid_customer_tag() {
+        assert_eq!(
+            tags_of("FILED: [2026-08-24 Mon 10:00 +0200]--[2026-08-24 Mon 11:00 +0200] =>  1:00"),
+            vec!["missing-tag"]
+        );
+        assert_eq!(
+            tags_of(
+                "FILED: [2026-08-24 Mon 10:00 +0200]--[2026-08-24 Mon 11:00 +0200] =>  1:00  # Bad.Tag"
+            ),
+            vec!["invalid-tag"]
+        );
+    }
+
+    #[test]
+    fn clock_customer_suffix_is_unexpected_not_a_duration_mismatch() {
+        assert_eq!(
+            tags_of(
+                "CLOCK: [2026-08-24 Mon 10:00 +0200]--[2026-08-24 Mon 11:00 +0200] =>  1:00  # lok"
+            ),
+            vec!["unexpected-tag"]
+        );
+    }
+
+    #[test]
+    fn filed_uses_clock_timezone_weekday_and_duration_rules() {
+        let tags = tags_of(
+            "FILED: [2026-08-24 Tue 10:00 +0200]--[2026-08-24 Tue 11:00 +0100] =>  2:00  # lok",
+        );
+        assert_eq!(
+            tags,
+            vec!["weekday-mismatch", "weekday-mismatch", "tz-mismatch"]
+        );
+        assert_eq!(
+            tags_of(
+                "FILED: [2026-08-24 Mon 10:00 +0200]--[2026-08-24 Mon 11:00 +0200] =>  2:00  # lok"
+            ),
+            vec!["duration-mismatch"]
+        );
+        let err = parse_clock_line(
+            "FILED: [2026-08-24 Mon 10:00]--[2026-08-24 Mon 11:00 +0200] =>  1:00  # lok",
+        )
+        .unwrap_err();
+        assert_eq!(err.tag(), "missing-tz");
+    }
+
+    #[test]
+    fn format_filed_line_round_trips() {
+        let start = NaiveDate::from_ymd_opt(2026, 8, 24)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        let end = NaiveDate::from_ymd_opt(2026, 8, 24)
+            .unwrap()
+            .and_hms_opt(11, 0, 0)
+            .unwrap();
+        let line = format_clock_line(ClockKeyword::Filed, start, end, "+0200", false, Some("lok"));
+        assert_eq!(
+            line,
+            "FILED: [2026-08-24 Mon 10:00 +0200]--[2026-08-24 Mon 11:00 +0200] =>  1:00  # lok"
+        );
+        let parsed = parsed_clean(&line);
+        assert_eq!(parsed.line.keyword, ClockKeyword::Filed);
+        assert_eq!(parsed.line.tag.as_deref(), Some("lok"));
     }
 
     #[test]

@@ -447,6 +447,42 @@ pub enum ClockCommands {
         timing: bool,
     },
 
+    /// Check that every closed-range FILED line follows the CLOCK
+    /// grammar and carries a valid customer tag.
+    CheckFiled {
+        /// Files or directories to scan. When omitted, the agenda set is used.
+        paths: Vec<std::path::PathBuf>,
+
+        /// Glob patterns matched against candidate file paths;
+        /// matching files are skipped. Repeatable. No defaults.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude_globs: Vec<String>,
+
+        /// NUL-separated record output (for safe shell piping).
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
+
+        /// NDJSON output (one JSON object per violation).
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Stop at the first violation.
+        #[arg(short = '1', long)]
+        first: bool,
+
+        /// Re-read and hash every file instead of trusting size+mtime.
+        #[arg(long)]
+        verify: bool,
+
+        /// Bypass the cache: read and parse every file from scratch.
+        #[arg(long = "no-cache")]
+        no_cache: bool,
+
+        /// Print a phase-by-phase timing breakdown on stderr.
+        #[arg(long)]
+        timing: bool,
+    },
+
     /// Report pairs of CLOCK lines that cover the same instant.
     ///
     /// Unlike ``clock check``, whose rules each apply to a single
@@ -575,6 +611,41 @@ pub enum ClockCommands {
         /// NDJSON output (currently the only supported shape).
         #[arg(short = 'j', long, default_value_t = true)]
         json: bool,
+
+        /// Re-read and hash every file instead of trusting size+mtime.
+        #[arg(long)]
+        verify: bool,
+
+        /// Bypass the cache: read and parse every file from scratch.
+        #[arg(long = "no-cache")]
+        no_cache: bool,
+
+        /// Print a phase-by-phase timing breakdown on stderr.
+        #[arg(long)]
+        timing: bool,
+    },
+
+    /// Emit one record per valid FILED line, optionally filtered by customer.
+    ListFiled {
+        /// Files or directories to scan. When omitted, the agenda set is used.
+        paths: Vec<std::path::PathBuf>,
+
+        /// Glob patterns matched against candidate file paths;
+        /// matching files are skipped. Repeatable.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude_globs: Vec<String>,
+
+        /// Keep only FILED lines carrying this customer tag.
+        #[arg(short = 'c', long, value_name = "TAG")]
+        customer: Option<String>,
+
+        /// NDJSON output (one JSON object per FILED line).
+        #[arg(short = 'j', long, conflicts_with = "nul")]
+        json: bool,
+
+        /// NUL-separated fixed-field records.
+        #[arg(short = '0', conflicts_with = "json")]
+        nul: bool,
 
         /// Re-read and hash every file instead of trusting size+mtime.
         #[arg(long)]

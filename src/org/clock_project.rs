@@ -1,4 +1,4 @@
-//! Project one org file's content into its CLOCK facts and diagnostics.
+//! Project one org file's content into its CLOCK/FILED facts and diagnostics.
 //!
 //! This is the layer-1 producer: given exact bytes, it yields the
 //! sorted records the cache stores, plus the diagnostics that
@@ -34,14 +34,15 @@ use orgize::{Org, SyntaxKind, SyntaxNode};
 
 use std::collections::BTreeMap;
 
-use crate::index::clock_blob::{Blob, FLAG_HAS_SECONDS, Interner, NO_HEADING, Record};
-use crate::org::clock::parse_clock_line;
+use crate::index::clock_blob::{Blob, Interner, Record};
+use crate::index::clock_blob::{FLAG_FILED, FLAG_HAS_SECONDS, NO_HEADING, NO_TAG};
+use crate::org::clock::ClockKeyword;
 use crate::org::heading::LineIndex;
 
 /// Bump when the *meaning* of a produced record or diagnostic changes
 /// — e.g. a new flag, a changed instant epoch, a different heading
 /// attribution rule. Folded into every cache key.
-pub const PROJECTION_ABI: u16 = 5;
+pub const PROJECTION_ABI: u16 = 6;
 
 /// Bump when the patched `orgize` fork changes in a way that could
 /// alter which lines become `CLOCK` nodes. Folded into every cache
@@ -49,9 +50,11 @@ pub const PROJECTION_ABI: u16 = 5;
 /// version of its own.
 pub const PARSER_ABI: u16 = 1;
 
-/// One CLOCK line that failed strict validation.
+/// One clock-family line that failed strict validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
+    /// Keyword of the rejected line.
+    pub keyword: ClockKeyword,
     /// 1-based line number.
     pub line: u32,
     /// Byte offset of the line's first byte.
@@ -137,7 +140,7 @@ pub fn project(canonical_path: &str, content: &str) -> Projection {
     // parse. This is a pre-filter on the *result*, not a discovery
     // rule — it never decides whether a candidate that IS present
     // counts. On the real corpus ~70% of files take this path.
-    if !content.contains("CLOCK:") {
+    if !content.contains("CLOCK:") && !content.contains("FILED:") {
         return Projection {
             blob: Blob {
                 projection_abi: PROJECTION_ABI,
@@ -259,7 +262,9 @@ fn walk(
                 // Most paragraphs hold no CLOCK at all; one substring
                 // scan over the span skips the per-line split for
                 // them. The per-line pass only runs on the rare hit.
-                if !content[start..end].contains("CLOCK:") {
+                if !content[start..end].contains("CLOCK:")
+                    && !content[start..end].contains("FILED:")
+                {
                     continue;
                 }
                 // A paragraph's range starts at its first character,
@@ -272,7 +277,7 @@ fn walk(
                 // `CLOCK:` test and is ignored).
                 let mut pos = start;
                 for seg in content[start..end].split_inclusive('\n') {
-                    if seg.contains("CLOCK:") {
+                    if seg.contains("CLOCK:") || seg.contains("FILED:") {
                         let line_start = content[..pos].rfind('\n').map_or(0, |i| i + 1);
                         let line_end = pos + seg.len();
                         let raw = content[line_start..line_end].trim_end_matches(['\n', '\r']);
@@ -337,11 +342,17 @@ fn classify(
             id
         }
     };
-    match parse_clock_line(raw) {
+    match crate::org::clock::parse_clock_line(raw) {
         // Running clock or not a closed range at all: neither fact
         // nor diagnostic, exactly as `clock check` treats it.
         Ok(None) => {}
         Ok(Some(p)) if p.violations.is_empty() => {
+            let tag_id = p
+                .line
+                .tag
+                .as_deref()
+                .map(|tag| interner.intern(tag))
+                .unwrap_or(NO_TAG);
             records.push(Record {
                 start: p.line.start_utc_seconds(),
                 end: p.line.end_utc_seconds(),
@@ -350,16 +361,22 @@ fn classify(
                 byte_offset: byte_offset as u32,
                 line,
                 tz_minutes: p.line.start.tz_minutes as i16,
-                flags: if p.line.has_seconds {
+                flags: (if p.line.has_seconds {
                     FLAG_HAS_SECONDS
                 } else {
                     0
-                },
+                }) | (if p.line.keyword == ClockKeyword::Filed {
+                    FLAG_FILED
+                } else {
+                    0
+                }),
+                tag_id,
             });
         }
         Ok(Some(p)) => {
             for v in &p.violations {
                 diagnostics.push(Diagnostic {
+                    keyword: p.line.keyword,
                     line,
                     byte_offset: byte_offset as u32,
                     tag: v.tag(),
@@ -369,6 +386,11 @@ fn classify(
             }
         }
         Err(e) => diagnostics.push(Diagnostic {
+            keyword: if raw.trim_start().starts_with("FILED:") {
+                ClockKeyword::Filed
+            } else {
+                ClockKeyword::Clock
+            },
             line,
             byte_offset: byte_offset as u32,
             tag: e.tag(),
@@ -686,5 +708,51 @@ mod tests {
         let p = project(P, c);
         assert!(p.diagnostics.len() >= 2, "{:?}", p.diagnostics);
         assert_eq!(p.candidate_lines(), vec![2, 4]);
+    }
+
+    #[test]
+    fn filed_lines_in_logbook_and_body_are_facts_with_tags() {
+        let c = indoc! {"
+            * h
+            :LOGBOOK:
+            FILED: [2026-08-24 Mon 10:00 +0200]--[2026-08-24 Mon 11:00 +0200] =>  1:00  # lok
+            :END:
+            FILED: [2026-08-24 Mon 12:00 +0200]--[2026-08-24 Mon 13:00 +0200] =>  1:00  # acme_2
+        "};
+        let p = project(P, c);
+        assert_eq!(p.blob.records.len(), 2);
+        assert!(p.blob.records.iter().all(|r| r.flags & FLAG_FILED != 0));
+        let tags: Vec<&str> = p
+            .blob
+            .records
+            .iter()
+            .map(|r| p.blob.strings[r.tag_id as usize].as_str())
+            .collect();
+        assert_eq!(tags, vec!["lok", "acme_2"]);
+        assert!(p.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn filed_inside_example_block_is_ignored() {
+        let c = indoc! {"
+            * h
+            #+begin_example
+            FILED: [2026-08-24 Mon 10:00 +0200]--[2026-08-24 Mon 11:00 +0200] =>  1:00  # lok
+            #+end_example
+        "};
+        let p = project(P, c);
+        assert!(p.blob.records.is_empty());
+        assert!(p.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn clock_record_remains_unfiled_and_has_no_tag() {
+        let p = project(
+            P,
+            "CLOCK: [2026-08-24 Mon 10:00 +0200]--[2026-08-24 Mon 11:00 +0200] =>  1:00\n",
+        );
+        assert_eq!(p.blob.records.len(), 1);
+        assert_eq!(p.blob.records[0].flags & FLAG_FILED, 0);
+        assert_eq!(p.blob.records[0].tag_id, NO_TAG);
     }
 }

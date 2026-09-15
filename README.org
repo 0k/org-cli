@@ -108,6 +108,44 @@ org-cli clock list -f "billing" -i --has-property TASK_REF -j path/
 With no heading filter, NDJSON output is byte-identical to the
 pre-filter shape — existing consumers are unaffected.
 
+** =clock list-filed= and =clock check-filed= — declared customer time
+
+A =FILED:= line records a time segment that was declared to a
+customer's accounting system and is frozen there. It uses exactly the
+closed-range CLOCK grammar plus a mandatory customer tag:
+
+#+begin_example
+FILED: [2026-08-24 Mon 10:00 +0200]--[2026-08-24 Mon 11:00 +0200] =>  1:00  # lok
+#+end_example
+
+Customer tags match =[a-z0-9][a-z0-9_-]*=. FILED segments are not work
+time: =clock list=, =clock check=, =clock overlap=, and =clock fix=
+ignore them, so they are never counted, summed, checked for overlap, or
+rewritten. A distinct five-letter keyword keeps the line aligned with
+=CLOCK:= while remaining ordinary paragraph text to Emacs; consequently
+=org-clock-sum=, =org-find-open-clocks=, and org-element clock parsing
+also ignore it.
+
+#+begin_src bash
+# List every valid FILED line in human-readable form
+org-cli clock list-filed path/
+
+# Emit NDJSON for one customer
+org-cli clock list-filed --customer lok -j path/
+
+# Emit fixed-field NUL records
+org-cli clock list-filed -0 path/
+
+# Validate FILED grammar and customer tags
+org-cli clock check-filed path/
+#+end_src
+
+The =list-filed -j= fields are =file=, =line=, =start=, =end=, and
+=tag=. Machine =start= and =end= values are UTC integer seconds since
+the Unix epoch. NUL records use the same order, with NUL between fields
+and a double-NUL record terminator. Invalid FILED lines are diagnosed
+and excluded from listing; either command exits 1 when it finds one.
+
 ** =clock overlap= — find CLOCK lines covering the same instant
 
 Every =clock check= rule applies to a single line. =clock overlap= is

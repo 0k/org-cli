@@ -139,6 +139,34 @@ pub fn run() -> Result<(), String> {
                 timing,
             } => {
                 let opts = action::clock::CheckOptions {
+                    kind: crate::org::clock::ClockKeyword::Clock,
+                    paths,
+                    exclude_globs,
+                    nul,
+                    json,
+                    first,
+                    verify,
+                    no_cache,
+                    timing,
+                };
+                let exit_code = action::clock::run_check(opts)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
+            def::ClockCommands::CheckFiled {
+                paths,
+                exclude_globs,
+                nul,
+                json,
+                first,
+                verify,
+                no_cache,
+                timing,
+            } => {
+                let opts = action::clock::CheckOptions {
+                    kind: crate::org::clock::ClockKeyword::Filed,
                     paths,
                     exclude_globs,
                     nul,
@@ -212,11 +240,44 @@ pub fn run() -> Result<(), String> {
                 timing,
             } => {
                 let opts = action::clock::ListOptions {
+                    kind: crate::org::clock::ClockKeyword::Clock,
                     paths,
                     exclude_globs,
                     filter,
                     ignore_case,
                     has_property,
+                    customer: None,
+                    nul: false,
+                    json,
+                    verify,
+                    no_cache,
+                    timing,
+                };
+                let exit_code = action::clock::run_list(opts)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
+            def::ClockCommands::ListFiled {
+                paths,
+                exclude_globs,
+                customer,
+                json,
+                nul,
+                verify,
+                no_cache,
+                timing,
+            } => {
+                let opts = action::clock::ListOptions {
+                    kind: crate::org::clock::ClockKeyword::Filed,
+                    paths,
+                    exclude_globs,
+                    filter: None,
+                    ignore_case: false,
+                    has_property: Vec::new(),
+                    customer,
+                    nul,
                     json,
                     verify,
                     no_cache,

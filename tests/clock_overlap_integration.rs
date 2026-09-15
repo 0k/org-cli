@@ -241,6 +241,38 @@ fn json_record_carries_both_sides() {
     );
 }
 
+/// A file that is not valid UTF-8 (a stray Latin-1 byte in prose) is
+/// indexed with a lossy decode, so its pairs are found. Rendering
+/// must read the source lines back the same way: the `raw` field
+/// carries the CLOCK text, not an empty string.
+#[test]
+fn non_utf8_file_still_renders_raw_clock_lines() {
+    let td = TempDir::new("latin1");
+    let file = td.path().join("latin1.org");
+    let mut bytes = b"* Op\xe9rationnelle\n".to_vec();
+    bytes.extend_from_slice(
+        indoc! {"
+            CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 12:00 +0100] =>  2:00
+            CLOCK: [2026-01-07 Wed 11:00 +0100]--[2026-01-07 Wed 13:00 +0100] =>  2:00
+        "}
+        .as_bytes(),
+    );
+    fs::write(&file, bytes).unwrap();
+
+    let (code, stdout, _) = run(&[file.to_str().unwrap(), "-j"]);
+    assert_eq!(code, Some(1));
+    let records = json_records(&stdout);
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["a"]["raw"],
+        "CLOCK: [2026-01-07 Wed 10:00 +0100]--[2026-01-07 Wed 12:00 +0100] =>  2:00"
+    );
+    assert_eq!(
+        records[0]["b"]["raw"],
+        "CLOCK: [2026-01-07 Wed 11:00 +0100]--[2026-01-07 Wed 13:00 +0100] =>  2:00"
+    );
+}
+
 #[test]
 fn json_instants_are_rfc3339_utc() {
     let td = TempDir::new("rfc3339");

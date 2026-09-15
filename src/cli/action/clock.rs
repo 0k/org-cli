@@ -201,17 +201,24 @@ impl PerFile {
     /// report actually prints are ever requested, so this is a cold
     /// read per *printed* file, not per scanned file.
     fn raw_lines(&self, file: &Path) -> Vec<String> {
-        // Decode exactly as the projection did, so line numbers and
-        // text line up for files that are not valid UTF-8.
-        fs::read(file)
-            .map(|b| {
-                String::from_utf8_lossy(&b)
-                    .lines()
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default()
+        read_lines_lossy(file)
     }
+}
+
+/// Source lines of `file` for rendering, decoded exactly as the
+/// projection did (lossily), so line numbers and text line up for
+/// files that are not valid UTF-8. An unreadable file yields no
+/// lines rather than an error: the report already has its instants,
+/// only the echoed text is missing.
+fn read_lines_lossy(file: &Path) -> Vec<String> {
+    fs::read(file)
+        .map(|b| {
+            String::from_utf8_lossy(&b)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn per_file_projections(
@@ -678,11 +685,10 @@ struct RawLineCache {
 
 impl RawLineCache {
     fn get(&mut self, file: &Path, line: usize) -> String {
-        let lines = self.files.entry(file.to_path_buf()).or_insert_with(|| {
-            fs::read_to_string(file)
-                .map(|c| c.lines().map(str::to_owned).collect())
-                .unwrap_or_default()
-        });
+        let lines = self
+            .files
+            .entry(file.to_path_buf())
+            .or_insert_with(|| read_lines_lossy(file));
         lines
             .get(line.saturating_sub(1))
             .cloned()

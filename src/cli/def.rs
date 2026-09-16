@@ -408,9 +408,20 @@ pub enum SyntaxCommands {
 /// `org-cli clock <action>` sub-actions.
 #[derive(Subcommand, Debug)]
 pub enum ClockCommands {
-    /// Check that every closed-range CLOCK line follows the
-    /// canonical format (numerical timezone, consistent precision,
-    /// matching weekday, start ≤ end).
+    /// Check a file's time bookkeeping: every closed-range CLOCK
+    /// line follows the canonical format (numerical timezone,
+    /// consistent precision, matching weekday, start ≤ end), every
+    /// FILED line follows the CLOCK grammar and carries a valid
+    /// customer tag, and no two CLOCK entries cover the same
+    /// instant.
+    ///
+    /// The overlap rule is the one cross-entry rule and is checked
+    /// against the whole agenda set, not just PATHS: a CLOCK just
+    /// written here may collide with one in any other agenda file.
+    /// Only pairs touching PATHS are reported; with no PATHS, every
+    /// pair is. Files matching ``clock.overlap.exclude-globs`` in the
+    /// config contribute no intervals. ``clock overlap`` remains the
+    /// pair-oriented, sortable view of the same rule.
     Check {
         /// Files or directories to scan. When omitted, the agenda
         /// set is read from
@@ -418,7 +429,9 @@ pub enum ClockCommands {
         paths: Vec<std::path::PathBuf>,
 
         /// Glob patterns matched against candidate file paths;
-        /// matching files are skipped. Repeatable. No defaults.
+        /// matching files are skipped. Repeatable. For the overlap
+        /// rule they are added to the configured
+        /// ``clock.overlap.exclude-globs``.
         #[arg(long = "exclude", value_name = "GLOB")]
         exclude_globs: Vec<String>,
 
@@ -446,43 +459,6 @@ pub enum ClockCommands {
         #[arg(long)]
         timing: bool,
     },
-
-    /// Check that every closed-range FILED line follows the CLOCK
-    /// grammar and carries a valid customer tag.
-    CheckFiled {
-        /// Files or directories to scan. When omitted, the agenda set is used.
-        paths: Vec<std::path::PathBuf>,
-
-        /// Glob patterns matched against candidate file paths;
-        /// matching files are skipped. Repeatable. No defaults.
-        #[arg(long = "exclude", value_name = "GLOB")]
-        exclude_globs: Vec<String>,
-
-        /// NUL-separated record output (for safe shell piping).
-        #[arg(short = '0', conflicts_with = "json")]
-        nul: bool,
-
-        /// NDJSON output (one JSON object per violation).
-        #[arg(short = 'j', long)]
-        json: bool,
-
-        /// Stop at the first violation.
-        #[arg(short = '1', long)]
-        first: bool,
-
-        /// Re-read and hash every file instead of trusting size+mtime.
-        #[arg(long)]
-        verify: bool,
-
-        /// Bypass the cache: read and parse every file from scratch.
-        #[arg(long = "no-cache")]
-        no_cache: bool,
-
-        /// Print a phase-by-phase timing breakdown on stderr.
-        #[arg(long)]
-        timing: bool,
-    },
-
     /// Report pairs of CLOCK lines that cover the same instant.
     ///
     /// Unlike ``clock check``, whose rules each apply to a single

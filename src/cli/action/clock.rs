@@ -9,7 +9,7 @@
 //! line for `fmt`.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,9 @@ use log::{debug, warn};
 use regex::RegexBuilder;
 use serde::Serialize;
 
-use crate::cli::action::walk::resolve_input_files;
+use crate::cli::action::walk::{
+    compile_globs, default_agenda_set_path, path_excluded, read_agenda_set, resolve_input_files,
+};
 use crate::config::Config;
 use crate::index::clock_cache::{ClockCache, Resolved, Verify};
 use crate::org::clock::{
@@ -44,13 +46,12 @@ use crate::org::heading::Heading;
 /// CLI options received from `Commands::Clock { Check { … } }`.
 #[derive(Debug, Clone)]
 pub struct CheckOptions {
-    /// Keyword whose lines this invocation checks.
-    pub kind: ClockKeyword,
     /// Files or directories to scan. Empty means "use the agenda
-    /// set" (see [`read_agenda_set`]).
+    /// set" (see [`crate::cli::action::walk::read_agenda_set`]).
     pub paths: Vec<PathBuf>,
     /// Glob patterns matched against candidate file paths;
-    /// matching files are skipped.
+    /// matching files are skipped. For the overlap pass they are
+    /// added to the configured `clock.overlap.exclude-globs`.
     pub exclude_globs: Vec<String>,
     pub nul: bool,
     pub json: bool,
@@ -61,9 +62,30 @@ pub struct CheckOptions {
     pub no_cache: bool,
     /// Print a phase-by-phase timing breakdown on stderr.
     pub timing: bool,
+    /// Agenda-set file the overlap rule widens its sweep with.
+    /// `None` resolves the default (see
+    /// [`crate::cli::action::walk::default_agenda_set_path`]).
+    /// Library callers and in-process tests pin it here; a missing
+    /// file narrows the sweep to PATHS with a warning.
+    pub agenda_set: Option<PathBuf>,
+}
+
+/// The other CLOCK line of an `overlap` violation.
+#[derive(Debug, Clone, Serialize)]
+pub struct OtherSide {
+    pub file: PathBuf,
+    pub line: usize,
+    pub raw: String,
 }
 
 /// One violation, format-agnostic.
+///
+/// Per-line rules describe a single line. The `overlap` rule
+/// describes a *pair*: the record is anchored on one side (the
+/// earlier-starting line, preferring a line inside the named
+/// PATHS) and carries the other in `other`, with the shared span
+/// in `overlap_seconds`. Both are absent from per-line records so
+/// existing consumers see unchanged shapes.
 #[derive(Debug, Clone, Serialize)]
 pub struct Violation {
     pub file: PathBuf,
@@ -71,16 +93,36 @@ pub struct Violation {
     pub raw: String,
     pub tag: &'static str,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other: Option<OtherSide>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlap_seconds: Option<i64>,
 }
+
+/// Tag of the one cross-entry rule.
+const OVERLAP_TAG: &str = "overlap";
 
 /// Run `clock check`. Returns 0 on a clean run, 1 when violations
 /// were reported, `Err` on usage / I/O errors.
+///
+/// Three passes share one exit code and one output stream:
+///
+/// 1. every closed-range `CLOCK:` line follows the canonical format;
+/// 2. every closed-range `FILED:` line follows the CLOCK grammar and
+///    carries a valid customer tag;
+/// 3. no two clean `CLOCK:` entries cover the same instant.
+///
+/// Passes 1–2 are per-line and scoped to the named PATHS. Pass 3 is
+/// pairwise over PATHS ∪ agenda set, reporting only pairs that touch
+/// PATHS — a line just written to one file may collide with a line
+/// in any other agenda file, and that is exactly what a post-write
+/// gate must catch. With no PATHS the agenda set *is* the scope and
+/// every pair is reported, as `clock overlap` does.
 pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
     let t_total = Instant::now();
     let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
     debug!(
-        "checking {} lines in {} org file(s)",
-        opts.kind.as_str(),
+        "checking CLOCK and FILED lines in {} org file(s)",
         files.len()
     );
 
@@ -89,35 +131,31 @@ pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
     let cfg = Config::load_default()?;
     let zones = cfg.clock.resolve_zones()?;
 
-    // Everything `check` reports is already in the per-file
-    // projection: structural and semantic diagnostics carry their
-    // raw line and message; clean records carry the instant and the
-    // offset the zone rule needs. On a warm cache this reads no
-    // source file at all.
+    // Everything the per-line passes report is already in the
+    // per-file projection: structural and semantic diagnostics
+    // carry their raw line and message; clean records carry the
+    // instant and the offset the zone rule needs. On a warm cache
+    // this reads no source file at all.
     let t_prep = Instant::now();
     let per_file = per_file_projections(&files, opts.verify, opts.no_cache)?;
     let prep = t_prep.elapsed();
 
-    let mut violation_count: usize = 0;
+    let mut counts = CheckCounts::default();
     let mut writer = StdoutWriter::new(&opts);
     let t_emit = Instant::now();
 
+    let mut stopped = false;
     'files: for (file, proj) in &per_file.files {
         // Merge diagnostics and zone-rule hits in source order so
         // output is byte-identical to the old per-line walk.
-        let mut hits: Vec<(u32, &'static str, String, &str)> = Vec::new();
-        for d in proj.diagnostics.iter().filter(|d| d.keyword == opts.kind) {
-            hits.push((d.line, d.tag, d.message.clone(), d.raw.as_str()));
+        let mut hits: Vec<(u32, ClockKeyword, &'static str, String, &str)> = Vec::new();
+        for d in &proj.diagnostics {
+            hits.push((d.line, d.keyword, d.tag, d.message.clone(), d.raw.as_str()));
         }
-        let mut zone_hits: Vec<(u32, &'static str, String)> = Vec::new();
-        for r in proj
-            .blob
-            .records
-            .iter()
-            .filter(|r| record_matches_kind(r, opts.kind))
-        {
+        let mut zone_hits: Vec<(u32, ClockKeyword, &'static str, String)> = Vec::new();
+        for r in &proj.blob.records {
             if let Some(v) = zone_violation_for_record(r, &zones) {
-                zone_hits.push((r.line, v.tag(), v.message()));
+                zone_hits.push((r.line, record_kind(r), v.tag(), v.message()));
             }
         }
         // Zone hits need the raw line; fetch lazily and only if any.
@@ -126,15 +164,15 @@ pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
         } else {
             Some(per_file.raw_lines(file))
         };
-        let zone_hits: Vec<(u32, &'static str, String, &str)> = zone_hits
+        let zone_hits: Vec<(u32, ClockKeyword, &'static str, String, &str)> = zone_hits
             .into_iter()
-            .map(|(l, t, m)| {
+            .map(|(l, k, t, m)| {
                 let raw = raw_lines
                     .as_ref()
                     .and_then(|ls| ls.get(l as usize - 1))
                     .map(String::as_str)
                     .unwrap_or("");
-                (l, t, m, raw)
+                (l, k, t, m, raw)
             })
             .collect();
         hits.extend(zone_hits);
@@ -142,34 +180,180 @@ pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
         // hit comes after them, exactly like the old code path.
         hits.sort_by_key(|h| h.0);
 
-        for (line, tag, message, raw) in hits {
-            violation_count += 1;
+        for (line, kind, tag, message, raw) in hits {
+            counts.bump(kind);
             let v = Violation {
                 file: file.to_path_buf(),
                 line: line as usize,
                 raw: raw.to_string(),
                 tag,
                 message,
+                other: None,
+                overlap_seconds: None,
             };
             writer.emit(&v).map_err(|e| e.to_string())?;
             if opts.first {
+                stopped = true;
                 break 'files;
             }
         }
     }
 
-    writer.finish(violation_count).map_err(|e| e.to_string())?;
+    // ---- pass 3: overlap -------------------------------------------
+    if !stopped {
+        let t_sweep = Instant::now();
+        let pairs = overlap_violations(&opts, &cfg, &files)?;
+        debug!(
+            "overlap sweep found {} pair(s) touching the checked files in {:.2} ms",
+            pairs.len(),
+            t_sweep.elapsed().as_secs_f64() * 1000.0
+        );
+        for v in pairs {
+            counts.overlap += 1;
+            writer.emit(&v).map_err(|e| e.to_string())?;
+            if opts.first {
+                break;
+            }
+        }
+    }
+
+    writer.finish(&counts).map_err(|e| e.to_string())?;
     let emit = t_emit.elapsed();
 
     if opts.timing {
-        let command = if opts.kind == ClockKeyword::Filed {
-            "check-filed"
-        } else {
-            "check"
-        };
-        report_prep_timing(command, &per_file, prep, emit, t_total.elapsed());
+        report_prep_timing("check", &per_file, prep, emit, t_total.elapsed());
     }
-    Ok(if violation_count == 0 { 0 } else { 1 })
+    Ok(if counts.total() == 0 { 0 } else { 1 })
+}
+
+/// Per-pass tallies for the human summary and the exit code.
+#[derive(Debug, Default)]
+struct CheckCounts {
+    clock: usize,
+    filed: usize,
+    overlap: usize,
+}
+
+impl CheckCounts {
+    fn bump(&mut self, kind: ClockKeyword) {
+        match kind {
+            ClockKeyword::Clock => self.clock += 1,
+            ClockKeyword::Filed => self.filed += 1,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.clock + self.filed + self.overlap
+    }
+}
+
+fn record_kind(r: &crate::index::clock_blob::Record) -> ClockKeyword {
+    if r.flags & crate::index::clock_blob::FLAG_FILED != 0 {
+        ClockKeyword::Filed
+    } else {
+        ClockKeyword::Clock
+    }
+}
+
+/// The overlap pass of `clock check`: every pair of clean CLOCK
+/// entries sharing an instant, where at least one side lives in
+/// `checked` (the resolved PATHS). Returned in detector order.
+///
+/// The sweep runs over `checked ∪ agenda set`, minus the configured
+/// `clock.overlap.exclude-globs` and the command-line `--exclude`
+/// patterns. When the agenda set cannot be read, the sweep narrows to
+/// `checked` alone and says so on stderr — a file-local check must
+/// keep working on a machine that never ran org-collect.
+fn overlap_violations(
+    opts: &CheckOptions,
+    cfg: &Config,
+    checked: &[PathBuf],
+) -> Result<Vec<Violation>, String> {
+    // Config globs first, command-line ones appended: `--exclude`
+    // narrows further, it never re-opens what config excluded.
+    let mut exclude_globs = cfg.clock.overlap.resolve_exclude_globs()?;
+    exclude_globs.extend(opts.exclude_globs.iter().cloned());
+
+    // Membership is decided on canonical paths: the caller may name
+    // a file relatively while the agenda set lists it absolutely.
+    let checked_set: BTreeSet<PathBuf> = checked.iter().map(|p| canonical(p)).collect();
+
+    let mut corpus: Vec<PathBuf> = checked.to_vec();
+    if opts.paths.is_empty() {
+        // No PATHS: `checked` already IS the agenda set.
+    } else {
+        let agenda_path = match &opts.agenda_set {
+            Some(p) => p.clone(),
+            None => default_agenda_set_path()?,
+        };
+        match read_agenda_set(&agenda_path) {
+            Ok(listed) => {
+                let existing: Vec<PathBuf> = listed.into_iter().filter(|p| p.exists()).collect();
+                if existing.is_empty() {
+                    warn!(
+                        "agenda set {} lists no existing file; overlap sweep covers the named paths only",
+                        agenda_path.display()
+                    );
+                } else {
+                    corpus.extend(resolve_input_files(&existing, &[])?);
+                }
+            }
+            Err(e) => warn!("{}; overlap sweep covers the named paths only", e),
+        }
+    }
+    let patterns = compile_globs(&exclude_globs)?;
+    let mut corpus: Vec<PathBuf> = corpus
+        .into_iter()
+        .filter(|p| !path_excluded(p, &patterns))
+        .map(|p| canonical(&p))
+        .collect();
+    corpus.sort();
+    corpus.dedup();
+
+    let resolved = resolve_clocks(&corpus, &exclude_globs, opts.verify, opts.no_cache)?;
+    let intervals = intervals_from_root(&resolved.root);
+    // Non-canonical lines were already reported by pass 1 for the
+    // checked files; lines outside them are not this run's business.
+    // Either way the sweep stays silent about them.
+
+    let mut raw_lines = RawLineCache::default();
+    let mut out = Vec::new();
+    for p in find_overlaps_sorted(&intervals) {
+        let (a, b) = (&intervals[p.a], &intervals[p.b]);
+        let a_in = checked_set.contains(&a.file);
+        let b_in = checked_set.contains(&b.file);
+        if !a_in && !b_in {
+            continue;
+        }
+        // Anchor on the earlier-starting side, unless only the later
+        // one is in scope: the record must point at a checked file.
+        let (anchor, other) = if a_in || !b_in { (a, b) } else { (b, a) };
+        let anchor_raw = raw_lines.get(&anchor.file, anchor.line);
+        let other_raw = raw_lines.get(&other.file, other.line);
+        out.push(Violation {
+            file: anchor.file.clone(),
+            line: anchor.line,
+            raw: anchor_raw,
+            tag: OVERLAP_TAG,
+            message: format!(
+                "covers the same {} as {}:{}",
+                format_span(p.overlap_seconds),
+                other.file.display(),
+                other.line
+            ),
+            other: Some(OtherSide {
+                file: other.file.clone(),
+                line: other.line,
+                raw: other_raw,
+            }),
+            overlap_seconds: Some(p.overlap_seconds),
+        });
+    }
+    Ok(out)
+}
+
+fn canonical(p: &Path) -> PathBuf {
+    fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// The `unaccepted-tz` rule evaluated on a cached record.
@@ -290,15 +474,22 @@ impl<'a> StdoutWriter<'a> {
             writeln!(self.stdout, "{}", line)
         } else if self.opts.nul {
             // <file>\0<line>\0<tag>\0<message>\0<raw>\0\0
+            // An overlap record appends the other side before the
+            // terminator so existing field indices stay stable:
+            // …<raw>\0<other-file>\0<other-line>\0<other-raw>\0\0
             write!(
                 self.stdout,
-                "{}\0{}\0{}\0{}\0{}\0\0",
+                "{}\0{}\0{}\0{}\0{}\0",
                 v.file.display(),
                 v.line,
                 v.tag,
                 v.message,
                 v.raw,
-            )
+            )?;
+            if let Some(o) = &v.other {
+                write!(self.stdout, "{}\0{}\0{}\0", o.file.display(), o.line, o.raw)?;
+            }
+            write!(self.stdout, "\0")
         } else {
             writeln!(
                 self.stdout,
@@ -309,25 +500,55 @@ impl<'a> StdoutWriter<'a> {
                 "->".dimmed(),
                 v.message.bright_yellow(),
                 v.raw.trim().dimmed(),
-            )
+            )?;
+            if let Some(o) = &v.other {
+                writeln!(
+                    self.stdout,
+                    "    {} {}:{}\n    {}",
+                    "vs".dimmed(),
+                    o.file.display().to_string().bright_blue(),
+                    o.line,
+                    o.raw.trim().dimmed(),
+                )?;
+            }
+            Ok(())
         }
     }
 
-    fn finish(&mut self, count: usize) -> io::Result<()> {
+    /// One summary line per pass, so a green run reads as three
+    /// distinct facts and a red one names which rule set failed.
+    fn finish(&mut self, counts: &CheckCounts) -> io::Result<()> {
         if !self.opts.json && !self.opts.nul {
-            if count == 0 {
-                writeln!(
-                    self.stdout,
-                    "{}",
-                    format!("All {} lines OK.", self.opts.kind.as_str()).green()
-                )?;
-            } else {
-                writeln!(
-                    self.stdout,
-                    "\n{} {}",
-                    count.to_string().bright_red(),
-                    format!("{} violation(s) found", self.opts.kind.as_str()).bright_red(),
-                )?;
+            if counts.total() > 0 {
+                writeln!(self.stdout)?;
+            }
+            for (n, ok, bad) in [
+                (
+                    counts.clock,
+                    "All CLOCK lines OK.",
+                    "CLOCK violation(s) found",
+                ),
+                (
+                    counts.filed,
+                    "All FILED lines OK.",
+                    "FILED violation(s) found",
+                ),
+                (
+                    counts.overlap,
+                    "No overlapping CLOCK entries.",
+                    "overlapping pair(s) found",
+                ),
+            ] {
+                if n == 0 {
+                    writeln!(self.stdout, "{}", ok.green())?;
+                } else {
+                    writeln!(
+                        self.stdout,
+                        "{} {}",
+                        n.to_string().bright_red(),
+                        bad.bright_red()
+                    )?;
+                }
             }
         }
         self.stdout.flush()
@@ -1212,7 +1433,7 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
                 // Unfiltered listing streams; filtered listing buffers
                 // per file. Both flush what precedes the rejection.
                 flush_records(&mut stdout, &pending, &opts)?;
-                return abort_list(&mut stdout, &mut stderr, &rej, opts.kind);
+                return abort_list(&mut stdout, &mut stderr, &rej);
             }
             // A filter needs the enclosing heading; the projection
             // stored it for every clocked heading, so no source parse
@@ -1264,7 +1485,7 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
             if heading_filter.is_empty() {
                 flush_records(&mut stdout, &pending, &opts)?;
             }
-            return abort_list(&mut stdout, &mut stderr, &rej, opts.kind);
+            return abort_list(&mut stdout, &mut stderr, &rej);
         }
         flush_records(&mut stdout, &pending, &opts)?;
     }
@@ -1475,19 +1696,13 @@ fn abort_list<W1: Write, W2: Write>(
     stdout: &mut W1,
     stderr: &mut W2,
     rej: &ListReject,
-    kind: ClockKeyword,
 ) -> Result<i32, String> {
     stdout.flush().map_err(|e| e.to_string())?;
     emit_reject(stderr, rej).map_err(|e| e.to_string())?;
     writeln!(
         stderr,
-        "\nstopped on first rejection. Use ``org-cli clock {}`` \
+        "\nstopped on first rejection. Use ``org-cli clock check`` \
          for the complete inventory.",
-        if kind == ClockKeyword::Filed {
-            "check-filed"
-        } else {
-            "check"
-        },
     )
     .map_err(|e| e.to_string())?;
     stderr.flush().map_err(|e| e.to_string())?;
@@ -1881,16 +2096,17 @@ mod tests {
 
     fn opts_for(paths: Vec<PathBuf>) -> CheckOptions {
         CheckOptions {
-            kind: ClockKeyword::Clock,
             paths,
             exclude_globs: Vec::new(),
             nul: false,
             json: true, // tests use json so output is unaffected by colors
             first: false,
             verify: false,
-            // Unit tests must not touch the user's real cache file.
+            // Unit tests must not touch the user's real cache file…
             no_cache: true,
             timing: false,
+            // …nor sweep the user's real agenda set for overlaps.
+            agenda_set: Some(PathBuf::from("/nonexistent/org-cli-unit-test-agenda")),
         }
     }
 

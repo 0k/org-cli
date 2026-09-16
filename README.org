@@ -82,6 +82,55 @@ and =todo_keywords=. NUL records use the fixed-field layout
 field indices remain stable, but consumers that assert the old exact field
 count must be updated.
 
+** =clock check= — is this file's time bookkeeping sound?
+
+The single gate to run after any edit that adds, modifies, or moves a
+=CLOCK:= or =FILED:= line. Three rule sets share one exit code (=0=
+clean, =1= at least one violation):
+
+1. every closed-range =CLOCK:= line follows the canonical format
+   (numerical timezone, consistent precision, matching weekday,
+   start ≤ end, accepted zone);
+2. every =FILED:= line follows the CLOCK grammar and carries a valid
+   customer tag;
+3. no two clean =CLOCK:= entries cover the same instant — the one
+   *cross-entry* rule.
+
+Rules 1–2 are per-line and scoped to =PATHS=. Rule 3 is pairwise over
+=PATHS ∪ agenda set=: a CLOCK just written to one file may collide
+with one in *any* other agenda file, and that is exactly what a
+post-write check must catch. Only pairs touching =PATHS= are reported;
+with no =PATHS= the agenda set is the scope and every pair is. Files
+matching =clock.overlap.exclude-globs= (see =clock overlap= below)
+contribute no intervals. When the agenda set cannot be read, the sweep
+narrows to =PATHS= with a warning on stderr, so a file-local check
+keeps working on a machine that never ran org-collect.
+
+#+begin_src bash
+# After writing a CLOCK into a project file
+org-cli clock check ~/notes/project.org
+
+# Whole agenda set, NDJSON, stop at the first hit
+org-cli clock check -j -1
+
+# Narrow both the lint and the sweep
+org-cli clock check --exclude '**/archive/**' path/
+#+end_src
+
+Human output ends with one summary line per rule set — =All CLOCK
+lines OK.=, =All FILED lines OK.=, =No overlapping CLOCK entries.= —
+or the matching red count, so a green run reads as three distinct
+facts and a red one names which rule set failed.
+
+Records are anchored on one line. NDJSON fields are =file=, =line=,
+=tag=, =message=, =raw=; an =overlap= record additionally carries
+=other= (=file=, =line=, =raw= of the other side) and
+=overlap_seconds=, anchored on the earlier-starting line — or on the
+line inside =PATHS= when only one side is. NUL records are
+=file\0line\0tag\0message\0raw\0\0=; an =overlap= record appends
+=other-file\0other-line\0other-raw\0= before the terminator so
+existing field indices stay stable.
+
 ** =clock list= — list CLOCK lines, optionally filtered by parent heading
 
 In its default form, =clock list= is a flat scanner emitting every
@@ -108,7 +157,7 @@ org-cli clock list -f "billing" -i --has-property TASK_REF -j path/
 With no heading filter, NDJSON output is byte-identical to the
 pre-filter shape — existing consumers are unaffected.
 
-** =clock list-filed= and =clock check-filed= — declared customer time
+** =clock list-filed= — declared customer time
 
 A =FILED:= line records a time segment that was declared to a
 customer's accounting system and is frozen there. It uses exactly the
@@ -136,22 +185,24 @@ org-cli clock list-filed --customer lok -j path/
 # Emit fixed-field NUL records
 org-cli clock list-filed -0 path/
 
-# Validate FILED grammar and customer tags
-org-cli clock check-filed path/
+# Validate FILED grammar and customer tags (the FILED pass of check)
+org-cli clock check path/
 #+end_src
 
 The =list-filed -j= fields are =file=, =line=, =start=, =end=, and
 =tag=. Machine =start= and =end= values are UTC integer seconds since
 the Unix epoch. NUL records use the same order, with NUL between fields
 and a double-NUL record terminator. Invalid FILED lines are diagnosed
-and excluded from listing; either command exits 1 when it finds one.
+and excluded from listing; =list-filed= exits 1 when it finds one, and
+=clock check= reports them alongside its CLOCK and overlap findings.
 
 ** =clock overlap= — find CLOCK lines covering the same instant
 
-Every =clock check= rule applies to a single line. =clock overlap= is
-the one cross-entry rule: it compares each clean CLOCK entry against
+The one cross-entry rule: it compares each clean CLOCK entry against
 every other one across the whole corpus, because you cannot be doing
-two things at the same time.
+two things at the same time. =clock check= runs the same rule as its
+third pass; =clock overlap= is the pair-oriented, sortable view of it
+for auditing a corpus.
 
 Intervals are *half-open* =[start, end)=: =10:00–11:00= and
 =11:00–12:00= are adjacent, not overlapping — that is exactly the
@@ -183,10 +234,10 @@ detector order. Without =--sort=, detector order is unchanged.
 =--first= is applied after sorting, and human, NUL, and NDJSON output
 all use the same resulting order.
 
-Lines that fail =clock check= are skipped with a warning rather than
-aborting the run: a line whose own timestamps are broken cannot be
-placed on a timeline, but the rest still can. Run =clock check= first
-for a corpus that is clean line-by-line.
+Lines that fail the per-line rules are skipped with a warning rather
+than aborting the run: a line whose own timestamps are broken cannot
+be placed on a timeline, but the rest still can. =clock check= reports
+those lines itself, so it stays silent about skipping them.
 
 *** Declaring which CLOCK lines are work logs
 

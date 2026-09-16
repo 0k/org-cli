@@ -69,6 +69,7 @@ fn run_with_cache(cache: &TempDir, args: &[&str]) -> (Option<i32>, String, Strin
     let out = Command::new(bin_path())
         .env("ORG_CLI_CLOCK_CACHE", cache.path().join("clock.sqlite"))
         .env("XDG_CONFIG_HOME", cache.path().join("config"))
+        .env("ORG_CLI_AGENDA_SET", "/nonexistent/org-cli-it-agenda")
         .arg("clock")
         .arg("overlap")
         .args(args)
@@ -160,6 +161,8 @@ fn clean_fixture_also_passes_clock_check() {
     // canonical, otherwise `clock overlap` would be silent merely
     // because every line got skipped.
     let out = Command::new(bin_path())
+        .env("ORG_CLI_AGENDA_SET", "/nonexistent/org-cli-it-agenda")
+        .env("XDG_CONFIG_HOME", "/nonexistent/org-cli-it-config")
         .arg("clock")
         .arg("check")
         .arg(fixtures_root().join("overlap-clean.org"))
@@ -174,21 +177,25 @@ fn clean_fixture_also_passes_clock_check() {
 }
 
 #[test]
-fn dirty_fixture_also_passes_clock_check() {
+fn dirty_fixture_also_passes_per_line_clock_check() {
     // The dirty fixture is dirty *only* in the overlap sense; each
-    // individual line must still be canonical.
+    // individual line must still be canonical. `clock check` now
+    // runs the overlap rule too, so look at the per-line records
+    // rather than the exit code.
     let out = Command::new(bin_path())
+        .env("ORG_CLI_AGENDA_SET", "/nonexistent/org-cli-it-agenda")
+        .env("XDG_CONFIG_HOME", "/nonexistent/org-cli-it-config")
         .arg("clock")
         .arg("check")
+        .arg("-j")
         .arg(fixtures_root().join("overlap-dirty.org"))
         .output()
         .expect("spawn org-cli");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["tag"], "overlap", "per-line violation leaked: {line}");
+    }
 }
 
 #[test]

@@ -139,7 +139,6 @@ pub fn run() -> Result<(), String> {
                 timing,
             } => {
                 let opts = action::clock::CheckOptions {
-                    kind: crate::org::clock::ClockKeyword::Clock,
                     paths,
                     exclude_globs,
                     nul,
@@ -148,33 +147,7 @@ pub fn run() -> Result<(), String> {
                     verify,
                     no_cache,
                     timing,
-                };
-                let exit_code = action::clock::run_check(opts)?;
-                if exit_code != 0 {
-                    std::process::exit(exit_code);
-                }
-                Ok(())
-            }
-            def::ClockCommands::CheckFiled {
-                paths,
-                exclude_globs,
-                nul,
-                json,
-                first,
-                verify,
-                no_cache,
-                timing,
-            } => {
-                let opts = action::clock::CheckOptions {
-                    kind: crate::org::clock::ClockKeyword::Filed,
-                    paths,
-                    exclude_globs,
-                    nul,
-                    json,
-                    first,
-                    verify,
-                    no_cache,
-                    timing,
+                    agenda_set: None,
                 };
                 let exit_code = action::clock::run_check(opts)?;
                 if exit_code != 0 {

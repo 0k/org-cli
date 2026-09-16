@@ -1,4 +1,5 @@
-//! End-to-end tests for `org-cli clock list-filed` and `check-filed`.
+//! End-to-end tests for `org-cli clock list-filed` and the FILED
+//! pass of `clock check`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -25,6 +26,7 @@ fn run_clock(args: &[&str], path: &Path) -> Output {
         .arg(path)
         .env("ORG_CLI_CLOCK_CACHE", cache.path().join("clock.sqlite"))
         .env("XDG_CONFIG_HOME", config.path())
+        .env("ORG_CLI_AGENDA_SET", "/nonexistent/org-cli-it-agenda")
         .output()
         .expect("spawn org-cli clock command")
 }
@@ -97,15 +99,13 @@ fn list_filed_human_output_is_one_line_per_record() {
 }
 
 #[test]
-fn check_filed_accepts_clean_and_reports_dirty_lines() {
-    let clean = run_clock(&["check-filed"], &fixture("filed.org"));
+fn check_accepts_clean_and_reports_dirty_filed_lines() {
+    let clean = run_clock(&["check"], &fixture("filed.org"));
     assert_eq!(clean.status.code(), Some(0));
-    assert_output_eq(
-        &String::from_utf8(clean.stdout).unwrap(),
-        "All FILED lines OK.\n",
-    );
+    let stdout = String::from_utf8(clean.stdout).unwrap();
+    assert!(stdout.contains("All FILED lines OK.\n"), "{stdout}");
 
-    let dirty = run_clock(&["check-filed", "--no-color"], &fixture("filed-dirty.org"));
+    let dirty = run_clock(&["check", "--no-color"], &fixture("filed-dirty.org"));
     assert_eq!(dirty.status.code(), Some(1));
     let stdout = String::from_utf8(dirty.stdout).unwrap();
     assert!(stdout.contains("missing-tag"), "{stdout}");
@@ -122,7 +122,7 @@ fn list_filed_rejects_invalid_lines_on_stderr() {
     assert_output_eq(&String::from_utf8(output.stdout).unwrap(), "");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("rejected (missing-tag)"), "{stderr}");
-    assert!(stderr.contains("clock check-filed"), "{stderr}");
+    assert!(stderr.contains("clock check``"), "{stderr}");
 }
 
 #[test]
@@ -136,10 +136,8 @@ fn clock_commands_ignore_filed_lines() {
 
     let check = run_clock(&["check", "--no-color", "--no-cache"], &path);
     assert_eq!(check.status.code(), Some(0));
-    assert_output_eq(
-        &String::from_utf8(check.stdout).unwrap(),
-        "All CLOCK lines OK.\n",
-    );
+    let stdout = String::from_utf8(check.stdout).unwrap();
+    assert!(stdout.starts_with("All CLOCK lines OK.\n"), "{stdout}");
 
     let overlap = run_clock(&["overlap", "-j", "--no-cache"], &path);
     assert_eq!(overlap.status.code(), Some(0));

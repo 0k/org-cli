@@ -56,7 +56,18 @@ pub fn collect_org_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
 }
 
 /// Default location of the agenda-set file (the org-collect output).
+///
+/// `ORG_CLI_AGENDA_SET` overrides it. Tests use it — alongside
+/// `ORG_CLI_CLOCK_CACHE` — to keep every run isolated from the
+/// user's real corpus: the overlap rule of `clock check` sweeps the
+/// agenda set even when PATHS are given, so an unpinned test would
+/// compare its fixture against whatever the user has clocked.
 pub fn default_agenda_set_path() -> Result<PathBuf, String> {
+    if let Ok(p) = std::env::var("ORG_CLI_AGENDA_SET")
+        && !p.is_empty()
+    {
+        return Ok(PathBuf::from(p));
+    }
     let home = dirs::home_dir().ok_or("cannot determine home directory")?;
     Ok(home.join(".cache/emacs/org-collect/org-agenda-files.tmp"))
 }
@@ -77,13 +88,16 @@ pub fn read_agenda_set(p: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-fn compile_globs(raw: &[String]) -> Result<Vec<Pattern>, String> {
+/// Compile `--exclude`-style glob patterns, failing on the first
+/// malformed one.
+pub fn compile_globs(raw: &[String]) -> Result<Vec<Pattern>, String> {
     raw.iter()
         .map(|g| Pattern::new(g).map_err(|e| format!("invalid --exclude glob {:?}: {}", g, e)))
         .collect()
 }
 
-fn path_excluded(p: &Path, patterns: &[Pattern]) -> bool {
+/// Whether `p` matches any of the compiled exclusion patterns.
+pub fn path_excluded(p: &Path, patterns: &[Pattern]) -> bool {
     let s = p.to_string_lossy();
     patterns.iter().any(|pat| pat.matches(&s))
 }

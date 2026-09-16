@@ -12,6 +12,16 @@ fn bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_org-cli"))
 }
 
+/// A `org-cli` command isolated from the user's environment: no real
+/// clock cache, no real config, and — because `clock check` sweeps
+/// the agenda set for overlaps — no real agenda set either.
+fn cmd() -> Command {
+    let mut c = Command::new(bin_path());
+    c.env("ORG_CLI_AGENDA_SET", "/nonexistent/org-cli-it-agenda")
+        .env("XDG_CONFIG_HOME", "/nonexistent/org-cli-it-config");
+    c
+}
+
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -21,7 +31,7 @@ fn fixtures_root() -> PathBuf {
 
 #[test]
 fn check_clean_fixture_returns_zero() {
-    let out = Command::new(bin_path())
+    let out = cmd()
         .arg("clock")
         .arg("check")
         .arg(fixtures_root().join("clean.org"))
@@ -37,7 +47,7 @@ fn check_clean_fixture_returns_zero() {
 
 #[test]
 fn check_dirty_fixture_returns_one_with_json() {
-    let out = Command::new(bin_path())
+    let out = cmd()
         .arg("clock")
         .arg("check")
         .arg("-j")
@@ -83,7 +93,7 @@ fn check_dirty_fixture_returns_one_with_json() {
 
 #[test]
 fn list_clean_fixture_emits_one_record_per_clock() {
-    let out = Command::new(bin_path())
+    let out = cmd()
         .arg("clock")
         .arg("list")
         .arg("-j")
@@ -125,7 +135,7 @@ fn list_clean_fixture_emits_one_record_per_clock() {
 
 #[test]
 fn list_hard_fails_on_first_rejection() {
-    let out = Command::new(bin_path())
+    let out = cmd()
         .arg("clock")
         .arg("list")
         .arg("-j")
@@ -189,7 +199,7 @@ fn list_aborts_before_processing_subsequent_clean_lines() {
         ),
     )
     .unwrap();
-    let out = Command::new(bin_path())
+    let out = cmd()
         .arg("clock")
         .arg("list")
         .arg("-j")
@@ -231,7 +241,7 @@ fn add_inserts_canonical_clock_into_target_heading() {
     )
     .unwrap();
 
-    let out = Command::new(bin_path())
+    let out = cmd()
         .arg("clock")
         .arg("add")
         .arg(&p)
@@ -264,7 +274,7 @@ fn add_inserts_canonical_clock_into_target_heading() {
         after
     );
     // The inserted line must pass ``clock check``.
-    let chk = Command::new(bin_path())
+    let chk = cmd()
         .arg("clock")
         .arg("check")
         .arg(&p)
@@ -283,7 +293,7 @@ fn add_inserts_canonical_clock_into_target_heading() {
 
 #[test]
 fn fmt_minute_with_explicit_tz_outputs_canonical_line() {
-    let out = Command::new(bin_path())
+    let out = cmd()
         .arg("clock")
         .arg("fmt")
         .arg("2025-06-06 09:30")
@@ -307,7 +317,7 @@ fn fmt_minute_with_explicit_tz_outputs_canonical_line() {
 
 #[test]
 fn fmt_with_seconds_outputs_canonical_line() {
-    let out = Command::new(bin_path())
+    let out = cmd()
         .arg("clock")
         .arg("fmt")
         .arg("2026-01-07 09:57:20")
@@ -344,7 +354,7 @@ fn fmt_round_trips_through_check() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
 
-    let fmt = Command::new(bin_path())
+    let fmt = cmd()
         .arg("clock")
         .arg("fmt")
         .arg("2025-06-06 09:23")
@@ -366,7 +376,7 @@ fn fmt_round_trips_through_check() {
     let p = dir.join("rt.org");
     std::fs::write(&p, format!("  :LOGBOOK:\n  {}\n  :END:\n", line)).unwrap();
 
-    let chk = Command::new(bin_path())
+    let chk = cmd()
         .arg("clock")
         .arg("check")
         .arg(&p)
@@ -410,7 +420,7 @@ fn check_first_emits_a_single_record() {
         "CLOCK: [2024-11-13 Mon 15:00 +0100]--[2024-11-13 Mon 15:45 +0100] => 720:45\n",
     )
     .unwrap();
-    let out = Command::new(bin_path())
+    let out = cmd()
         .args(["clock", "check", "-j", "-1"])
         .arg(&dir)
         .output()
@@ -442,7 +452,7 @@ fn src_block_samples_are_invisible_to_check_list_and_fix() {
                 #+end_src\n";
     std::fs::write(&f, body).unwrap();
 
-    let chk = Command::new(bin_path())
+    let chk = cmd()
         .args(["clock", "check", "-j"])
         .arg(&f)
         .output()
@@ -450,7 +460,7 @@ fn src_block_samples_are_invisible_to_check_list_and_fix() {
     assert_eq!(chk.status.code(), Some(0), "check must be clean");
     assert!(chk.stdout.is_empty());
 
-    let lst = Command::new(bin_path())
+    let lst = cmd()
         .args(["clock", "list", "-j"])
         .arg(&f)
         .output()
@@ -462,7 +472,7 @@ fn src_block_samples_are_invisible_to_check_list_and_fix() {
     );
     assert_eq!(String::from_utf8_lossy(&lst.stdout).lines().count(), 1);
 
-    let fix = Command::new(bin_path())
+    let fix = cmd()
         .args(["clock", "fix", "--write"])
         .arg(&f)
         .output()
@@ -491,7 +501,7 @@ fn non_utf8_file_is_decoded_lossily_with_warning() {
 
     for (sub, want_exit) in [("check", 1), ("list", 1)] {
         for extra in [&[][..], &["--no-cache"][..]] {
-            let out = Command::new(bin_path())
+            let out = cmd()
                 .env("ORG_CLI_CLOCK_CACHE", dir.join("cache.sqlite"))
                 .args(["clock", sub, "-j"])
                 .args(extra)

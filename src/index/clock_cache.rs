@@ -40,7 +40,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-use crate::index::clock_blob::Blob;
+use crate::index::clock_blob::{Blob, FORMAT_VERSION};
 use crate::org::clock::ClockKeyword;
 use crate::org::clock_project::{
     ClockedHeading, Diagnostic, PARSER_ABI, PROJECTION_ABI, Projection, project,
@@ -160,6 +160,11 @@ impl ClockCache {
                 .map_err(|e| e.to_string())?;
             tx.commit().map_err(|e| e.to_string())?;
         }
+        conn.execute(
+            "DELETE FROM l1 WHERE proj_abi <> ?1 OR parser_abi <> ?2",
+            params![PROJECTION_ABI as i64, PARSER_ABI as i64],
+        )
+        .map_err(|e| format!("evicting stale l1 rows: {}", e))?;
         Ok(Self { conn })
     }
 
@@ -346,8 +351,11 @@ impl ClockCache {
         let mut bucket_digests = [[0u8; 32]; 256];
         for (b, rows) in bucket_members.iter().enumerate() {
             let mut h = Sha256::new();
-            h.update(b"bucket-v1\0");
+            h.update(b"bucket-v2\0");
             h.update([b as u8]);
+            h.update(PROJECTION_ABI.to_le_bytes());
+            h.update(PARSER_ABI.to_le_bytes());
+            h.update(FORMAT_VERSION.to_le_bytes());
             for r in rows {
                 h.update(path_id(&r.canonical));
                 h.update(r.blob_digest);
@@ -418,11 +426,12 @@ impl ClockCache {
             .prepare(
                 "SELECT path_id, canonical, content_sha, proj_abi, parser_abi, size, mtime_ns,
                         blob_digest, blob, diagnostics, headings
-                 FROM l1",
+                 FROM l1
+                 WHERE proj_abi = ?1 AND parser_abi = ?2",
             )
             .map_err(|e| format!("preparing l1 scan: {}", e))?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map(params![PROJECTION_ABI as i64, PARSER_ABI as i64], |r| {
                 let pid: Vec<u8> = r.get(0)?;
                 let sha: Vec<u8> = r.get(2)?;
                 let bd: Vec<u8> = r.get(7)?;
@@ -457,8 +466,9 @@ impl ClockCache {
             .query_row(
                 "SELECT canonical, content_sha, proj_abi, parser_abi, size, mtime_ns,
                         blob_digest, blob, diagnostics, headings
-                 FROM l1 WHERE path_id = ?1",
-                params![pid.as_slice()],
+                 FROM l1
+                 WHERE path_id = ?1 AND proj_abi = ?2 AND parser_abi = ?3",
+                params![pid.as_slice(), PROJECTION_ABI as i64, PARSER_ABI as i64],
                 |r| {
                     let sha: Vec<u8> = r.get(1)?;
                     let bd: Vec<u8> = r.get(6)?;
@@ -1033,6 +1043,172 @@ mod tests {
             .resolve(std::slice::from_ref(&a), b"scope-1", Verify::Metadata)
             .unwrap();
         assert!(r.timing.root_hit);
+    }
+
+    #[test]
+    fn legacy_format_l2_bucket_is_not_reused() {
+        let td = TempDir::new("legacy-l2");
+        let file = td.path().join("a.org");
+        write(&file, CLOCK_A);
+        let mut cache = ClockCache::in_memory().unwrap();
+        cache
+            .resolve(std::slice::from_ref(&file), b"scope-1", Verify::Metadata)
+            .unwrap();
+
+        let pid = path_id(&canonical_string(&file).unwrap());
+        let row = cache.load_l1(&pid).unwrap().unwrap();
+        let mut digest = Sha256::new();
+        digest.update(b"bucket-v1\0");
+        digest.update([pid[0]]);
+        digest.update(path_id(&row.canonical));
+        digest.update(row.blob_digest);
+        let legacy_digest: [u8; 32] = digest.finalize().into();
+
+        let mut legacy_blob = Blob::empty(PROJECTION_ABI, PARSER_ABI).encode().unwrap();
+        legacy_blob[4..6]
+            .copy_from_slice(&(crate::index::clock_blob::FORMAT_VERSION - 1).to_le_bytes());
+        cache.store_l2(&legacy_digest, &legacy_blob, 0).unwrap();
+
+        let resolved = cache
+            .resolve(std::slice::from_ref(&file), b"scope-2", Verify::Metadata)
+            .unwrap();
+        assert_eq!(resolved.root.records.len(), 1);
+    }
+
+    #[test]
+    fn stale_out_of_scope_l1_row_is_ignored() {
+        let td = TempDir::new("stale-out-of-scope");
+        let file = td.path().join("a.org");
+        write(&file, CLOCK_A);
+        let mut cache = ClockCache::in_memory().unwrap();
+        cache
+            .resolve(std::slice::from_ref(&file), b"scope-1", Verify::Metadata)
+            .unwrap();
+
+        let pid = path_id(&canonical_string(&file).unwrap());
+        let mut stale = cache.load_l1(&pid).unwrap().unwrap();
+        stale.canonical = "/file-no-longer-in-scope.org".into();
+        stale.proj_abi = PROJECTION_ABI - 1;
+        stale.blob = vec![0xff];
+        cache.store_l1(&[0xff; 8], &stale).unwrap();
+
+        let resolved = cache
+            .resolve(std::slice::from_ref(&file), b"scope-2", Verify::Metadata)
+            .unwrap();
+        assert_eq!(resolved.root.records.len(), 1);
+    }
+
+    #[test]
+    fn stale_in_scope_l1_row_is_reprojected_without_decode() {
+        let td = TempDir::new("stale-in-scope");
+        let file = td.path().join("a.org");
+        write(&file, CLOCK_A);
+        let mut cache = ClockCache::in_memory().unwrap();
+        cache
+            .resolve(std::slice::from_ref(&file), b"scope-1", Verify::Metadata)
+            .unwrap();
+
+        let pid = path_id(&canonical_string(&file).unwrap());
+        let mut stale = cache.load_l1(&pid).unwrap().unwrap();
+        stale.proj_abi = PROJECTION_ABI - 1;
+        stale.blob = vec![0xff];
+        cache.store_l1(&pid, &stale).unwrap();
+
+        let resolved = cache
+            .resolve(std::slice::from_ref(&file), b"scope-2", Verify::Metadata)
+            .unwrap();
+        assert_eq!(resolved.timing.l1_misses, 1);
+        assert_eq!(resolved.root.records.len(), 1);
+    }
+
+    #[test]
+    fn all_l1_loader_excludes_stale_abi_rows() {
+        let td = TempDir::new("stale-loader");
+        let file = td.path().join("a.org");
+        write(&file, CLOCK_A);
+        let mut cache = ClockCache::in_memory().unwrap();
+        cache
+            .resolve(std::slice::from_ref(&file), b"", Verify::Metadata)
+            .unwrap();
+
+        let pid = path_id(&canonical_string(&file).unwrap());
+        let mut stale = cache.load_l1(&pid).unwrap().unwrap();
+        stale.proj_abi = PROJECTION_ABI - 1;
+        cache.store_l1(&[0xfe; 8], &stale).unwrap();
+
+        assert!(!cache.load_all_l1().unwrap().contains_key(&[0xfe; 8]));
+    }
+
+    #[test]
+    fn cache_open_evicts_stale_l1_rows() {
+        let td = TempDir::new("stale-open");
+        let db = td.path().join("cache.sqlite");
+        let file = td.path().join("a.org");
+        write(&file, CLOCK_A);
+        {
+            let mut cache = ClockCache::open(&db).unwrap();
+            cache
+                .resolve(std::slice::from_ref(&file), b"", Verify::Metadata)
+                .unwrap();
+            cache
+                .conn
+                .execute(
+                    "UPDATE l1 SET proj_abi = ?1",
+                    params![(PROJECTION_ABI - 1) as i64],
+                )
+                .unwrap();
+        }
+
+        let cache = ClockCache::open(&db).unwrap();
+        let count: i64 = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM l1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn current_abi_corrupt_l1_blob_remains_a_hard_error() {
+        let td = TempDir::new("current-corrupt");
+        let file = td.path().join("a.org");
+        write(&file, CLOCK_A);
+        let mut cache = ClockCache::in_memory().unwrap();
+        cache
+            .resolve(std::slice::from_ref(&file), b"", Verify::Metadata)
+            .unwrap();
+
+        let pid = path_id(&canonical_string(&file).unwrap());
+        let mut corrupt = cache.load_l1(&pid).unwrap().unwrap();
+        corrupt.blob = vec![0xff];
+        cache.store_l1(&pid, &corrupt).unwrap();
+
+        let error = cache
+            .resolve(std::slice::from_ref(&file), b"", Verify::Metadata)
+            .unwrap_err();
+        assert!(error.contains("blob shorter than header"), "{error}");
+    }
+
+    #[test]
+    fn current_digest_corrupt_l2_blob_remains_a_hard_error() {
+        let td = TempDir::new("current-l2-corrupt");
+        let file = td.path().join("a.org");
+        write(&file, CLOCK_A);
+        let mut cache = ClockCache::in_memory().unwrap();
+        cache
+            .resolve(std::slice::from_ref(&file), b"scope-1", Verify::Metadata)
+            .unwrap();
+        cache
+            .conn
+            .execute(
+                "UPDATE l2 SET blob = ?1 WHERE kind = 0",
+                params![vec![0xff_u8]],
+            )
+            .unwrap();
+
+        let error = cache
+            .resolve(std::slice::from_ref(&file), b"scope-2", Verify::Metadata)
+            .unwrap_err();
+        assert!(error.contains("blob shorter than header"), "{error}");
     }
 
     // O1

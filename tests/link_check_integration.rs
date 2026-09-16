@@ -316,6 +316,184 @@ fn test_check_follows_heading_anchor_with_escaped_brackets() {
     assert_eq!(output.status.code(), Some(1));
 }
 
+/// A description containing `[` or `]` must not make the link vanish.
+///
+/// This is the shape the archive's own house style produces — a
+/// description ending in a bracketed ISO date, `… ; versé
+/// [2026-08-30]` — and the parser used to stop the description at any
+/// bracket, so the whole link failed to parse and was absent from the
+/// graph. `check` then reported a clean tree over broken links, which
+/// is the one failure a link checker must never have.
+///
+/// Every row below is a link *Emacs follows*, verified against
+/// `org-element-parse-buffer`. They are therefore positive cases: each
+/// must be seen, and the ones whose target is missing must be
+/// reported. `[[file:present.org][…]]` variants must stay silent.
+#[test]
+fn test_check_sees_links_whose_description_contains_brackets() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("present.org"), "* Here\n").unwrap();
+    std::fs::write(
+        temp.path().join("source.org"),
+        concat!(
+            // Reported: target absent, description carries brackets.
+            "- [[file:gone-date.org][2010-04-14 — consultation ; versé [2026-08-30]]]\n",
+            "- [[file:gone-pair.org][has [bracket] pair]]\n",
+            "- [[file:gone-open.org][open [ only]]\n",
+            "- [[file:gone-close.org][close ] only]]\n",
+            // Silent: same shapes, but the target exists.
+            "- [[file:present.org][ok ; versé [2026-08-30]]]\n",
+            "- [[file:present.org][ok [bracket] pair]]\n",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .args(["link", "check", "--json"])
+        .arg(temp.path())
+        .output()
+        .expect("failed to spawn org-cli");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let targets: BTreeSet<String> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .map(|v| {
+            Path::new(v["resolved_target"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+
+    let expected: BTreeSet<String> = [
+        "gone-date.org",
+        "gone-pair.org",
+        "gone-open.org",
+        "gone-close.org",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    assert_eq!(
+        targets, expected,
+        "every bracketed-description link must be seen; \
+         a missing target must be reported and a present one must not. got: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// The bracketed-description shapes must stay excluded inside literal
+/// contexts, where Emacs does not follow links either.
+///
+/// Paired deliberately with the test above: widening the description
+/// scanner could plausibly have started claiming link-shaped text in
+/// `#+begin_src` / `#+begin_example` / `=verbatim=`, and a checker that
+/// reports a broken link inside a code sample is as wrong as one that
+/// misses a real link.
+#[test]
+fn test_check_ignores_bracketed_descriptions_in_literal_contexts() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("source.org"),
+        concat!(
+            "#+begin_src org\n",
+            "[[file:in-src.org][sample ; versé [2026-08-30]]]\n",
+            "#+end_src\n\n",
+            "#+begin_example\n",
+            "[[file:in-example.org][sample [bracket] pair]]\n",
+            "#+end_example\n\n",
+            "Inline verbatim: =[[file:in-verbatim.org][quoted [x] here]]=\n",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .args(["link", "check", "--json"])
+        .arg(temp.path())
+        .output()
+        .expect("failed to spawn org-cli");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert_eq!(
+        stdout.trim(),
+        "",
+        "link-shaped text in a literal context must yield no link, got: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// `[[path][]]` is a link with no description, not a parse failure.
+///
+/// Emacs parses this form, so dropping it would delete a real edge.
+/// Pinned because "the description is one-or-more characters" is the
+/// intuitive reading and it is wrong.
+#[test]
+fn test_check_sees_link_with_empty_description() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("source.org"),
+        "- [[file:gone-empty.org][]]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .args(["link", "check", "--json"])
+        .arg(temp.path())
+        .output()
+        .expect("failed to spawn org-cli");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(
+        stdout.contains("gone-empty.org"),
+        "an empty description must not make the link vanish, got: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// A bracketed description must not let one link swallow the next.
+///
+/// The scanner stops at the FIRST `]]`, so two links on one line stay
+/// two links. A greedy scan would merge them and silently drop the
+/// second target from the graph.
+#[test]
+fn test_check_does_not_merge_adjacent_bracketed_links() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("source.org"),
+        "See [[file:first-gone.org][a [x] b]] and [[file:second-gone.org][c [y] d]].\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .args(["link", "check", "--json"])
+        .arg(temp.path())
+        .output()
+        .expect("failed to spawn org-cli");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let targets: BTreeSet<String> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .map(|v| {
+            Path::new(v["resolved_target"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+
+    let expected: BTreeSet<String> = ["first-gone.org", "second-gone.org"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+    assert_eq!(targets, expected, "both links must survive; got: {stdout}");
+}
+
 /// `link backlinks` shares the extraction path, so an escaped anchor
 /// must make the source appear as a backlink rather than vanish.
 #[test]

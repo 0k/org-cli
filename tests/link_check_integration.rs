@@ -18,6 +18,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use indoc::indoc;
+
 /// Absolute path to the fixture root, regardless of cwd.
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -43,6 +45,150 @@ fn run_check(args: &[&str]) -> (Option<i32>, String) {
         .expect("failed to spawn org-cli");
     let stdout = String::from_utf8(output.stdout).expect("stdout not UTF-8");
     (output.status.code(), stdout)
+}
+
+#[test]
+fn test_check_internal_links_report_all_formats_and_origins() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.org");
+    std::fs::write(
+        &source,
+        indoc! {"
+            * Existing
+            :PROPERTIES:
+            :CUSTOM_ID: existing-id
+            :REFERENCE: [[#nope][missing id]]
+            :END:
+            [[*Missing][missing heading]]
+            :LOGBOOK:
+            - [[*Absent][drawer heading]]
+            :END:
+        "},
+    )
+    .unwrap();
+    let invoke = |format: &str| {
+        Command::new(bin_path())
+            .args(["link", "check", format])
+            .arg(&source)
+            .output()
+            .unwrap()
+    };
+    let json = invoke("-j");
+    assert_eq!(json.status.code(), Some(1));
+    let records: Vec<serde_json::Value> = String::from_utf8(json.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0]["source_file"], source.to_str().unwrap());
+    assert_eq!(records[0]["resolved_target"], source.to_str().unwrap());
+    assert_eq!(records[0]["reason_tag"], "custom-id-not-found");
+    assert_eq!(records[0]["origin_tag"], "property");
+    assert_eq!(records[0]["origin_property"], "REFERENCE");
+    assert_eq!(records[1]["reason_tag"], "heading-not-found");
+    assert_eq!(records[1]["origin_tag"], "body");
+    assert_eq!(records[2]["origin_tag"], "drawer");
+    assert_eq!(records[2]["origin_drawer"], "LOGBOOK");
+
+    let nul = invoke("-0");
+    assert_eq!(nul.status.code(), Some(1));
+    let bytes = String::from_utf8(nul.stdout).unwrap();
+    let rows: Vec<&str> = bytes.split("\0\0").filter(|row| !row.is_empty()).collect();
+    assert_eq!(rows.len(), 3);
+    let fields: Vec<&str> = rows[0].split('\0').collect();
+    assert_eq!(
+        fields,
+        vec![
+            source.to_str().unwrap(),
+            "4",
+            "13",
+            "custom-id-not-found",
+            source.to_str().unwrap(),
+            "[[#nope][missing id]]",
+            "property:PROPERTIES:REFERENCE"
+        ]
+    );
+
+    let human = invoke("--no-color");
+    assert_eq!(human.status.code(), Some(1));
+    let output = String::from_utf8(human.stdout).unwrap();
+    assert!(output.contains("CUSTOM_ID not found: \"nope\""));
+    assert!(output.contains("[[*Missing][missing heading]]"));
+    assert!(output.contains("3 broken link(s) found"));
+}
+
+#[test]
+fn test_check_internal_links_resolve_markup_unicode_and_ignore_other_link_kinds() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.org");
+    std::fs::write(
+        &source,
+        indoc! {"
+        ** odoo_base / build de l'image Élabore en échec — erreur sur un paquet =apt=
+        :PROPERTIES:
+        :CUSTOM_ID: existing-id
+        :END:
+        [[*Élabore en échec — erreur sur un paquet =apt=][heading]]
+        [[#existing-id]]
+        [[Some text]] [[https://example.com]] [[id:unknown]]
+        #+begin_src org
+        [[*Not a link]]
+        #+end_src
+        ** Headline [[*Not extracted]]
+    "},
+    )
+    .unwrap();
+    let output = Command::new(bin_path())
+        .args(["link", "check", "-j"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stdout.is_empty());
+    let strict = Command::new(bin_path())
+        .args(["link", "check", "-j", "--strict-headings"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(strict.status.code(), Some(1));
+    let record: serde_json::Value = serde_json::from_slice(&strict.stdout).unwrap();
+    assert_eq!(record["reason_tag"], "heading-not-found");
+}
+
+#[test]
+fn test_internal_links_do_not_change_orphans_or_backlinks() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target.org");
+    let source = temp.path().join("source.org");
+    std::fs::write(&target, "* Target\n").unwrap();
+    std::fs::write(&source, "* Source\n[[file:target.org][target]]\n").unwrap();
+    let run = |action: &str| {
+        let mut cmd = Command::new(bin_path());
+        cmd.args(["link", action, "-j"]);
+        if action == "backlinks" {
+            cmd.arg(&target);
+        }
+        cmd.arg(temp.path()).output().unwrap()
+    };
+    let before_orphans = run("orphans");
+    let before_backlinks = run("backlinks");
+    std::fs::write(
+        &source,
+        "* Source\n[[file:target.org][target]]\n[[*Source]] [[#nope]]\n",
+    )
+    .unwrap();
+    let after_orphans = run("orphans");
+    let after_backlinks = run("backlinks");
+    assert_eq!(after_orphans.status, before_orphans.status);
+    assert_eq!(after_orphans.stdout, before_orphans.stdout);
+    assert_eq!(after_backlinks.status, before_backlinks.status);
+    assert_eq!(after_backlinks.stdout, before_backlinks.stdout);
 }
 
 /// Every NDJSON record emitted by a `check -j` run over the fixture.

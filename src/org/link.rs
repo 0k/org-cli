@@ -1,7 +1,7 @@
 //! Org-mode link domain type.
 //!
 //! Owns the parsing and structural representation of `[[file:...]]`
-//! links found in an org document, plus the indexing of anchorable
+//! and same-file anchor links found in an org document, plus the indexing of anchorable
 //! targets (headings, `:CUSTOM_ID:` properties) inside an org file.
 //!
 //! Higher layers (`crate::cli::action::link::check`,
@@ -56,9 +56,9 @@ use crate::org::property::parse_property_line;
 
 /// A link extracted from an org document.
 ///
-/// Only `file:` links are produced by [`extract_file_links`]; other
-/// link types (`http:`, `id:`, `[[*Same-File-Heading]]`, …) are
-/// out of scope for v1 and are silently skipped.
+/// [`extract_file_links`] produces only `file:` links for graph and rewrite
+/// consumers. [`extract_checkable_links`] also produces same-file `[[*Heading]]`
+/// and `[[#custom-id]]` anchors for `link check`; other link types are skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     /// Raw link text as it appears in the source, e.g.
@@ -80,6 +80,9 @@ pub struct Link {
     /// stripped by `PathBuf` construction, so this flag preserves
     /// the semantic information for downstream consumers.
     pub target_is_directory: bool,
+    /// Same-file anchor links have no path to rewrite. Such links are only
+    /// returned by [`extract_checkable_links`]; `target_span` is empty.
+    pub target_is_same_file: bool,
     /// Optional anchor following `::`. `None` when the link is just
     /// `[[file:path]]` or `[[file:path][desc]]`.
     pub anchor: Option<Anchor>,
@@ -295,7 +298,9 @@ impl AnchorIndex {
         {
             headings.push(normalize_heading(&hdl.title_raw()));
             if let Some(properties) = hdl.properties()
-                && let Some(cid) = properties.get("CUSTOM_ID")
+                && let Some((_, cid)) = properties
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("CUSTOM_ID"))
             {
                 custom_ids.push(cid.to_string());
             }
@@ -373,7 +378,7 @@ pub fn rewrite_file_link_paths(
     rewrites: &[LinkPathRewrite],
 ) -> Result<String, String> {
     let mut ordered = rewrites.to_vec();
-    ordered.sort_by(|a, b| b.span.start.cmp(&a.span.start));
+    ordered.sort_by_key(|rewrite| std::cmp::Reverse(rewrite.span.start));
 
     let mut previous_start = content.len();
     for rewrite in &ordered {
@@ -530,8 +535,18 @@ pub fn collect_referenced_paths(
 ///
 /// Links are returned in source order.
 pub fn extract_file_links(content: &str) -> Vec<Link> {
-    let mut out = extract_body_links(content);
-    out.extend(extract_drawer_links(content));
+    extract_links(content, false)
+}
+
+/// Extract file links and same-file heading/CUSTOM_ID links for validation.
+/// Other schemes and unprefixed fuzzy links are not included.
+pub fn extract_checkable_links(content: &str) -> Vec<Link> {
+    extract_links(content, true)
+}
+
+fn extract_links(content: &str, include_same_file: bool) -> Vec<Link> {
+    let mut out = extract_body_links(content, include_same_file);
+    out.extend(extract_drawer_links(content, include_same_file));
     out.sort_by_key(|l| (l.line, l.column));
     out
 }
@@ -543,13 +558,13 @@ pub fn extract_file_links(content: &str) -> Vec<Link> {
 /// the walker's coverage *is* the definition of "body" here, and a
 /// descendant walk would additionally pick up links in headline
 /// titles, silently widening the historical edge set.
-fn extract_body_links(content: &str) -> Vec<Link> {
+fn extract_body_links(content: &str, include_same_file: bool) -> Vec<Link> {
     let mut out: Vec<Link> = Vec::new();
     let mut handler = from_fn(|event| {
         let Event::Enter(Container::Link(link)) = event else {
             return;
         };
-        if let Some(l) = build_link(content, &link, LinkOrigin::Body) {
+        if let Some(l) = build_link(content, &link, LinkOrigin::Body, include_same_file) {
             out.push(l);
         }
     });
@@ -574,7 +589,7 @@ fn extract_body_links(content: &str) -> Vec<Link> {
 ///   each value is one raw token. Every value is re-parsed *through
 ///   this module's own body extractor*, and the resulting links are
 ///   re-anchored to their absolute position in the document.
-fn extract_drawer_links(content: &str) -> Vec<Link> {
+fn extract_drawer_links(content: &str, include_same_file: bool) -> Vec<Link> {
     let org = Org::parse(content);
     let mut out: Vec<Link> = Vec::new();
 
@@ -591,7 +606,7 @@ fn extract_drawer_links(content: &str) -> Vec<Link> {
         for link in drawer.syntax().descendants().filter_map(OrgLink::cast) {
             let offset: usize = link.start().into();
             let origin = classify_drawer_link(content, offset, &name);
-            if let Some(l) = build_link(content, &link, origin) {
+            if let Some(l) = build_link(content, &link, origin, include_same_file) {
                 out.push(l);
             }
         }
@@ -619,7 +634,7 @@ fn extract_drawer_links(content: &str) -> Vec<Link> {
                 continue;
             };
             let value_offset = np_offset + value_in_line;
-            for mut link in extract_body_links(&parsed.value) {
+            for mut link in extract_body_links(&parsed.value, include_same_file) {
                 let pure_pointer = parsed.value.trim() == link.raw.trim();
                 link.origin = LinkOrigin::Property {
                     drawer: drawer_name.clone(),
@@ -703,25 +718,39 @@ fn offset_of(s: &str, line: usize, column: usize) -> usize {
     (start + column - 1).min(s.len())
 }
 
-/// Build a [`Link`] from an `orgize` link node, or `None` when the node
-/// is not a `file:` link (`http:`, `id:`, `[[*Heading]]`, …).
-fn build_link(content: &str, link: &OrgLink, origin: LinkOrigin) -> Option<Link> {
+/// Build a [`Link`] from the shared orgize link node for the admitted kinds.
+fn build_link(
+    content: &str,
+    link: &OrgLink,
+    origin: LinkOrigin,
+    include_same_file: bool,
+) -> Option<Link> {
     let raw_path = link.path().to_string();
-    let after_scheme = raw_path.strip_prefix("file:")?;
-
-    let (path_str, anchor) = split_anchor(after_scheme);
-    let decoded = percent_decode(path_str);
-    let target_is_directory = decoded.ends_with('/');
-    let target_path = PathBuf::from(decoded);
-
     let offset: usize = link.start().into();
     let (line, column) = offset_to_line_col(content, offset);
     let raw = link.raw();
-    let target_in_raw = raw.strip_prefix("[[file:")?;
-    if !target_in_raw.starts_with(path_str) {
-        return None;
-    }
-    let target_start = offset + "[[file:".len();
+    let (path_str, target_start, target_path, target_is_directory, target_is_same_file, anchor) =
+        if let Some(after_scheme) = raw_path.strip_prefix("file:") {
+            let (path_str, anchor) = split_anchor(after_scheme);
+            let decoded = percent_decode(path_str);
+            let target_in_raw = raw.strip_prefix("[[file:")?;
+            if !target_in_raw.starts_with(path_str) {
+                return None;
+            }
+            (
+                path_str,
+                offset + "[[file:".len(),
+                PathBuf::from(&decoded),
+                decoded.ends_with('/'),
+                false,
+                anchor,
+            )
+        } else if include_same_file && (raw_path.starts_with('*') || raw_path.starts_with('#')) {
+            let anchor = classify_anchor(&raw_path);
+            ("", offset, PathBuf::new(), false, true, Some(anchor))
+        } else {
+            return None;
+        };
 
     Some(Link {
         raw,
@@ -729,6 +758,7 @@ fn build_link(content: &str, link: &OrgLink, origin: LinkOrigin) -> Option<Link>
         target_span: target_start..target_start + path_str.len(),
         target_path,
         target_is_directory,
+        target_is_same_file,
         anchor,
         line,
         column,

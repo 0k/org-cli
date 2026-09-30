@@ -50,10 +50,7 @@ fn assert_ok(output: &Output) {
 fn assert_output_eq(actual: &str, expected: &str) {
     if actual != expected {
         let diff = TextDiff::from_lines(expected, actual);
-        eprintln!(
-            "{}",
-            diff.unified_diff().header("expected", "actual").to_string()
-        );
+        eprintln!("{}", diff.unified_diff().header("expected", "actual"));
         panic!("output mismatch");
     }
 }
@@ -559,6 +556,25 @@ fn initially_broken_corpus_is_rejected_before_preview_or_write_mutation() {
         &fs::read_to_string(root.join("unrelated.org")).unwrap(),
         unrelated_original,
     );
+}
+
+#[test]
+fn move_succeeds_with_preexisting_broken_internal_link_and_preserves_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let old = root.join("old.org");
+    let new = root.join("new.org");
+    let source = root.join("source.org");
+    write(&old, "* Old\n");
+    write(&source, "* Source\n[[file:old.org][target]] [[*Nope]]\n");
+
+    assert_ok(&run_move(&old, &new, root, true));
+    assert_output_eq(
+        &fs::read_to_string(&source).unwrap(),
+        "* Source\n[[file:new.org][target]] [[*Nope]]\n",
+    );
+    assert!(!old.exists());
+    assert!(new.exists());
 }
 
 #[test]

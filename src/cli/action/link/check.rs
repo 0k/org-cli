@@ -1,9 +1,9 @@
 //! `link check` action — link integrity check for org files.
 //!
 //! Walks the requested paths (files and directories), parses every
-//! `.org` file with [`crate::org::link::extract_file_links`], resolves
-//! each `[[file:...]]` target relative to the containing org file's
-//! directory, and reports broken links.
+//! `.org` file with [`crate::org::link::extract_checkable_links`], resolves
+//! file targets relative to the source and same-file anchors to the source,
+//! and reports broken links.
 //!
 //! This module is the *orchestration* layer. The link domain logic
 //! (parsing, anchor classification, anchor index) lives in
@@ -37,8 +37,8 @@ use serde::Serialize;
 
 use crate::cli::action::walk::collect_org_files;
 use crate::org::link::{
-    Anchor, AnchorIndex, BreakReason, Link, LinkOrigin, OriginPolicy, extract_file_links,
-    resolve_target,
+    Anchor, AnchorIndex, BreakReason, Link, LinkOrigin, OriginPolicy, extract_checkable_links,
+    extract_file_links, resolve_target,
 };
 
 /// Which links this command validates.
@@ -113,6 +113,7 @@ pub fn run(opts: CheckOptions) -> Result<i32, String> {
         opts.strict_headings,
         false,
         opts.first,
+        true,
     )?;
     let broken_count = broken.len();
     let mut writer = StdoutWriter::new(&opts);
@@ -133,7 +134,7 @@ pub fn run(opts: CheckOptions) -> Result<i32, String> {
 /// `link move` uses this after mutation and treats an unreadable source as a
 /// hard verification failure rather than silently skipping it.
 pub(crate) fn validate_corpus(org_files: &[PathBuf]) -> Result<(), String> {
-    let broken = collect_broken_links(org_files, false, false, true, true)?;
+    let broken = collect_broken_links(org_files, false, false, true, true, false)?;
     if let Some(first) = broken.first() {
         return Err(format!(
             "broken link in corpus at {}:{}:{}: {} ({})",
@@ -153,6 +154,7 @@ fn collect_broken_links(
     strict_headings: bool,
     unreadable_is_error: bool,
     stop_after_first: bool,
+    include_same_file: bool,
 ) -> Result<Vec<BrokenLink>, String> {
     // Cache of AnchorIndex per resolved target file, so a target
     // pointed to from many links is parsed at most once.
@@ -178,11 +180,20 @@ fn collect_broken_links(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
-        for link in extract_file_links(&content) {
+        let links = if include_same_file {
+            extract_checkable_links(&content)
+        } else {
+            extract_file_links(&content)
+        };
+        for link in links {
             if !POLICY.admits(&link.origin) {
                 continue;
             }
-            let resolved = resolve_target(&source_dir, &link).path;
+            let resolved = if link.target_is_same_file {
+                fs::canonicalize(source_file).unwrap_or_else(|_| source_file.clone())
+            } else {
+                resolve_target(&source_dir, &link).path
+            };
 
             let break_reason =
                 match validate_link(&link, &resolved, &mut anchor_cache, strict, strict_headings) {
@@ -442,6 +453,7 @@ impl<'a> StdoutWriter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
     use std::fs;
     use tempdir_helper::TempDir;
 
@@ -495,6 +507,111 @@ mod tests {
             strict: false,
             strict_headings: false,
         }
+    }
+
+    #[test]
+    fn test_internal_anchors_report_existing_source_and_existing_reasons() {
+        let td = TempDir::new("internal-missing");
+        let source = td.path().join("source.org");
+        write(
+            &source,
+            indoc! {"
+                * Present
+                :PROPERTIES:
+                :CUSTOM_ID: present-id
+                :END:
+                [[*Missing][heading]]
+                [[#nope][id]]
+            "},
+        );
+        let broken = collect_broken_links(
+            std::slice::from_ref(&source),
+            false,
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(broken.len(), 2);
+        assert_eq!(broken[0].resolved_target, source);
+        assert_eq!(broken[0].reason_tag, "heading-not-found");
+        assert_eq!(broken[0].raw, "[[*Missing][heading]]");
+        assert_eq!(broken[1].reason_tag, "custom-id-not-found");
+        assert_eq!(broken[1].raw, "[[#nope][id]]");
+    }
+
+    #[test]
+    fn test_internal_headings_use_substring_or_exact_matching_and_custom_id() {
+        let td = TempDir::new("internal-valid");
+        let source = td.path().join("source.org");
+        write(
+            &source,
+            indoc! {"
+                ** odoo_base / build de l'image Élabore en échec — erreur sur un paquet =apt=
+                :PROPERTIES:
+                :CUSTOM_ID: existing-id
+                :END:
+                [[*Élabore en échec — erreur sur un paquet =apt=]]
+                [[#existing-id]]
+            "},
+        );
+        assert!(
+            collect_broken_links(
+                std::slice::from_ref(&source),
+                false,
+                false,
+                false,
+                false,
+                true
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let strict = collect_broken_links(&[source], false, true, false, false, true).unwrap();
+        assert_eq!(strict.len(), 1);
+        assert_eq!(strict[0].reason_tag, "heading-not-found");
+    }
+
+    #[test]
+    fn test_lowercase_custom_id_key_resolves_same_file_and_file_anchor() {
+        let td = TempDir::new("lowercase-custom-id");
+        let source = td.path().join("source.org");
+        let target = td.path().join("target.org");
+        write(
+            &source,
+            indoc! {"
+                * Source
+                :PROPERTIES:
+                :custom_id: source-id
+                :END:
+                [[#source-id]]
+                [[file:target.org::#target-id]]
+                [[#SOURCE-ID]]
+            "},
+        );
+        write(
+            &target,
+            indoc! {"
+                * Target
+                :PROPERTIES:
+                :custom_id: target-id
+                :END:
+            "},
+        );
+
+        let broken = collect_broken_links(&[source], false, false, false, false, true).unwrap();
+        assert_eq!(broken.len(), 1, "both lowercase-key targets must resolve");
+        assert_eq!(broken[0].raw, "[[#SOURCE-ID]]");
+        assert_eq!(broken[0].reason_tag, "custom-id-not-found");
+    }
+
+    #[test]
+    fn test_move_corpus_validation_ignores_preexisting_internal_failure() {
+        let td = TempDir::new("move-internal");
+        let source = td.path().join("source.org");
+        write(&source, "* Present\n[[*Nope]]\n");
+        assert!(validate_corpus(&[source]).is_ok());
     }
 
     #[test]

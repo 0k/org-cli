@@ -268,8 +268,8 @@ pub enum LinkCommands {
         #[arg(long)]
         strict: bool,
 
-        /// Require exact heading match for `[[file:...::*Heading]]`
-        /// anchors. By default, heading anchors match any headline
+        /// Require exact heading match for `[[file:...::*Heading]]` and
+        /// `[[*Heading]]` anchors. By default, heading anchors match any headline
         /// whose title contains the anchor text as a substring, which
         /// mirrors Emacs' org-mode default link-following behavior.
         #[arg(long)]

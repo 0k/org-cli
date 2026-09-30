@@ -303,13 +303,29 @@ source subtree is removed. Cross-file moves write the destination
 first, then the source, so a crash between the two writes duplicates
 the subtree rather than losing it.
 
+** =link check= — validate file and same-file links
+
+Check =[[file:...]]= targets and same-file =[[*Heading]]= and
+=[[#custom-id]]= anchors, with or without descriptions, in body text,
+drawers, and property values. Missing same-file anchors report
+=heading-not-found= or =custom-id-not-found= with the source file as the
+resolved target. Heading anchors match substrings by default; use
+=--strict-headings= to require an exact heading title. Other schemes and
+unprefixed fuzzy links are not checked. Exit status is 0 when clean, 1
+when any link is broken. Use =-j= for NDJSON or =-0= for NUL records.
+
+#+begin_src bash
+org-cli link check notes/
+org-cli link check -j --strict-headings notes.org
+#+end_src
+
 ** =link move= — relocate paths without breaking file links
 
 Move one file or directory inside an explicitly scanned root while
 preserving every supported =[[file:...]]= edge in that corpus. The
-command scans all =.org= files recursively with the same all-followable
-semantics as =link check=, including links in body text, drawers, and
-property values.
+command scans all =.org= files recursively for =file:= links in body
+text, drawers, and property values. Same-file links are not rewritten
+or used to reject a move because moving a file cannot break them.
 
 The default is a read-only dry-run with a deterministic summary and
 unified diffs. =--write= moves the filesystem object, atomically writes

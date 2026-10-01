@@ -22,3 +22,65 @@ Body with a [[file:/tmp/x.org][link]] and ~code~.
 
 ** DONE Archived :ARCHIVE:
 CLOSED: [2026-07-28 Tue]
+
+#+CAPTION: Hours per collaborator
+#+NAME: hours-table
+#+ATTR_HTML: :class compact
+| Name | Hours |
+|------+-------|
+| Ada  | 14    |
+
+Bare https://orgmode.org. Braced H_{2} x^{n+1}; unbraced H_2 x^2 here.
+<2026-10-05 Mon +1w -3d> <2026-10-03 Sat 14:00-15:30>
+
+#+NAME: python-sample
+#+begin_src python
+print(14)
+#+end_src
+
+#+RESULTS: python-sample
+: 14
+
+#+begin_verse
+A /italic/ line
+and a second line
+#+end_verse
+
+#+CAPTION: Note caption
+[fn:note] A *bold* definition.
+
+#+NAME: intro
+An affiliated paragraph.
+
+#+NAME: tasks
+- an affiliated list item
+
+#+NAME: example
+#+begin_example
+Example content.
+#+end_example
+
+#+NAME: exported
+#+begin_export html
+<b>Exported</b>
+#+end_export
+
+#+NAME: quoted
+#+begin_quote
+Quoted content.
+#+end_quote
+
+#+NAME: centered
+#+begin_center
+Centered content.
+#+end_center
+
+#+NAME: special
+#+begin_note
+Special content.
+#+end_note
+
+#+NAME: commented
+#+begin_comment
+Hidden content.
+#+end_comment

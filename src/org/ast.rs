@@ -16,16 +16,15 @@
 //! owner of Org parsing, and `vigil-watch` depends on this crate rather
 //! than duplicating it.  Consumers today:
 //!
-//! * `vigil-watch` serves it from its `/api/data-flow/item?format=ast`
-//!   endpoint;
+//! * `vigil-watch` serves it from its Org AST endpoint;
 //! * `vigil-ui` renders it, and mirrors this exact shape in TypeScript at
 //!   `frontend/src/types/orgAst.ts`.
 //!
 //! The serialized shape is therefore a *cross-language contract*.
-//! `tests/fixtures/org-ast-contract.org` and its companion
-//! `tests/fixtures/org-ast-contract.json` pin it so the Rust and
+//! `tests/fixtures/ast-contract.org` and its companion
+//! `tests/fixtures/ast-contract.json` pin it so the Rust and
 //! TypeScript shapes cannot drift apart; see
-//! `tests/org_ast_contract.rs`.  Changing a field name or a `type`
+//! `tests/ast_contract.rs`.  Changing a field name or a `type`
 //! discriminator here is a breaking change for the renderer.
 //!
 //! ## Patched `orgize` dependency
@@ -53,6 +52,11 @@
 //! raw source on every semantic node would substantially inflate item
 //! responses without adding information because the response already carries
 //! the original content.
+//! Affiliated keywords are attached to their owning element as ordered
+//! `{key, value}` entries, rather than emitted as separate keyword nodes.
+//! Inline scripts retain their original bracing, verse exposes parsed inline
+//! children alongside its raw value, and timestamp cookies keep their raw
+//! spelling while date/time endpoints remain structured.
 //!
 //! Unknown or unsupported rowan syntax is never skipped: the whole node or
 //! token becomes a `raw` node containing its exact source text.  This is the
@@ -118,6 +122,13 @@ pub struct PlanningEntry {
     pub timestamp: Box<OrgAstNode>,
 }
 
+/// An affiliated Org keyword attached to the following element, in source order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AffiliatedKeyword {
+    pub key: String,
+    pub value: String,
+}
+
 /// Complete semantic Org AST node.
 ///
 /// The enum is internally tagged, so every serialized node has a kebab-case
@@ -178,6 +189,10 @@ pub enum OrgAstNode {
         active: bool,
         range: bool,
         raw: String,
+        /// Raw repeater cookie (for example `+1w`), or null.
+        repeater: Option<String>,
+        /// Raw warning/delay cookie (for example `-3d`), or null.
+        warning: Option<String>,
     },
     Keyword {
         source: SourceRange,
@@ -186,10 +201,12 @@ pub enum OrgAstNode {
     },
     Paragraph {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         children: Vec<OrgAstNode>,
     },
     PlainList {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         ordered: bool,
         descriptive: bool,
         children: Vec<OrgAstNode>,
@@ -205,6 +222,7 @@ pub enum OrgAstNode {
     },
     Table {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         has_header: bool,
         children: Vec<OrgAstNode>,
     },
@@ -219,6 +237,7 @@ pub enum OrgAstNode {
     },
     SrcBlock {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         language: Option<String>,
         switches: Option<String>,
         parameters: Option<String>,
@@ -226,27 +245,35 @@ pub enum OrgAstNode {
     },
     QuoteBlock {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         children: Vec<OrgAstNode>,
     },
     ExampleBlock {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         value: String,
     },
     VerseBlock {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         value: String,
+        /// Inline Org objects in the verse body; line breaks remain text.
+        children: Vec<OrgAstNode>,
     },
     CenterBlock {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         children: Vec<OrgAstNode>,
     },
     ExportBlock {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         backend: Option<String>,
         value: String,
     },
     SpecialBlock {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         name: String,
         children: Vec<OrgAstNode>,
     },
@@ -256,10 +283,12 @@ pub enum OrgAstNode {
     },
     CommentBlock {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         value: String,
     },
     FixedWidth {
         source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
         value: String,
     },
     HorizontalRule {
@@ -312,16 +341,26 @@ pub enum OrgAstNode {
         label: Option<String>,
         definition: Vec<OrgAstNode>,
     },
+    FootnoteDefinition {
+        source: SourceRange,
+        affiliated: Vec<AffiliatedKeyword>,
+        label: String,
+        children: Vec<OrgAstNode>,
+    },
     LatexFragment {
         source: SourceRange,
         value: String,
     },
     Superscript {
         source: SourceRange,
+        /// Whether the source used `^{…}` rather than `^x`.
+        braced: bool,
         children: Vec<OrgAstNode>,
     },
     Subscript {
         source: SourceRange,
+        /// Whether the source used `_{…}` rather than `_x`.
+        braced: bool,
         children: Vec<OrgAstNode>,
     },
     Target {
@@ -420,7 +459,23 @@ fn element_to_ast(element: SyntaxElement) -> OrgAstNode {
 }
 
 fn children_to_ast(node: &SyntaxNode) -> Vec<OrgAstNode> {
-    node.children_with_tokens().map(element_to_ast).collect()
+    node.children_with_tokens()
+        .filter(|element| element.kind() != SyntaxKind::AFFILIATED_KEYWORD)
+        .map(element_to_ast)
+        .collect()
+}
+
+fn affiliated(node: &SyntaxNode) -> Vec<AffiliatedKeyword> {
+    node.children()
+        .filter(|child| child.kind() == SyntaxKind::AFFILIATED_KEYWORD)
+        .filter_map(|child| {
+            let texts = token_texts(&child, SyntaxKind::TEXT);
+            Some(AffiliatedKeyword {
+                key: texts.first()?.to_ascii_uppercase(),
+                value: texts.get(1)?.trim().to_string(),
+            })
+        })
+        .collect()
 }
 
 fn node_to_ast(node: &SyntaxNode) -> OrgAstNode {
@@ -448,11 +503,13 @@ fn node_to_ast(node: &SyntaxNode) -> OrgAstNode {
         }
         SyntaxKind::PARAGRAPH => OrgAstNode::Paragraph {
             source,
+            affiliated: affiliated(node),
             children: children_to_ast(node),
         },
         SyntaxKind::LIST => list_node(node).unwrap_or_else(|| raw_node(node)),
         SyntaxKind::LIST_ITEM => list_item_node(node).unwrap_or_else(|| raw_node(node)),
         SyntaxKind::ORG_TABLE => table_node(node),
+        SyntaxKind::FN_DEF => footnote_definition_node(node).unwrap_or_else(|| raw_node(node)),
         SyntaxKind::ORG_TABLE_STANDARD_ROW | SyntaxKind::ORG_TABLE_RULE_ROW => table_row_node(node),
         SyntaxKind::ORG_TABLE_CELL => OrgAstNode::TableCell {
             source,
@@ -461,18 +518,23 @@ fn node_to_ast(node: &SyntaxNode) -> OrgAstNode {
         SyntaxKind::SOURCE_BLOCK => source_block_node(node).unwrap_or_else(|| raw_node(node)),
         SyntaxKind::QUOTE_BLOCK => OrgAstNode::QuoteBlock {
             source,
+            affiliated: affiliated(node),
             children: block_children(node),
         },
         SyntaxKind::EXAMPLE_BLOCK => OrgAstNode::ExampleBlock {
             source,
+            affiliated: affiliated(node),
             value: block_value(node),
         },
         SyntaxKind::VERSE_BLOCK => OrgAstNode::VerseBlock {
             source,
+            affiliated: affiliated(node),
             value: block_value(node),
+            children: block_inline_children(node),
         },
         SyntaxKind::CENTER_BLOCK => OrgAstNode::CenterBlock {
             source,
+            affiliated: affiliated(node),
             children: block_children(node),
         },
         SyntaxKind::EXPORT_BLOCK => export_block_node(node),
@@ -483,10 +545,12 @@ fn node_to_ast(node: &SyntaxNode) -> OrgAstNode {
         },
         SyntaxKind::COMMENT_BLOCK => OrgAstNode::CommentBlock {
             source,
+            affiliated: affiliated(node),
             value: block_value(node),
         },
         SyntaxKind::FIXED_WIDTH => OrgAstNode::FixedWidth {
             source,
+            affiliated: affiliated(node),
             value: direct_text(node),
         },
         SyntaxKind::RULE => OrgAstNode::HorizontalRule { source },
@@ -524,6 +588,7 @@ fn node_to_ast(node: &SyntaxNode) -> OrgAstNode {
         },
         SyntaxKind::SUPERSCRIPT => OrgAstNode::Superscript {
             source,
+            braced: first_direct_token(node, SyntaxKind::L_CURLY).is_some(),
             children: inline_children_without(
                 node,
                 &[SyntaxKind::CARET, SyntaxKind::L_CURLY, SyntaxKind::R_CURLY],
@@ -531,6 +596,7 @@ fn node_to_ast(node: &SyntaxNode) -> OrgAstNode {
         },
         SyntaxKind::SUBSCRIPT => OrgAstNode::Subscript {
             source,
+            braced: first_direct_token(node, SyntaxKind::L_CURLY).is_some(),
             children: inline_children_without(
                 node,
                 &[
@@ -688,7 +754,24 @@ fn timestamp_node(node: &SyntaxNode) -> Option<OrgAstNode> {
         active: timestamp.is_active(),
         range,
         raw: node.to_string(),
+        repeater: timestamp_cookie(node, SyntaxKind::TIMESTAMP_REPEATER_MARK),
+        warning: timestamp_cookie(node, SyntaxKind::TIMESTAMP_DELAY_MARK),
     })
+}
+
+fn timestamp_cookie(node: &SyntaxNode, mark: SyntaxKind) -> Option<String> {
+    let tokens: Vec<_> = node
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .collect();
+    tokens
+        .windows(3)
+        .find(|window| {
+            window[0].kind() == mark
+                && window[1].kind() == SyntaxKind::TIMESTAMP_VALUE
+                && window[2].kind() == SyntaxKind::TIMESTAMP_UNIT
+        })
+        .map(|window| window.iter().map(|token| token.text()).collect())
 }
 
 fn timestamp_values(timestamp: &Timestamp) -> (TimestampValue, Option<TimestampValue>, bool) {
@@ -734,6 +817,7 @@ fn list_node(node: &SyntaxNode) -> Option<OrgAstNode> {
     let list = List::cast(node.clone())?;
     Some(OrgAstNode::PlainList {
         source: source_of_node(node),
+        affiliated: affiliated(node),
         ordered: list.is_ordered(),
         descriptive: list.is_descriptive(),
         children: node
@@ -780,6 +864,7 @@ fn table_node(node: &SyntaxNode) -> OrgAstNode {
         orgize::ast::OrgTable::cast(node.clone()).is_some_and(|table| table.has_header());
     OrgAstNode::Table {
         source: source_of_node(node),
+        affiliated: affiliated(node),
         has_header,
         children: node
             .children()
@@ -810,6 +895,7 @@ fn source_block_node(node: &SyntaxNode) -> Option<OrgAstNode> {
     let block = SourceBlock::cast(node.clone())?;
     Some(OrgAstNode::SrcBlock {
         source: source_of_node(node),
+        affiliated: affiliated(node),
         language: block.language().map(|token| token.to_string()),
         switches: block.switches().map(|token| token.to_string()),
         parameters: block.parameters().map(|token| token.to_string()),
@@ -821,6 +907,19 @@ fn block_children(node: &SyntaxNode) -> Vec<OrgAstNode> {
     node.children()
         .find(|child| child.kind() == SyntaxKind::BLOCK_CONTENT)
         .map(|content| children_to_ast(&content))
+        .unwrap_or_default()
+}
+
+fn block_inline_children(node: &SyntaxNode) -> Vec<OrgAstNode> {
+    node.children()
+        .find(|child| child.kind() == SyntaxKind::BLOCK_CONTENT)
+        .map(|content| {
+            content
+                .children_with_tokens()
+                .filter(|element| element.kind() != SyntaxKind::COMMA)
+                .map(element_to_ast)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -856,9 +955,9 @@ fn block_value(node: &SyntaxNode) -> String {
         .find(|child| child.kind() == SyntaxKind::BLOCK_CONTENT)
         .map(|content| {
             content
-                .children_with_tokens()
+                .descendants_with_tokens()
                 .filter_map(|element| element.into_token())
-                .filter(|token| token.kind() == SyntaxKind::TEXT)
+                .filter(|token| token.kind() != SyntaxKind::COMMA)
                 .map(|token| token.to_string())
                 .collect()
         })
@@ -925,6 +1024,7 @@ fn export_block_node(node: &SyntaxNode) -> OrgAstNode {
         .and_then(|begin| first_direct_token(&begin, SyntaxKind::EXPORT_BLOCK_TYPE));
     OrgAstNode::ExportBlock {
         source: source_of_node(node),
+        affiliated: affiliated(node),
         backend,
         value: block_value(node),
     }
@@ -937,6 +1037,7 @@ fn special_block_node(node: &SyntaxNode) -> Option<OrgAstNode> {
     let name = token_texts(&begin, SyntaxKind::TEXT).get(1)?.clone();
     Some(OrgAstNode::SpecialBlock {
         source: source_of_node(node),
+        affiliated: affiliated(node),
         name,
         children: block_children(node),
     })
@@ -1030,6 +1131,21 @@ fn footnote_reference_node(node: &SyntaxNode) -> OrgAstNode {
         label,
         definition,
     }
+}
+
+fn footnote_definition_node(node: &SyntaxNode) -> Option<OrgAstNode> {
+    let texts = token_texts(node, SyntaxKind::TEXT);
+    let label = texts.get(1)?.clone();
+    Some(OrgAstNode::FootnoteDefinition {
+        source: source_of_node(node),
+        affiliated: affiliated(node),
+        label,
+        children: node
+            .children()
+            .filter(|child| child.kind() == SyntaxKind::PARAGRAPH)
+            .map(|child| node_to_ast(&child))
+            .collect(),
+    })
 }
 
 fn macro_node(node: &SyntaxNode) -> Option<OrgAstNode> {
@@ -1355,6 +1471,202 @@ mod tests {
         nodes_of_type(&ast, "table-row", &mut rows);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1]["rule"], true);
+    }
+
+    #[test]
+    fn affiliated_keywords_attach_in_order_without_becoming_children() {
+        let ast = json(indoc! {"
+            #+TITLE: Kept standalone
+
+            #+CAPTION: Table caption
+            #+NAME: named-table
+            #+ATTR_HTML: :class compact
+            | Name | Value |
+            |------+-------|
+            | A    | 1     |
+
+            #+NAME: python-sample
+            #+begin_src python
+            print(14)
+            #+end_src
+
+            #+RESULTS: python-sample
+            : 14
+        "});
+        let mut tables = Vec::new();
+        nodes_of_type(&ast, "table", &mut tables);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(
+            tables[0]["affiliated"],
+            serde_json::json!([
+                {"key":"CAPTION", "value":"Table caption"},
+                {"key":"NAME", "value":"named-table"},
+                {"key":"ATTR_HTML", "value":":class compact"}
+            ])
+        );
+        let mut blocks = Vec::new();
+        nodes_of_type(&ast, "src-block", &mut blocks);
+        assert_eq!(
+            blocks[0]["affiliated"],
+            serde_json::json!([{"key":"NAME", "value":"python-sample"}])
+        );
+        let mut fixed = Vec::new();
+        nodes_of_type(&ast, "fixed-width", &mut fixed);
+        assert_eq!(
+            fixed[0]["affiliated"],
+            serde_json::json!([{"key":"RESULTS", "value":"python-sample"}])
+        );
+        let mut keywords = Vec::new();
+        nodes_of_type(&ast, "keyword", &mut keywords);
+        assert_eq!(keywords.len(), 1);
+        assert_eq!(keywords[0]["key"], "TITLE");
+    }
+
+    #[test]
+    fn every_affiliable_element_serializes_an_affiliated_array() {
+        let ast = json(indoc! {"
+            Paragraph.
+
+            - list
+
+            #+begin_example
+            example
+            #+end_example
+            #+begin_export html
+            export
+            #+end_export
+            #+begin_quote
+            quote
+            #+end_quote
+            #+begin_center
+            center
+            #+end_center
+            #+begin_note
+            special
+            #+end_note
+            #+begin_comment
+            comment
+            #+end_comment
+            : fixed
+
+            [fn:note] Definition.
+        "});
+        for kind in [
+            "paragraph",
+            "plain-list",
+            "example-block",
+            "export-block",
+            "quote-block",
+            "center-block",
+            "special-block",
+            "comment-block",
+            "fixed-width",
+            "footnote-definition",
+        ] {
+            let mut nodes = Vec::new();
+            nodes_of_type(&ast, kind, &mut nodes);
+            assert!(!nodes.is_empty(), "missing {kind}");
+            for node in nodes {
+                assert_eq!(node["affiliated"], serde_json::json!([]), "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn plain_links_are_links_with_null_description_and_no_trailing_punctuation() {
+        let ast = json(
+            "Visit https://orgmode.org, (mailto:person@example.org) and file:/tmp/note.org. =https://literal.org= [[https://bracket.org][label]]\n",
+        );
+        let mut links = Vec::new();
+        nodes_of_type(&ast, "link", &mut links);
+        let paths: Vec<_> = links
+            .iter()
+            .map(|link| link["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "https://orgmode.org",
+                "mailto:person@example.org",
+                "file:/tmp/note.org",
+                "https://bracket.org"
+            ]
+        );
+        assert_eq!(links[0]["description"], Value::Null);
+        assert_eq!(links[1]["link_type"], "mailto");
+        assert_eq!(links[2]["link_type"], "file");
+        assert_eq!(links[3]["description"][0]["type"], "text");
+    }
+
+    #[test]
+    fn scripts_report_bracing_without_changing_content() {
+        let ast = json("H_{2} H_2 x^{n+1} x^2\n");
+        let mut subs = Vec::new();
+        nodes_of_type(&ast, "subscript", &mut subs);
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0]["braced"], true);
+        assert_eq!(subs[1]["braced"], false);
+        let mut sups = Vec::new();
+        nodes_of_type(&ast, "superscript", &mut sups);
+        assert_eq!(sups.len(), 2);
+        assert_eq!(sups[0]["braced"], true);
+        assert_eq!(sups[1]["braced"], false);
+    }
+
+    #[test]
+    fn footnote_definitions_keep_label_and_parsed_children() {
+        let ast = json("[fn:note] A *bold* definition.\n");
+        let mut definitions = Vec::new();
+        nodes_of_type(&ast, "footnote-definition", &mut definitions);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0]["label"], "note");
+        assert_eq!(definitions[0]["affiliated"], serde_json::json!([]));
+        assert_eq!(definitions[0]["children"][0]["type"], "paragraph");
+        assert_eq!(definitions[0]["children"][0]["children"][1]["type"], "bold");
+    }
+
+    #[test]
+    fn verse_exposes_inline_objects_and_line_breaks_alongside_raw_value() {
+        let ast = json("#+begin_verse\nA /soft/ line\nand more\n#+end_verse\n");
+        let mut verses = Vec::new();
+        nodes_of_type(&ast, "verse-block", &mut verses);
+        assert_eq!(verses[0]["value"], "A /soft/ line\nand more\n");
+        assert_eq!(verses[0]["affiliated"], serde_json::json!([]));
+        assert!(
+            verses[0]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|child| child["type"] == "italic")
+        );
+        assert!(
+            verses[0]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|child| child["text"].as_str().is_some_and(|s| s.contains('\n')))
+        );
+    }
+
+    #[test]
+    fn timestamp_cookies_and_same_day_time_range_are_structured() {
+        let ast = json(
+            "<2026-10-05 Mon +1w -3d> <2026-10-06 Tue .+2d --2d> <2026-10-07 Wed ++1m> <2026-10-03 Sat 14:00-15:30>\n",
+        );
+        let mut timestamps = Vec::new();
+        nodes_of_type(&ast, "timestamp", &mut timestamps);
+        assert_eq!(timestamps.len(), 4);
+        assert_eq!(timestamps[0]["repeater"], "+1w");
+        assert_eq!(timestamps[0]["warning"], "-3d");
+        assert_eq!(timestamps[1]["repeater"], ".+2d");
+        assert_eq!(timestamps[1]["warning"], "--2d");
+        assert_eq!(timestamps[2]["repeater"], "++1m");
+        assert_eq!(timestamps[2]["warning"], Value::Null);
+        assert_eq!(timestamps[3]["repeater"], Value::Null);
+        assert_eq!(timestamps[3]["warning"], Value::Null);
+        assert_eq!(timestamps[3]["start"]["hour"], "14");
+        assert_eq!(timestamps[3]["end"]["hour"], "15");
+        assert_eq!(timestamps[3]["end"]["minute"], "30");
     }
 
     #[test]

@@ -52,6 +52,7 @@
                 "end": null,
                 "range": false,
                 "raw": "<2026-07-29 Wed 10:00 -2d>",
+                "repeater": null,
                 "source": {
                   "end": 159,
                   "start": 133
@@ -66,7 +67,8 @@
                   "tz_offset": null,
                   "year": "2026"
                 },
-                "type": "timestamp"
+                "type": "timestamp",
+                "warning": "-2d"
               }
             },
             {
@@ -80,6 +82,7 @@
                 "end": null,
                 "range": false,
                 "raw": "<2026-07-30 Thu +1w>",
+                "repeater": "+1w",
                 "source": {
                   "end": 190,
                   "start": 170
@@ -94,7 +97,8 @@
                   "tz_offset": null,
                   "year": "2026"
                 },
-                "type": "timestamp"
+                "type": "timestamp",
+                "warning": null
               }
             }
           ],
@@ -213,6 +217,7 @@
               "type": "drawer"
             },
             {
+              "affiliated": [],
               "children": [
                 {
                   "source": {
@@ -281,12 +286,14 @@
               "type": "paragraph"
             },
             {
+              "affiliated": [],
               "children": [
                 {
                   "bullet": "- ",
                   "checkbox": " ",
                   "children": [
                     {
+                      "affiliated": [],
                       "children": [
                         {
                           "source": {
@@ -304,6 +311,7 @@
                       "type": "paragraph"
                     },
                     {
+                      "affiliated": [],
                       "language": "rust",
                       "parameters": null,
                       "source": {
@@ -356,6 +364,7 @@
                     "end": null,
                     "range": false,
                     "raw": "[2026-07-28 Tue]",
+                    "repeater": null,
                     "source": {
                       "end": 595,
                       "start": 579
@@ -370,7 +379,8 @@
                       "tz_offset": null,
                       "year": "2026"
                     },
-                    "type": "timestamp"
+                    "type": "timestamp",
+                    "warning": null
                   }
                 }
               ],
@@ -379,13 +389,737 @@
                 "start": 571
               },
               "type": "planning"
+            },
+            {
+              "children": [
+                {
+                  "affiliated": [],
+                  "children": [
+                    {
+                      "source": {
+                        "end": 597,
+                        "start": 596
+                      },
+                      "text": "\n",
+                      "type": "text"
+                    }
+                  ],
+                  "source": {
+                    "end": 597,
+                    "start": 596
+                  },
+                  "type": "paragraph"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "CAPTION",
+                      "value": "Hours per collaborator"
+                    },
+                    {
+                      "key": "NAME",
+                      "value": "hours-table"
+                    },
+                    {
+                      "key": "ATTR_HTML",
+                      "value": ":class compact"
+                    }
+                  ],
+                  "children": [
+                    {
+                      "children": [
+                        {
+                          "children": [
+                            {
+                              "source": {
+                                "end": 685,
+                                "start": 681
+                              },
+                              "text": "Name",
+                              "type": "text"
+                            }
+                          ],
+                          "source": {
+                            "end": 685,
+                            "start": 681
+                          },
+                          "type": "table-cell"
+                        },
+                        {
+                          "children": [
+                            {
+                              "source": {
+                                "end": 693,
+                                "start": 688
+                              },
+                              "text": "Hours",
+                              "type": "text"
+                            }
+                          ],
+                          "source": {
+                            "end": 693,
+                            "start": 688
+                          },
+                          "type": "table-cell"
+                        }
+                      ],
+                      "rule": false,
+                      "source": {
+                        "end": 696,
+                        "start": 679
+                      },
+                      "type": "table-row"
+                    },
+                    {
+                      "children": [],
+                      "rule": true,
+                      "source": {
+                        "end": 713,
+                        "start": 696
+                      },
+                      "type": "table-row"
+                    },
+                    {
+                      "children": [
+                        {
+                          "children": [
+                            {
+                              "source": {
+                                "end": 718,
+                                "start": 715
+                              },
+                              "text": "Ada",
+                              "type": "text"
+                            }
+                          ],
+                          "source": {
+                            "end": 718,
+                            "start": 715
+                          },
+                          "type": "table-cell"
+                        },
+                        {
+                          "children": [
+                            {
+                              "source": {
+                                "end": 724,
+                                "start": 722
+                              },
+                              "text": "14",
+                              "type": "text"
+                            }
+                          ],
+                          "source": {
+                            "end": 724,
+                            "start": 722
+                          },
+                          "type": "table-cell"
+                        }
+                      ],
+                      "rule": false,
+                      "source": {
+                        "end": 730,
+                        "start": 713
+                      },
+                      "type": "table-row"
+                    }
+                  ],
+                  "has_header": true,
+                  "source": {
+                    "end": 731,
+                    "start": 597
+                  },
+                  "type": "table"
+                },
+                {
+                  "affiliated": [],
+                  "children": [
+                    {
+                      "source": {
+                        "end": 736,
+                        "start": 731
+                      },
+                      "text": "Bare ",
+                      "type": "text"
+                    },
+                    {
+                      "description": null,
+                      "link_type": "https",
+                      "path": "https://orgmode.org",
+                      "source": {
+                        "end": 755,
+                        "start": 736
+                      },
+                      "type": "link"
+                    },
+                    {
+                      "source": {
+                        "end": 765,
+                        "start": 755
+                      },
+                      "text": ". Braced H",
+                      "type": "text"
+                    },
+                    {
+                      "braced": true,
+                      "children": [
+                        {
+                          "source": {
+                            "end": 768,
+                            "start": 767
+                          },
+                          "text": "2",
+                          "type": "text"
+                        }
+                      ],
+                      "source": {
+                        "end": 769,
+                        "start": 765
+                      },
+                      "type": "subscript"
+                    },
+                    {
+                      "source": {
+                        "end": 771,
+                        "start": 769
+                      },
+                      "text": " x",
+                      "type": "text"
+                    },
+                    {
+                      "braced": true,
+                      "children": [
+                        {
+                          "source": {
+                            "end": 776,
+                            "start": 773
+                          },
+                          "text": "n+1",
+                          "type": "text"
+                        }
+                      ],
+                      "source": {
+                        "end": 777,
+                        "start": 771
+                      },
+                      "type": "superscript"
+                    },
+                    {
+                      "source": {
+                        "end": 789,
+                        "start": 777
+                      },
+                      "text": "; unbraced H",
+                      "type": "text"
+                    },
+                    {
+                      "braced": false,
+                      "children": [
+                        {
+                          "source": {
+                            "end": 791,
+                            "start": 790
+                          },
+                          "text": "2",
+                          "type": "text"
+                        }
+                      ],
+                      "source": {
+                        "end": 791,
+                        "start": 789
+                      },
+                      "type": "subscript"
+                    },
+                    {
+                      "source": {
+                        "end": 793,
+                        "start": 791
+                      },
+                      "text": " x",
+                      "type": "text"
+                    },
+                    {
+                      "braced": false,
+                      "children": [
+                        {
+                          "source": {
+                            "end": 795,
+                            "start": 794
+                          },
+                          "text": "2",
+                          "type": "text"
+                        }
+                      ],
+                      "source": {
+                        "end": 795,
+                        "start": 793
+                      },
+                      "type": "superscript"
+                    },
+                    {
+                      "source": {
+                        "end": 802,
+                        "start": 795
+                      },
+                      "text": " here.\n",
+                      "type": "text"
+                    },
+                    {
+                      "active": true,
+                      "end": null,
+                      "range": false,
+                      "raw": "<2026-10-05 Mon +1w -3d>",
+                      "repeater": "+1w",
+                      "source": {
+                        "end": 826,
+                        "start": 802
+                      },
+                      "start": {
+                        "day": "05",
+                        "dayname": "Mon",
+                        "hour": null,
+                        "minute": null,
+                        "month": "10",
+                        "second": null,
+                        "tz_offset": null,
+                        "year": "2026"
+                      },
+                      "type": "timestamp",
+                      "warning": "-3d"
+                    },
+                    {
+                      "source": {
+                        "end": 827,
+                        "start": 826
+                      },
+                      "text": " ",
+                      "type": "text"
+                    },
+                    {
+                      "active": true,
+                      "end": {
+                        "day": "03",
+                        "dayname": "Sat",
+                        "hour": "15",
+                        "minute": "30",
+                        "month": "10",
+                        "second": null,
+                        "tz_offset": null,
+                        "year": "2026"
+                      },
+                      "range": true,
+                      "raw": "<2026-10-03 Sat 14:00-15:30>",
+                      "repeater": null,
+                      "source": {
+                        "end": 855,
+                        "start": 827
+                      },
+                      "start": {
+                        "day": "03",
+                        "dayname": "Sat",
+                        "hour": "14",
+                        "minute": "00",
+                        "month": "10",
+                        "second": null,
+                        "tz_offset": null,
+                        "year": "2026"
+                      },
+                      "type": "timestamp",
+                      "warning": null
+                    },
+                    {
+                      "source": {
+                        "end": 856,
+                        "start": 855
+                      },
+                      "text": "\n",
+                      "type": "text"
+                    },
+                    {
+                      "source": {
+                        "end": 857,
+                        "start": 856
+                      },
+                      "text": "\n",
+                      "type": "text"
+                    }
+                  ],
+                  "source": {
+                    "end": 857,
+                    "start": 731
+                  },
+                  "type": "paragraph"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "NAME",
+                      "value": "python-sample"
+                    }
+                  ],
+                  "language": "python",
+                  "parameters": null,
+                  "source": {
+                    "end": 919,
+                    "start": 857
+                  },
+                  "switches": null,
+                  "type": "src-block",
+                  "value": "print(14)\n"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "RESULTS",
+                      "value": "python-sample"
+                    }
+                  ],
+                  "source": {
+                    "end": 950,
+                    "start": 919
+                  },
+                  "type": "fixed-width",
+                  "value": "14\n"
+                },
+                {
+                  "affiliated": [],
+                  "children": [
+                    {
+                      "source": {
+                        "end": 966,
+                        "start": 964
+                      },
+                      "text": "A ",
+                      "type": "text"
+                    },
+                    {
+                      "children": [
+                        {
+                          "source": {
+                            "end": 973,
+                            "start": 967
+                          },
+                          "text": "italic",
+                          "type": "text"
+                        }
+                      ],
+                      "source": {
+                        "end": 974,
+                        "start": 966
+                      },
+                      "type": "italic"
+                    },
+                    {
+                      "source": {
+                        "end": 998,
+                        "start": 974
+                      },
+                      "text": " line\nand a second line\n",
+                      "type": "text"
+                    }
+                  ],
+                  "source": {
+                    "end": 1011,
+                    "start": 950
+                  },
+                  "type": "verse-block",
+                  "value": "A /italic/ line\nand a second line\n"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "CAPTION",
+                      "value": "Note caption"
+                    }
+                  ],
+                  "children": [
+                    {
+                      "affiliated": [],
+                      "children": [
+                        {
+                          "source": {
+                            "end": 1047,
+                            "start": 1044
+                          },
+                          "text": " A ",
+                          "type": "text"
+                        },
+                        {
+                          "children": [
+                            {
+                              "source": {
+                                "end": 1052,
+                                "start": 1048
+                              },
+                              "text": "bold",
+                              "type": "text"
+                            }
+                          ],
+                          "source": {
+                            "end": 1053,
+                            "start": 1047
+                          },
+                          "type": "bold"
+                        },
+                        {
+                          "source": {
+                            "end": 1065,
+                            "start": 1053
+                          },
+                          "text": " definition.",
+                          "type": "text"
+                        }
+                      ],
+                      "source": {
+                        "end": 1065,
+                        "start": 1044
+                      },
+                      "type": "paragraph"
+                    }
+                  ],
+                  "label": "note",
+                  "source": {
+                    "end": 1067,
+                    "start": 1011
+                  },
+                  "type": "footnote-definition"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "NAME",
+                      "value": "intro"
+                    }
+                  ],
+                  "children": [
+                    {
+                      "source": {
+                        "end": 1106,
+                        "start": 1081
+                      },
+                      "text": "An affiliated paragraph.\n",
+                      "type": "text"
+                    },
+                    {
+                      "source": {
+                        "end": 1107,
+                        "start": 1106
+                      },
+                      "text": "\n",
+                      "type": "text"
+                    }
+                  ],
+                  "source": {
+                    "end": 1107,
+                    "start": 1067
+                  },
+                  "type": "paragraph"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "NAME",
+                      "value": "tasks"
+                    }
+                  ],
+                  "children": [
+                    {
+                      "bullet": "- ",
+                      "checkbox": null,
+                      "children": [
+                        {
+                          "affiliated": [],
+                          "children": [
+                            {
+                              "source": {
+                                "end": 1147,
+                                "start": 1123
+                              },
+                              "text": "an affiliated list item\n",
+                              "type": "text"
+                            }
+                          ],
+                          "source": {
+                            "end": 1147,
+                            "start": 1123
+                          },
+                          "type": "paragraph"
+                        }
+                      ],
+                      "counter": null,
+                      "indent": 0,
+                      "source": {
+                        "end": 1148,
+                        "start": 1121
+                      },
+                      "tag": [],
+                      "type": "list-item"
+                    }
+                  ],
+                  "descriptive": false,
+                  "ordered": false,
+                  "source": {
+                    "end": 1148,
+                    "start": 1107
+                  },
+                  "type": "plain-list"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "NAME",
+                      "value": "example"
+                    }
+                  ],
+                  "source": {
+                    "end": 1212,
+                    "start": 1148
+                  },
+                  "type": "example-block",
+                  "value": "Example content.\n"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "NAME",
+                      "value": "exported"
+                    }
+                  ],
+                  "backend": "html",
+                  "source": {
+                    "end": 1279,
+                    "start": 1212
+                  },
+                  "type": "export-block",
+                  "value": "<b>Exported</b>\n"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "NAME",
+                      "value": "quoted"
+                    }
+                  ],
+                  "children": [
+                    {
+                      "affiliated": [],
+                      "children": [
+                        {
+                          "source": {
+                            "end": 1324,
+                            "start": 1308
+                          },
+                          "text": "Quoted content.\n",
+                          "type": "text"
+                        }
+                      ],
+                      "source": {
+                        "end": 1324,
+                        "start": 1308
+                      },
+                      "type": "paragraph"
+                    }
+                  ],
+                  "source": {
+                    "end": 1337,
+                    "start": 1279
+                  },
+                  "type": "quote-block"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "NAME",
+                      "value": "centered"
+                    }
+                  ],
+                  "children": [
+                    {
+                      "affiliated": [],
+                      "children": [
+                        {
+                          "source": {
+                            "end": 1387,
+                            "start": 1369
+                          },
+                          "text": "Centered content.\n",
+                          "type": "text"
+                        }
+                      ],
+                      "source": {
+                        "end": 1387,
+                        "start": 1369
+                      },
+                      "type": "paragraph"
+                    }
+                  ],
+                  "source": {
+                    "end": 1401,
+                    "start": 1337
+                  },
+                  "type": "center-block"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "NAME",
+                      "value": "special"
+                    }
+                  ],
+                  "children": [
+                    {
+                      "affiliated": [],
+                      "children": [
+                        {
+                          "source": {
+                            "end": 1447,
+                            "start": 1430
+                          },
+                          "text": "Special content.\n",
+                          "type": "text"
+                        }
+                      ],
+                      "source": {
+                        "end": 1447,
+                        "start": 1430
+                      },
+                      "type": "paragraph"
+                    }
+                  ],
+                  "name": "note",
+                  "source": {
+                    "end": 1459,
+                    "start": 1401
+                  },
+                  "type": "special-block"
+                },
+                {
+                  "affiliated": [
+                    {
+                      "key": "NAME",
+                      "value": "commented"
+                    }
+                  ],
+                  "source": {
+                    "end": 1523,
+                    "start": 1459
+                  },
+                  "type": "comment-block",
+                  "value": "Hidden content.\n"
+                }
+              ],
+              "source": {
+                "end": 1523,
+                "start": 596
+              },
+              "type": "section"
             }
           ],
           "commented": false,
           "level": 2,
           "priority": null,
           "source": {
-            "end": 596,
+            "end": 1523,
             "start": 544
           },
           "tags": [
@@ -411,7 +1145,7 @@
       "level": 1,
       "priority": "A",
       "source": {
-        "end": 596,
+        "end": 1523,
         "start": 74
       },
       "tags": [
@@ -460,7 +1194,7 @@
     }
   ],
   "source": {
-    "end": 596,
+    "end": 1523,
     "start": 0
   },
   "type": "document"

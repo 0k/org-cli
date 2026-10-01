@@ -76,4 +76,4 @@ reqwest = { version = "0.12", features = ["blocking"] }
 # Source: https://github.com/0k/orgize
 #   branch: vaab/timestamp-tz-offset-and-seconds
 [patch.crates-io]
-orgize = { git = "https://github.com/0k/orgize", rev = "d2494cfefed47f4490357fa094a3dc213a1d0315" }
+orgize = { git = "https://github.com/0k/orgize", rev = "05c099696dfa48bc27dcba6a759640c9533fcced" }

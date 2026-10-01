@@ -236,6 +236,84 @@ fn the_fixture_exercises_the_structural_node_kinds_the_renderer_switches_on() {
     assert_eq!(planning[0]["entries"][1]["kind"], "deadline");
 }
 
+#[test]
+fn fixture_pins_affiliations_plain_links_scripts_footnotes_verse_and_timestamps() {
+    let ast = actual();
+    let tables = nodes_of_type(&ast, "table");
+    assert_eq!(tables.len(), 1);
+    assert_eq!(
+        tables[0]["affiliated"],
+        serde_json::json!([
+            {"key":"CAPTION","value":"Hours per collaborator"},
+            {"key":"NAME","value":"hours-table"},
+            {"key":"ATTR_HTML","value":":class compact"}
+        ])
+    );
+    let links = nodes_of_type(&ast, "link");
+    assert!(
+        links
+            .iter()
+            .any(|link| link["path"] == "https://orgmode.org" && link["description"].is_null())
+    );
+    let subs = nodes_of_type(&ast, "subscript");
+    assert!(subs.iter().any(|node| node["braced"] == true));
+    assert!(subs.iter().any(|node| node["braced"] == false));
+    let sups = nodes_of_type(&ast, "superscript");
+    assert!(sups.iter().any(|node| node["braced"] == true));
+    assert!(sups.iter().any(|node| node["braced"] == false));
+    let footnotes = nodes_of_type(&ast, "footnote-definition");
+    assert_eq!(footnotes[0]["label"], "note");
+    assert_eq!(
+        footnotes[0]["affiliated"],
+        serde_json::json!([{"key":"CAPTION","value":"Note caption"}])
+    );
+    assert_eq!(footnotes[0]["children"][0]["type"], "paragraph");
+    let src = nodes_of_type(&ast, "src-block");
+    assert!(
+        src.iter().any(|node| node["affiliated"]
+            == serde_json::json!([{"key":"NAME","value":"python-sample"}]))
+    );
+    let fixed = nodes_of_type(&ast, "fixed-width");
+    assert_eq!(
+        fixed[0]["affiliated"],
+        serde_json::json!([{"key":"RESULTS","value":"python-sample"}])
+    );
+    let verse = nodes_of_type(&ast, "verse-block");
+    assert!(
+        verse[0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["type"] == "italic")
+    );
+    let stamps = nodes_of_type(&ast, "timestamp");
+    assert!(
+        stamps
+            .iter()
+            .any(|node| node["repeater"] == "+1w" && node["warning"] == "-3d")
+    );
+    assert!(stamps.iter().any(|node| node["start"]["hour"] == "14"
+        && node["end"]["hour"] == "15"
+        && node["end"]["minute"] == "30"));
+    for (kind, name) in [
+        ("paragraph", "intro"),
+        ("plain-list", "tasks"),
+        ("example-block", "example"),
+        ("export-block", "exported"),
+        ("quote-block", "quoted"),
+        ("center-block", "centered"),
+        ("special-block", "special"),
+        ("comment-block", "commented"),
+    ] {
+        assert!(
+            nodes_of_type(&ast, kind)
+                .iter()
+                .any(|node| node["affiliated"] == serde_json::json!([{"key":"NAME","value":name}])),
+            "missing affiliation on {kind}"
+        );
+    }
+}
+
 /// Every `source` range is a valid slice of the original input.
 ///
 /// The AST omits Org delimiters from the semantic payload and tells

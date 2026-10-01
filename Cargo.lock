@@ -1299,7 +1299,7 @@ dependencies = [
 [[package]]
 name = "orgize"
 version = "0.10.0-alpha.10"
-source = "git+https://github.com/0k/orgize?rev=d2494cfefed47f4490357fa094a3dc213a1d0315#d2494cfefed47f4490357fa094a3dc213a1d0315"
+source = "git+https://github.com/0k/orgize?rev=05c099696dfa48bc27dcba6a759640c9533fcced#05c099696dfa48bc27dcba6a759640c9533fcced"
 dependencies = [
  "bytecount",
  "cfg-if",

@@ -7,17 +7,9 @@ use clap::{Parser, Subcommand};
 #[command(name = "org-cli")]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    /// Turn general verbose logging
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    pub verbose: u8,
-
-    /// Configure component wise logging
-    #[arg(long, short = 'l', action = clap::ArgAction::Append)]
-    pub log: Option<Vec<String>>,
-
-    /// prepend time to each log line
-    #[arg(long)]
-    pub log_time: bool,
+    /// -v / -l [OUTPUT/]TARGET:LEVEL / --log-out OUTPUT=DEST / --log-time
+    #[command(flatten)]
+    pub logging: kal_log::LogArgs,
 
     /// Force color output (defaults to automatic TTY detection)
     #[arg(long, global = true)]

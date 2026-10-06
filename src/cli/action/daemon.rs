@@ -15,7 +15,7 @@
 //!    ([`crate::serve::serve`]), bridging the watcher's diff channel
 //!    into the SSE event log. Ctrl-C triggers graceful shutdown.
 //!
-//! Status is logged exclusively through the `log` crate (fern is wired
+//! Status is logged exclusively through the `log` crate (kal-log is wired
 //! by [`crate::cli::run`]); nothing is printed to stdout/stderr
 //! directly.
 

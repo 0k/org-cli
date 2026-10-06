@@ -9,18 +9,8 @@ pub mod log;
 
 use clap::Parser;
 
-/// Setup logging and color output based on CLI arguments.
-fn setup_logging_and_colors(cli: &def::Args) -> Result<(), String> {
-    let logs = cli.log.clone().unwrap_or_default();
-    let logs = logs
-        .iter()
-        .flat_map(|log| log.split(','))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<&str>>();
-
-    log::setup(cli.verbose, logs, cli.log_time)?;
-
+/// Setup color output, then logging (kal-log's stderr follows `colored`).
+fn setup_logging_and_colors(cli: &def::Args) -> Result<log::LogHandle, String> {
     if cli.color && cli.no_color {
         return Err("Cannot use both --color and --no-color".to_string());
     }
@@ -31,13 +21,14 @@ fn setup_logging_and_colors(cli: &def::Args) -> Result<(), String> {
         colored::control::set_override(false);
     }
 
-    Ok(())
+    log::setup(&cli.logging)
 }
 
 /// Run the CLI application.
 pub fn run() -> Result<(), String> {
     let args = Args::parse();
-    setup_logging_and_colors(&args)?;
+    // Keep the handle alive for the whole run (SIGUSR1 file reopen).
+    let _log = setup_logging_and_colors(&args)?;
 
     match args.command {
         None => {

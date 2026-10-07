@@ -673,3 +673,104 @@ fn test_backlinks_sees_links_with_escaped_brackets() {
         "escaped link must be visible to the link graph, got: {stdout}"
     );
 }
+
+/// Corpus where a regular file `b/note.org` exists and is linked once
+/// correctly, once with a trailing slash, once with a path continuing
+/// past it, and once at a location that truly does not exist.
+fn not_a_directory_fixture(root: &Path) {
+    std::fs::create_dir(root.join("b")).unwrap();
+    std::fs::write(root.join("b/note.org"), "* T\n").unwrap();
+    std::fs::write(
+        root.join("index.org"),
+        indoc! {"
+            [[file:b/note.org][ok]]
+            [[file:b/note.org/][slash]]
+            [[file:b/note.org/x.org][past]]
+            [[file:a/note.org][missing]]
+        "},
+    )
+    .unwrap();
+}
+
+/// Run `link check .` from `root` so reported paths are `./`-relative.
+fn run_check_in(root: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let output = Command::new(bin_path())
+        .args(["link", "check"])
+        .args(args)
+        .arg(".")
+        .current_dir(root)
+        .output()
+        .expect("failed to spawn org-cli");
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout not UTF-8"),
+    )
+}
+
+#[test]
+fn test_check_reports_path_through_regular_file_as_not_a_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    not_a_directory_fixture(temp.path());
+
+    let (code, stdout) = run_check_in(temp.path(), &[]);
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        stdout,
+        indoc! {"
+            ./index.org:2:1: broken -> ./b/note.org/ (not a directory: ./b/note.org is a regular file)
+                [[file:b/note.org/][slash]]
+            ./index.org:3:1: broken -> ./b/note.org/x.org (not a directory: ./b/note.org is a regular file)
+                [[file:b/note.org/x.org][past]]
+            ./index.org:4:1: broken -> ./a/note.org (target path does not exist)
+                [[file:a/note.org][missing]]
+
+            3 broken link(s) found
+        "}
+    );
+}
+
+#[test]
+fn test_check_machine_formats_tag_not_a_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    not_a_directory_fixture(temp.path());
+
+    let (_, json) = run_check_in(temp.path(), &["-j"]);
+    let tags: Vec<(String, String)> = json
+        .lines()
+        .map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            (
+                v["reason_tag"].as_str().unwrap().to_string(),
+                v["reason_message"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tags,
+        [
+            (
+                "not-a-directory".to_string(),
+                "not a directory: ./b/note.org is a regular file".to_string()
+            ),
+            (
+                "not-a-directory".to_string(),
+                "not a directory: ./b/note.org is a regular file".to_string()
+            ),
+            (
+                "path-missing".to_string(),
+                "target path does not exist".to_string()
+            ),
+        ]
+    );
+
+    let (_, nul) = run_check_in(temp.path(), &["-0"]);
+    let nul_tags: Vec<&str> = nul
+        .split("\0\0")
+        .filter(|r| !r.is_empty())
+        .map(|r| r.split('\0').nth(3).unwrap())
+        .collect();
+    assert_eq!(
+        nul_tags,
+        ["not-a-directory", "not-a-directory", "path-missing"]
+    );
+}

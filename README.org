@@ -309,7 +309,10 @@ Check =[[file:...]]= targets and same-file =[[*Heading]]= and
 =[[#custom-id]]= anchors, with or without descriptions, in body text,
 drawers, and property values. Missing same-file anchors report
 =heading-not-found= or =custom-id-not-found= with the source file as the
-resolved target. Heading anchors match substrings by default; use
+resolved target. A missing target reports =path-missing=; a target that
+runs through a regular file as if it were a directory (=note.org/= or
+=note.org/x.org=) reports =not-a-directory= and names that file.
+Heading anchors match substrings by default; use
 =--strict-headings= to require an exact heading title. Other schemes and
 unprefixed fuzzy links are not checked. Exit status is 0 when clean, 1
 when any link is broken. Use =-j= for NDJSON or =-0= for NUL records.

@@ -229,6 +229,10 @@ pub enum Anchor {
 pub enum BreakReason {
     /// Resolved target path does not exist on disk.
     PathMissing,
+    /// Resolved target treats a regular file as a directory (trailing
+    /// slash after a file, or a path continuing past it). `file` is the
+    /// regular file standing in the way.
+    NotADirectory { file: PathBuf },
     /// Path exists but the requested heading was not found.
     HeadingNotFound { heading: String },
     /// Path exists but no headline carries that `:CUSTOM_ID:`.
@@ -244,6 +248,7 @@ impl BreakReason {
     pub fn tag(&self) -> &'static str {
         match self {
             BreakReason::PathMissing => "path-missing",
+            BreakReason::NotADirectory { .. } => "not-a-directory",
             BreakReason::HeadingNotFound { .. } => "heading-not-found",
             BreakReason::CustomIdNotFound { .. } => "custom-id-not-found",
             BreakReason::LineOutOfRange { .. } => "line-out-of-range",
@@ -255,6 +260,9 @@ impl BreakReason {
     pub fn message(&self) -> String {
         match self {
             BreakReason::PathMissing => "target path does not exist".to_string(),
+            BreakReason::NotADirectory { file } => {
+                format!("not a directory: {} is a regular file", file.display())
+            }
             BreakReason::HeadingNotFound { heading } => {
                 format!("heading not found: {:?}", heading)
             }
@@ -1107,6 +1115,14 @@ mod tests {
     #[test]
     fn test_break_reason_tag_and_message() {
         assert_eq!(BreakReason::PathMissing.tag(), "path-missing");
+        let not_dir = BreakReason::NotADirectory {
+            file: PathBuf::from("./b/note.org"),
+        };
+        assert_eq!(not_dir.tag(), "not-a-directory");
+        assert_eq!(
+            not_dir.message(),
+            "not a directory: ./b/note.org is a regular file"
+        );
         let r = BreakReason::HeadingNotFound {
             heading: "X".into(),
         };

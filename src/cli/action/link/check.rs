@@ -233,8 +233,8 @@ fn validate_link(
 ) -> Result<(), BreakReason> {
     // Step 1: target path must exist on disk. A trailing-slash link
     // (directory) is fine as long as the directory exists.
-    if !resolved.exists() {
-        return Err(BreakReason::PathMissing);
+    if let Err(error) = fs::metadata(resolved) {
+        return Err(missing_target_reason(resolved, &error));
     }
 
     // Step 2: anchor validation, only meaningful on files (not dirs).
@@ -317,6 +317,27 @@ fn validate_link(
         }
         Anchor::Other(_) => Ok(()), // unsupported anchor kind, not an error
     }
+}
+
+/// Classify why `resolved` could not be inspected. `ENOTDIR` means the
+/// path runs through a regular file as if it were a directory; report the
+/// deepest such file so the message names what is in the way. Everything
+/// else stays [`BreakReason::PathMissing`].
+fn missing_target_reason(resolved: &Path, error: &io::Error) -> BreakReason {
+    if error.kind() != io::ErrorKind::NotADirectory {
+        return BreakReason::PathMissing;
+    }
+    // Walk prefixes component by component (`ancestors()` would skip a
+    // trailing-slash path's own file: `Path::new("b/f/").parent()` is
+    // `b`). The first prefix that is a regular file is in the way.
+    let mut prefix = PathBuf::new();
+    for component in resolved.components() {
+        prefix.push(component);
+        if fs::metadata(&prefix).is_ok_and(|metadata| metadata.is_file()) {
+            return BreakReason::NotADirectory { file: prefix };
+        }
+    }
+    BreakReason::PathMissing
 }
 
 /// Get (and cache) the AnchorIndex for a target file. Read errors

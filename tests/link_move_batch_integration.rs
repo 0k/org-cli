@@ -258,3 +258,34 @@ fn batch_rejects_overlaps_collisions_and_chains() {
     write(&plan, "moves:\n  - from: ../outside\n    to: inside\n");
     assert_ne!(run_plan(&plan, &root, false, None).status.code(), Some(0));
 }
+
+#[test]
+fn batch_moves_org_file_whose_own_links_must_be_rewritten() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write(
+        &root.join("a/note.org"),
+        "* A\n[[file:../b/target.org][t]]\n",
+    );
+    write(&root.join("b/target.org"), "* T\n");
+    write(&root.join("index.org"), "* Idx\n[[file:a/note.org][n]]\n");
+    let plan = root.join("renames.yaml");
+    write(&plan, "moves:\n  - from: a/note.org\n    to: b/note.org\n");
+
+    let output = run_plan(&plan, root, true, None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.join("a/note.org").exists());
+    assert_output_eq(
+        &fs::read_to_string(root.join("b/note.org")).unwrap(),
+        "* A\n[[file:target.org][t]]\n",
+    );
+    assert_output_eq(
+        &fs::read_to_string(root.join("index.org")).unwrap(),
+        "* Idx\n[[file:b/note.org][n]]\n",
+    );
+}

@@ -623,3 +623,110 @@ fn help_documents_dry_run_root_and_write_contract() {
         assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
     }
 }
+
+/// Fixture from the bug report: `a/note.org` links out to `b/target.org`
+/// and is linked from `index.org`, so moving it into `b/` must rewrite
+/// both its own outbound link and the inbound one.
+fn moved_org_with_outbound_link_fixture(root: &Path) -> (PathBuf, PathBuf) {
+    write(
+        &root.join("a/note.org"),
+        "* A\n[[file:../b/target.org][t]]\n",
+    );
+    write(&root.join("b/target.org"), "* T\n");
+    write(&root.join("index.org"), "* Idx\n[[file:a/note.org][n]]\n");
+    (root.join("a/note.org"), root.join("b/note.org"))
+}
+
+#[test]
+fn dry_run_names_moved_org_file_without_trailing_slash() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (old, new) = moved_org_with_outbound_link_fixture(root);
+
+    let output = run_move(&old, &new, root, false);
+    assert_ok(&output);
+
+    let expected = format!(
+        "Move: {old} -> {new}\nRewrites: 2 link(s) in 2 org file(s)\n--- a/{old}\n+++ b/{new}\n@@ -1,2 +1,2 @@\n * A\n-[[file:../b/target.org][t]]\n+[[file:target.org][t]]\n--- a/{index}\n+++ b/{index}\n@@ -1,2 +1,2 @@\n * Idx\n-[[file:a/note.org][n]]\n+[[file:b/note.org][n]]\n(dry run; pass --write to apply)\n",
+        old = old.display(),
+        new = new.display(),
+        index = root.join("index.org").display(),
+    );
+    assert_output_eq(&String::from_utf8(output.stdout).unwrap(), &expected);
+}
+
+#[test]
+fn org_file_moved_to_another_directory_rewrites_its_own_outbound_links() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (old, new) = moved_org_with_outbound_link_fixture(root);
+
+    let output = run_move(&old, &new, root, true);
+    assert_ok(&output);
+
+    assert!(!old.exists());
+    assert_output_eq(
+        &fs::read_to_string(&new).unwrap(),
+        "* A\n[[file:target.org][t]]\n",
+    );
+    assert_output_eq(
+        &fs::read_to_string(root.join("index.org")).unwrap(),
+        "* Idx\n[[file:b/note.org][n]]\n",
+    );
+}
+
+#[test]
+fn moved_org_file_that_is_link_source_and_target_keeps_every_edge() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let old = root.join("a/note.org");
+    let new = root.join("b/deeper/note.org");
+    fs::create_dir_all(root.join("b/deeper")).unwrap();
+    write(
+        &old,
+        indoc! {"
+            * A
+            [[file:../b/target.org][out]]
+            [[file:note.org::*A][self]]
+        "},
+    );
+    write(
+        &root.join("b/target.org"),
+        "* T\n[[file:../a/note.org][back]]\n",
+    );
+
+    let output = run_move(&old, &new, root, true);
+    assert_ok(&output);
+
+    assert!(!old.exists());
+    assert_output_eq(
+        &fs::read_to_string(&new).unwrap(),
+        indoc! {"
+            * A
+            [[file:../target.org][out]]
+            [[file:note.org::*A][self]]
+        "},
+    );
+    assert_output_eq(
+        &fs::read_to_string(root.join("b/target.org")).unwrap(),
+        "* T\n[[file:deeper/note.org][back]]\n",
+    );
+}
+
+#[test]
+fn absolute_link_to_moved_file_is_rewritten_without_trailing_slash() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let old = root.join("a/note.org");
+    let new = root.join("b/note.org");
+    fs::create_dir_all(root.join("b")).unwrap();
+    write(&old, "* T\n");
+    let source = root.join("index.org");
+    write(&source, &format!("[[file:{}][abs]]\n", old.display()));
+
+    assert_ok(&run_move(&old, &new, root, true));
+    assert_output_eq(
+        &fs::read_to_string(&source).unwrap(),
+        &format!("[[file:{}][abs]]\n", new.display()),
+    );
+}

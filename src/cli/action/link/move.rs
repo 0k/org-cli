@@ -658,11 +658,21 @@ fn matching_move<'a>(
     Ok(first)
 }
 
+/// Map `path` from the initial tree to the final tree.
+///
+/// The moved object itself maps to exactly `movement.new`: joining the
+/// empty remainder would append a trailing separator (`Path::join("")`),
+/// turning a moved file into a directory-shaped path.
 fn map_moved_path(path: &Path, moves: &[PlannedMove]) -> Result<PathBuf, String> {
     match matching_move(path, moves)? {
-        Some(movement) => Ok(movement
-            .new
-            .join(path.strip_prefix(&movement.old).expect("matching prefix"))),
+        Some(movement) => {
+            let remainder = path.strip_prefix(&movement.old).expect("matching prefix");
+            if remainder.as_os_str().is_empty() {
+                Ok(movement.new.clone())
+            } else {
+                Ok(movement.new.join(remainder))
+            }
+        }
         None => Ok(path.to_path_buf()),
     }
 }
@@ -1246,6 +1256,18 @@ mod tests {
         assert!(!root.join("a-new").exists());
         assert!(!root.join("b-new").exists());
         assert_eq!(fs::read_to_string(source).unwrap(), original);
+    }
+
+    #[test]
+    fn map_moved_path_maps_the_moved_object_itself_without_trailing_separator() {
+        let moves = [PlannedMove {
+            old: PathBuf::from("/root/a/note.org"),
+            new: PathBuf::from("/root/b/note.org"),
+        }];
+        let mapped = map_moved_path(Path::new("/root/a/note.org"), &moves).unwrap();
+        assert_eq!(mapped.as_os_str(), "/root/b/note.org");
+        let nested = map_moved_path(Path::new("/root/a/note.org/x"), &moves).unwrap();
+        assert_eq!(nested.as_os_str(), "/root/b/note.org/x");
     }
 
     #[test]

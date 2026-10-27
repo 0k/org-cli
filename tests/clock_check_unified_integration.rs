@@ -473,7 +473,7 @@ fn non_canonical_lines_are_reported_once_not_also_as_sweep_warnings() {
     // Per-line hits first (source order), then the overlap pair.
     let tags: Vec<&str> = recs.iter().map(|r| r["tag"].as_str().unwrap()).collect();
     assert_eq!(tags.last().copied(), Some("overlap"), "{stdout}");
-    assert!(tags.iter().any(|t| *t == "missing-tz"), "{stdout}");
+    assert!(tags.contains(&"missing-tz"), "{stdout}");
     assert!(
         !stderr.contains("skipping non-canonical"),
         "pass 1 already reported the line; stderr={stderr}"

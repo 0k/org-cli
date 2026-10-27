@@ -75,8 +75,16 @@ org-cli headings --exclude '**/archive/**' path/
 #+end_src
 
 NDJSON records carry =file=, =level=, =line=, =keyword=, =done=, =title=,
-=tags=, =properties= (full property map), =priority=, =fingerprint=, =etag=,
-and =todo_keywords=. NUL records use the fixed-field layout
+=title_ast=, =tags=, =properties= (full property map), =priority=,
+=fingerprint=, =etag=, and =todo_keywords=. =title= is the raw title text:
+markup is kept, while the TODO keyword, priority cookie and tags are removed.
+=title_ast= is that same title as an array of inline Org AST nodes (emphasis,
+code, verbatim, links, timestamps and other inline objects), shaped exactly
+like a headline's =title= in the =org::ast= document AST: every node has a
+=type= and a =source= byte range into the file. A plain title is one =text=
+node, an empty title is =[]=, and unlike =title= it is not trimmed, so a title
+followed by tags ends with a space. NUL and human output do not carry it.
+NUL records use the fixed-field layout
 =level\0line\0file\0keyword\0done\0title\0tags\0priority\0fingerprint\0etag\0todo_keywords\0\0=;
 =todo_keywords= is compact JSON. The new NUL fields are appended, so existing
 field indices remain stable, but consumers that assert the old exact field

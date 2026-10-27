@@ -624,12 +624,25 @@ fn node_to_ast(node: &SyntaxNode) -> OrgAstNode {
     }
 }
 
+/// Inline AST of `headline`'s title: the children of its `HEADLINE_TITLE`
+/// node, exactly as they appear in the `title` of [`OrgAstNode::Headline`].
+///
+/// The single owner of that conversion: [`crate::org::heading::Heading`]
+/// builds its `title_ast` with it, so a `headings` record and the document
+/// AST cannot drift apart.  Source ranges are byte offsets into the text
+/// `headline` was parsed from.  Empty when the headline has no title.
+pub(crate) fn headline_title_ast(headline: &Headline) -> Vec<OrgAstNode> {
+    headline
+        .syntax()
+        .children()
+        .find(|child| child.kind() == SyntaxKind::HEADLINE_TITLE)
+        .map(|title| children_to_ast(&title))
+        .unwrap_or_default()
+}
+
 fn headline_node(node: &SyntaxNode) -> Option<OrgAstNode> {
     let headline = Headline::cast(node.clone())?;
-    let title_node = node
-        .children()
-        .find(|child| child.kind() == SyntaxKind::HEADLINE_TITLE);
-    let title = title_node.as_ref().map(children_to_ast).unwrap_or_default();
+    let title = headline_title_ast(&headline);
     let children = node
         .children()
         .filter(|child| {

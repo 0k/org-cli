@@ -8,6 +8,7 @@ use orgize::{
     rowan::{TextSize, ast::AstNode},
 };
 
+use crate::org::ast::{OrgAstNode, headline_title_ast};
 use crate::org::snapshot::sha256_hex;
 use crate::org::todo_keywords::TodoKeywords;
 
@@ -35,6 +36,16 @@ pub struct Heading {
     /// Lowercase hex SHA-256 of this exact heading line, terminator excluded.
     pub fingerprint: String,
     pub title: String,
+    /// The title's inline Org AST (emphasis, code, verbatim, links,
+    /// timestamps, ...), node for node as the document AST
+    /// ([`crate::org::ast::parse_ast`]) renders a headline's `title`.
+    ///
+    /// Built from the same parse as `title`, so a recognized TODO keyword,
+    /// the priority cookie and the tags are excluded from both. Unlike
+    /// `title` it is not trimmed: when tags follow, the last text node keeps
+    /// the space before them. `source` ranges are byte offsets into the
+    /// whole file.
+    pub title_ast: Vec<OrgAstNode>,
     pub tags: Vec<String>,
     pub properties: BTreeMap<String, String>,
 }
@@ -222,6 +233,7 @@ fn build_heading(content: &str, line_index: &LineIndex, headline: OrgHeadline) -
             .as_bytes(),
     );
     let title = headline.title_raw().trim().to_string();
+    let title_ast = headline_title_ast(&headline);
     let tags = headline.tags().map(|tag| tag.to_string()).collect();
     let properties = headline
         .properties()
@@ -240,6 +252,7 @@ fn build_heading(content: &str, line_index: &LineIndex, headline: OrgHeadline) -
         priority,
         fingerprint,
         title,
+        title_ast,
         tags,
         properties,
     })
@@ -595,6 +608,7 @@ mod tests {
         Heading, HeadingPath, LineIndex, PathError, SubtreeSpan, heading_body, heading_for_line,
         iter_headings, iter_headings_with, resolve_path, section_span, span_text, subtree_span,
     };
+    use crate::org::ast::{OrgAstNode, SourceRange, parse_ast};
     use crate::org::todo_keywords::TodoKeywords;
     use indoc::indoc;
     use std::collections::BTreeMap;
@@ -675,6 +689,53 @@ mod tests {
             .collect()
     }
 
+    /// A title AST made of one text node spanning bytes `start..end`.
+    fn text_title(start: u32, end: u32, text: &str) -> Vec<OrgAstNode> {
+        vec![OrgAstNode::Text {
+            source: SourceRange { start, end },
+            text: text.to_string(),
+        }]
+    }
+
+    /// Every headline `title` of the document AST, in document order.
+    fn document_ast_titles(content: &str) -> Vec<Vec<OrgAstNode>> {
+        fn collect(node: &OrgAstNode, titles: &mut Vec<Vec<OrgAstNode>>) {
+            match node {
+                OrgAstNode::Document { children, .. } => {
+                    children.iter().for_each(|child| collect(child, titles));
+                }
+                OrgAstNode::Headline {
+                    title, children, ..
+                } => {
+                    titles.push(title.clone());
+                    children.iter().for_each(|child| collect(child, titles));
+                }
+                _ => {}
+            }
+        }
+        let mut titles = Vec::new();
+        collect(&parse_ast(content), &mut titles);
+        titles
+    }
+
+    #[test]
+    fn title_ast_is_the_document_ast_headline_title() {
+        let content = indoc! {r"
+            * TODO [#A] Fix *bold* /it/ _under_ +gone+ =verb= ~code~ :tag:
+            ** [[https://x][link *in* desc]] <2026-07-29 Wed 10:00 +0200> [[file:a.org]]
+            * x^{2} \alpha [fn:1] [1/2] src_sh{ls}
+            * Plain
+        "};
+
+        let titles: Vec<Vec<OrgAstNode>> = iter_headings(content)
+            .map(|heading| heading.title_ast)
+            .collect();
+
+        assert_eq!(titles.len(), 4);
+        assert!(titles.iter().all(|title| !title.is_empty()));
+        assert_eq!(titles, document_ast_titles(content));
+    }
+
     #[test]
     fn iter_headings_extracts_level_line_title_tags_and_properties() {
         let content = indoc! {"
@@ -702,6 +763,8 @@ mod tests {
                     fingerprint: "e640c2d8c38f4bda691fcf8d8cba30e4fd2a53f1478a072f81c244ea688562d9"
                         .to_string(),
                     title: "Parent heading".to_string(),
+                    // Untrimmed: the space before the tags stays.
+                    title_ast: text_title(7, 22, "Parent heading "),
                     tags: vec!["work".to_string(), "client".to_string()],
                     properties: props(&[("CUSTOM_ID", "parent-id"), ("TASK_REF", "248")]),
                 },
@@ -713,6 +776,7 @@ mod tests {
                     fingerprint: "8b38c0d7ac803c4571af11def1e523fd313339b9fd8a194650b9e6536db45c6d"
                         .to_string(),
                     title: "Child heading".to_string(),
+                    title_ast: text_title(108, 121, "Child heading"),
                     tags: vec![],
                     properties: BTreeMap::new(),
                 },
@@ -724,6 +788,7 @@ mod tests {
                     fingerprint: "1bfe6956f9548c11f122f6866a6ae224c23c5fbde735e193ba8ed3107cd04fd7"
                         .to_string(),
                     title: "Finished sibling".to_string(),
+                    title_ast: text_title(141, 157, "Finished sibling"),
                     tags: vec![],
                     properties: BTreeMap::new(),
                 },
@@ -735,6 +800,7 @@ mod tests {
                     fingerprint: "1f4a9b6bdeb8a7999a8ab4e83789a4b8995681d13ace5462ff8b9024454af3d5"
                         .to_string(),
                     title: "Sibling".to_string(),
+                    title_ast: text_title(160, 167, "Sibling"),
                     tags: vec![],
                     properties: BTreeMap::new(),
                 },

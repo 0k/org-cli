@@ -4,6 +4,12 @@
 //! keywords, priority, and heading fingerprint. NUL fields are appended
 //! after the historical seven fields: existing field indices remain stable,
 //! but consumers that assert the old exact field count must be updated.
+//!
+//! NDJSON records also carry `title_ast`, the title's inline Org AST in the
+//! node shape of [`crate::org::ast`] (see [`Heading::title_ast`]). The NUL
+//! and human formats do not.
+//!
+//! [`Heading::title_ast`]: crate::org::heading::Heading::title_ast
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -14,6 +20,7 @@ use regex::RegexBuilder;
 use serde::Serialize;
 
 use crate::cli::action::walk::resolve_input_files;
+use crate::org::ast::OrgAstNode;
 use crate::org::filter::FilterOptions;
 use crate::org::snapshot::FileSnapshot;
 use crate::org::todo_keywords::{TodoKeywords, parse_spec};
@@ -47,6 +54,8 @@ struct HeadingRecord {
     /// effective keyword set. `None` when the heading carries no keyword.
     done: Option<bool>,
     title: String,
+    /// Inline Org AST of `title`; emitted by the NDJSON format only.
+    title_ast: Vec<OrgAstNode>,
     tags: Vec<String>,
     properties: BTreeMap<String, String>,
     priority: Option<String>,
@@ -90,6 +99,7 @@ pub fn run(opts: HeadingsOptions) -> Result<i32, String> {
                 keyword: heading.keyword,
                 done,
                 title: heading.title,
+                title_ast: heading.title_ast,
                 tags: heading.tags,
                 properties: heading.properties,
                 priority: heading.priority,
@@ -231,6 +241,7 @@ fn write_human<W: Write>(out: &mut W, records: &[HeadingRecord]) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::{HeadingRecord, HeadingsOptions, build_filter, write_records};
+    use crate::org::ast::{OrgAstNode, SourceRange};
     use crate::org::todo_keywords::TodoKeywords;
     use indoc::indoc;
     use similar::TextDiff;
@@ -290,6 +301,13 @@ mod tests {
             keyword: keyword.map(str::to_string),
             done,
             title: title.to_string(),
+            title_ast: vec![OrgAstNode::Text {
+                source: SourceRange {
+                    start: 0,
+                    end: u32::try_from(title.len()).unwrap(),
+                },
+                text: title.to_string(),
+            }],
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             properties: properties
                 .iter()
@@ -447,7 +465,7 @@ mod tests {
         write_records(&mut out, &records, &opts(false, true)).unwrap();
 
         let actual = String::from_utf8(out).unwrap();
-        let expected = "{\"file\":\"/tmp/a.org\",\"level\":2,\"line\":17,\"keyword\":null,\"done\":null,\"title\":\"Nested\",\"tags\":[\"ops\"],\"properties\":{\"CUSTOM_ID\":\"cid\",\"TASK_REF\":\"248\"},\"priority\":null,\"fingerprint\":\"fingerprint\",\"etag\":\"etag\",\"todo_keywords\":{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}\n";
+        let expected = "{\"file\":\"/tmp/a.org\",\"level\":2,\"line\":17,\"keyword\":null,\"done\":null,\"title\":\"Nested\",\"title_ast\":[{\"type\":\"text\",\"source\":{\"start\":0,\"end\":6},\"text\":\"Nested\"}],\"tags\":[\"ops\"],\"properties\":{\"CUSTOM_ID\":\"cid\",\"TASK_REF\":\"248\"},\"priority\":null,\"fingerprint\":\"fingerprint\",\"etag\":\"etag\",\"todo_keywords\":{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}\n";
         assert_output_eq(&actual, expected);
     }
 
@@ -470,7 +488,7 @@ mod tests {
         write_records(&mut out, &records, &opts(false, true)).unwrap();
 
         let actual = String::from_utf8(out).unwrap();
-        let expected = "{\"file\":\"/tmp/a.org\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"done\":false,\"title\":\"Buy milk\",\"tags\":[],\"properties\":{},\"priority\":\"A\",\"fingerprint\":\"fingerprint\",\"etag\":\"etag\",\"todo_keywords\":{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}\n";
+        let expected = "{\"file\":\"/tmp/a.org\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"done\":false,\"title\":\"Buy milk\",\"title_ast\":[{\"type\":\"text\",\"source\":{\"start\":0,\"end\":8},\"text\":\"Buy milk\"}],\"tags\":[],\"properties\":{},\"priority\":\"A\",\"fingerprint\":\"fingerprint\",\"etag\":\"etag\",\"todo_keywords\":{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}\n";
         assert_output_eq(&actual, expected);
     }
 

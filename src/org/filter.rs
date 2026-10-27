@@ -81,6 +81,7 @@ mod tests {
             priority: None,
             fingerprint: String::new(),
             title: title.to_string(),
+            title_ast: Vec::new(),
             tags: vec![],
             properties: properties
                 .iter()

@@ -58,6 +58,42 @@ fn titles_of(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+/// Write `content` to a fresh org file and return the NDJSON records
+/// `org-cli headings -j` prints for it.
+fn json_records_for(tag: &str, content: &str) -> Vec<serde_json::Value> {
+    let td = TempDir::new(tag);
+    let file = td.path().join("titles.org");
+    std::fs::write(&file, content).unwrap();
+    let out = Command::new(bin_path())
+        .arg("headings")
+        .arg("-j")
+        .arg(&file)
+        .output()
+        .expect("spawn org-cli");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Compare two JSON values as pretty-printed text, showing a line diff.
+fn assert_json_eq(actual: &serde_json::Value, expected: &serde_json::Value) {
+    let actual = serde_json::to_string_pretty(actual).unwrap();
+    let expected = serde_json::to_string_pretty(expected).unwrap();
+    if actual != expected {
+        let diff = similar::TextDiff::from_lines(&expected, &actual);
+        eprintln!("{}", diff.unified_diff().header("expected", "actual"));
+        panic!("JSON mismatch - see diff above");
+    }
+}
+
 #[test]
 fn headings_has_property_returns_expected_set() {
     let fixture = fixture_path();
@@ -191,13 +227,60 @@ fn headings_json_output_matches_expected_bytes() {
     let actual = String::from_utf8(out.stdout).unwrap();
     let expected = format!(
         concat!(
-            "{{\"file\":\"{}\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"done\":false,\"title\":\"TODO Billing task\",\"tags\":[\"urgent\"],\"properties\":{{\"CUSTOM_ID\":\"bill-248\",\"TASK_REF\":\"248\"}},\"priority\":null,\"fingerprint\":\"e9191080a819d962d2462483ff76f169f411864cbbdf29caa63ff14837999699\",\"etag\":\"fd65efd2c9dc107b6becaecb687a566413d29aee33ca457e234dcb59b1d5400b\",\"todo_keywords\":{{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}}}\n",
-            "{{\"file\":\"{}\",\"level\":2,\"line\":15,\"keyword\":\"TODO\",\"done\":false,\"title\":\"TODO Nested task\",\"tags\":[],\"properties\":{{\"TASK_REF\":\"314\"}},\"priority\":null,\"fingerprint\":\"1ab6c5c7142ef465aa548053748ba2cea1cc975952c3635f1c01b54bf166995a\",\"etag\":\"fd65efd2c9dc107b6becaecb687a566413d29aee33ca457e234dcb59b1d5400b\",\"todo_keywords\":{{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}}}\n"
+            "{{\"file\":\"{}\",\"level\":1,\"line\":1,\"keyword\":\"TODO\",\"done\":false,\"title\":\"TODO Billing task\",\"title_ast\":[{{\"type\":\"text\",\"source\":{{\"start\":7,\"end\":25}},\"text\":\"TODO Billing task \"}}],\"tags\":[\"urgent\"],\"properties\":{{\"CUSTOM_ID\":\"bill-248\",\"TASK_REF\":\"248\"}},\"priority\":null,\"fingerprint\":\"e9191080a819d962d2462483ff76f169f411864cbbdf29caa63ff14837999699\",\"etag\":\"fd65efd2c9dc107b6becaecb687a566413d29aee33ca457e234dcb59b1d5400b\",\"todo_keywords\":{{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}}}\n",
+            "{{\"file\":\"{}\",\"level\":2,\"line\":15,\"keyword\":\"TODO\",\"done\":false,\"title\":\"TODO Nested task\",\"title_ast\":[{{\"type\":\"text\",\"source\":{{\"start\":297,\"end\":313}},\"text\":\"TODO Nested task\"}}],\"tags\":[],\"properties\":{{\"TASK_REF\":\"314\"}},\"priority\":null,\"fingerprint\":\"1ab6c5c7142ef465aa548053748ba2cea1cc975952c3635f1c01b54bf166995a\",\"etag\":\"fd65efd2c9dc107b6becaecb687a566413d29aee33ca457e234dcb59b1d5400b\",\"todo_keywords\":{{\"active\":[\"TODO\"],\"done\":[\"DONE\"]}}}}\n"
         ),
         fixture.display(),
         fixture.display()
     );
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn headings_json_title_ast_parses_inline_markup_while_title_stays_raw() {
+    let records = json_records_for(
+        "title-ast-markup",
+        "* TODO Fix *important* =thing= [[https://x][link]]\n",
+    );
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["title"],
+        "Fix *important* =thing= [[https://x][link]]"
+    );
+    assert_json_eq(
+        &records[0]["title_ast"],
+        &serde_json::json!([
+            {"type": "text", "source": {"start": 7, "end": 11}, "text": "Fix "},
+            {"type": "bold", "source": {"start": 11, "end": 22}, "children": [
+                {"type": "text", "source": {"start": 12, "end": 21}, "text": "important"}
+            ]},
+            {"type": "text", "source": {"start": 22, "end": 23}, "text": " "},
+            {"type": "verbatim", "source": {"start": 23, "end": 30}, "value": "thing"},
+            {"type": "text", "source": {"start": 30, "end": 31}, "text": " "},
+            {"type": "link", "source": {"start": 31, "end": 50},
+             "path": "https://x", "link_type": "https", "description": [
+                {"type": "text", "source": {"start": 44, "end": 48}, "text": "link"}
+            ]}
+        ]),
+    );
+}
+
+#[test]
+fn headings_json_title_ast_of_plain_and_empty_titles() {
+    let records = json_records_for("title-ast-plain", "* Plain title\n* TODO\n");
+
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["title"], "Plain title");
+    assert_json_eq(
+        &records[0]["title_ast"],
+        &serde_json::json!([
+            {"type": "text", "source": {"start": 2, "end": 13}, "text": "Plain title"}
+        ]),
+    );
+    // No title text: an empty AST, never a missing field or `null`.
+    assert_eq!(records[1]["title"], "");
+    assert_json_eq(&records[1]["title_ast"], &serde_json::json!([]));
 }
 
 #[test]
@@ -444,7 +527,7 @@ fn headings_versioned_formats_match_exact_bytes_and_priority_placement() {
         .expect("spawn org-cli");
     assert_eq!(json.status.code(), Some(0));
     let expected_json = format!(
-        "{{\"file\":\"{}\",\"level\":1,\"line\":2,\"keyword\":\"WIP\",\"done\":false,\"title\":\"Buy milk\",\"tags\":[\"home\"],\"properties\":{{}},\"priority\":\"A\",\"fingerprint\":\"{FINGERPRINT}\",\"etag\":\"{ETAG}\",\"todo_keywords\":{{\"active\":[\"TODO\",\"WIP\"],\"done\":[\"DONE\",\"CANCELED\"]}}}}\n",
+        "{{\"file\":\"{}\",\"level\":1,\"line\":2,\"keyword\":\"WIP\",\"done\":false,\"title\":\"Buy milk\",\"title_ast\":[{{\"type\":\"text\",\"source\":{{\"start\":44,\"end\":53}},\"text\":\"Buy milk \"}}],\"tags\":[\"home\"],\"properties\":{{}},\"priority\":\"A\",\"fingerprint\":\"{FINGERPRINT}\",\"etag\":\"{ETAG}\",\"todo_keywords\":{{\"active\":[\"TODO\",\"WIP\"],\"done\":[\"DONE\",\"CANCELED\"]}}}}\n",
         file.display()
     );
     assert_eq!(String::from_utf8(json.stdout).unwrap(), expected_json);

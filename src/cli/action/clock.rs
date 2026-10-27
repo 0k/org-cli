@@ -1255,6 +1255,8 @@ pub struct ListOptions {
     pub ignore_case: bool,
     /// Keep only CLOCKs whose enclosing heading has all these properties.
     pub has_property: Vec<String>,
+    /// Include requested inherited heading properties, preserving requested keys.
+    pub inherit_property: Vec<String>,
     /// Keep only FILED records for this customer tag.
     pub customer: Option<String>,
     /// NUL-separated fixed-field records.
@@ -1313,6 +1315,9 @@ pub struct ClockRecord {
     pub raw: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heading: Option<HeadingSummary>,
+    /// Requested nearest-ancestor-or-self properties; absent unless requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1460,10 +1465,22 @@ pub fn run_list(opts: ListOptions) -> Result<i32, String> {
                     .expect("FILED cache record has a customer tag")
                     .to_string(),
             });
-            pending.push(ListRecord {
-                clock: record_from_cached(file, r, raw, heading),
-                filed,
-            });
+            let mut clock = record_from_cached(file, r, raw, heading);
+            if !opts.inherit_property.is_empty() {
+                let enclosing = proj.headings.get(&r.heading_id);
+                clock.properties = Some(
+                    opts.inherit_property
+                        .iter()
+                        .filter_map(|name| {
+                            enclosing?
+                                .inherited_properties
+                                .get(&name.to_ascii_uppercase())
+                                .map(|value| (name.clone(), value.clone()))
+                        })
+                        .collect(),
+                );
+            }
+            pending.push(ListRecord { clock, filed });
         }
 
         if let Some(bad) = first_bad {
@@ -1591,6 +1608,7 @@ fn record_from_cached(
             tags: h.tags.clone(),
             properties: h.properties.clone(),
         }),
+        properties: None,
     }
 }
 
@@ -2527,6 +2545,7 @@ mod tests {
             filter: None,
             ignore_case: false,
             has_property: Vec::new(),
+            inherit_property: Vec::new(),
             customer: None,
             nul: false,
             json: true,
@@ -2551,6 +2570,7 @@ mod tests {
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect(),
+            inherit_property: Vec::new(),
             customer: None,
             nul: false,
             json: true,

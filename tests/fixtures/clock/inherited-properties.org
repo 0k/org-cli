@@ -1,0 +1,43 @@
+#+PROPERTY: TASK_REF file-level-is-not-inherited
+
+CLOCK: [2026-01-07 Wed 09:00 +0100]--[2026-01-07 Wed 10:00 +0100] =>  1:00
+
+* Grandparent
+  :PROPERTIES:
+  :TASK_REF: elabore/6623#0123456789abcdef
+  :OWNER: Alice; Bob=team
+  :END:
+
+** Own
+  :PROPERTIES:
+  :task_ref: lok/42
+  :END:
+CLOCK: [2026-01-07 Wed 09:00 +0100]--[2026-01-07 Wed 10:00 +0100] =>  1:00
+
+** Parent
+
+*** Grandchild
+CLOCK: [2026-01-07 Wed 09:00 +0100]--[2026-01-07 Wed 10:00 +0100] =>  1:00
+
+** Nearer
+  :PROPERTIES:
+  :TaSk_ReF: lok/99#fedcba9876543210
+  :END:
+
+**** Override child
+CLOCK: [2026-01-07 Wed 09:00 +0100]--[2026-01-07 Wed 10:00 +0100] =>  1:00
+
+** After nearer subtree
+CLOCK: [2026-01-07 Wed 09:00 +0100]--[2026-01-07 Wed 10:00 +0100] =>  1:00
+
+** Empty value is ignored like for direct properties
+  :PROPERTIES:
+  :TASK_REF:
+  :END:
+CLOCK: [2026-01-07 Wed 09:00 +0100]--[2026-01-07 Wed 10:00 +0100] =>  1:00
+
+* Unrelated sibling
+CLOCK: [2026-01-07 Wed 09:00 +0100]--[2026-01-07 Wed 10:00 +0100] =>  1:00
+
+** Absent child
+CLOCK: [2026-01-07 Wed 09:00 +0100]--[2026-01-07 Wed 10:00 +0100] =>  1:00

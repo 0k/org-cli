@@ -623,9 +623,9 @@ fn encode_diags(d: &[Diagnostic]) -> Vec<u8> {
     out
 }
 
-/// Clocked headings: `id\0level\0line\0title\0tags(,)\0props(k=v;)\0`.
+/// Clocked headings: `id\0level\0line\0title\0tags(,)\0props(k=v;)\0inherited(json)\0`.
 /// Tags cannot contain `,` and property keys cannot contain `=` or
-/// `;` in Org, so the flat encoding is unambiguous.
+/// `;` in Org. Inherited values use JSON to preserve arbitrary punctuation.
 fn encode_headings(h: &BTreeMap<u32, ClockedHeading>) -> Vec<u8> {
     let mut out = Vec::new();
     for (id, ch) in h {
@@ -640,6 +640,7 @@ fn encode_headings(h: &BTreeMap<u32, ClockedHeading>) -> Vec<u8> {
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect::<Vec<_>>()
                 .join(";"),
+            serde_json::to_string(&ch.inherited_properties).expect("string map always serializes"),
         ] {
             out.extend_from_slice(field.as_bytes());
             out.push(0);
@@ -655,11 +656,11 @@ fn decode_headings(bytes: &[u8]) -> Result<BTreeMap<u32, ClockedHeading>, String
     }
     let fields: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
     let fields = &fields[..fields.len().saturating_sub(1)];
-    if !fields.len().is_multiple_of(6) {
+    if !fields.len().is_multiple_of(7) {
         return Err("corrupt headings blob".into());
     }
     let s = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| "corrupt headings utf8");
-    for c in fields.chunks(6) {
+    for c in fields.chunks(7) {
         let id: u32 = s(c[0])?.parse().map_err(|_| "corrupt headings id")?;
         let tags_s = s(c[4])?;
         let props_s = s(c[5])?;
@@ -682,6 +683,8 @@ fn decode_headings(bytes: &[u8]) -> Result<BTreeMap<u32, ClockedHeading>, String
                             .map(|(k, v)| (k.to_owned(), v.to_owned()))
                     })
                     .collect(),
+                inherited_properties: serde_json::from_slice(c[6])
+                    .map_err(|e| format!("corrupt inherited properties: {e}"))?,
             },
         );
     }

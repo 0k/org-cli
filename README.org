@@ -152,10 +152,34 @@ org-cli clock list -f "billing" -i -j path/
 
 # Combine filters (AND)
 org-cli clock list -f "billing" -i --has-property TASK_REF -j path/
+
+# Attribute CLOCKs to the nearest heading or ancestor defining TASK_REF
+org-cli clock list -j --inherit-property TASK_REF
+
+# Request multiple properties (independently inherited)
+org-cli clock list -j --inherit-property TASK_REF --inherit-property OWNER path/
 #+end_src
 
-With no heading filter, NDJSON output is byte-identical to the
-pre-filter shape — existing consumers are unaffected.
+With neither heading filters nor =--inherit-property=, NDJSON output is
+byte-identical to the original shape — existing consumers are unaffected.
+
+=--inherit-property NAME= is repeatable and adds a top-level =properties=
+map containing only requested names found in a heading's =:PROPERTIES:=
+drawer. The enclosing heading wins; otherwise the closest ancestor
+defining that name wins. Names match case-insensitively; output keys keep
+the spelling supplied on the command line, and values are preserved
+verbatim. An entry with an empty value is ignored by the parser (as it is
+for =--has-property=), so it does not hide an ancestor's value. No match yields
+=properties: {}=; without the option this field is omitted entirely.
+Clocks before any heading also get an empty map. This option does not
+filter clocks or implicitly add a =heading= field; existing heading
+filters still inspect direct, not inherited, properties.
+
+Inheritance is limited to heading drawers: =#+PROPERTY:= file-level
+defaults and Emacs =org-use-property-inheritance= configuration are not
+consulted. Inherited values are cached with the parsed clock metadata;
+=--verify= validates file contents and =--no-cache= bypasses the cache as
+usual.
 
 ** =clock list-filed= — declared customer time
 

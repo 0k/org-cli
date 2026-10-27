@@ -42,7 +42,7 @@ use crate::org::heading::LineIndex;
 /// Bump when the *meaning* of a produced record or diagnostic changes
 /// — e.g. a new flag, a changed instant epoch, a different heading
 /// attribution rule. Folded into every cache key.
-pub const PROJECTION_ABI: u16 = 6;
+pub const PROJECTION_ABI: u16 = 7;
 
 /// Bump when the patched `orgize` fork changes in a way that could
 /// alter which lines become `CLOCK` nodes. Folded into every cache
@@ -84,6 +84,9 @@ pub struct ClockedHeading {
     pub title: String,
     pub tags: Vec<String>,
     pub properties: BTreeMap<String, String>,
+    /// Nearest-ancestor-or-self drawer values, keyed by uppercase property name.
+    /// Kept separate from direct properties so heading filters do not inherit.
+    pub inherited_properties: BTreeMap<String, String>,
 }
 
 /// Everything layer 1 stores for one file.
@@ -336,9 +339,22 @@ fn classify(
         Some((level, node)) => {
             let start: usize = node.text_range().start().into();
             let id = interner.intern(&format!("\0h@{}", start));
-            headings
-                .entry(id)
-                .or_insert_with(|| clocked_heading(node, *level, line_index));
+            headings.entry(id).or_insert_with(|| {
+                let mut heading = clocked_heading(node, *level, line_index);
+                for (_, ancestor) in heading_stack.iter().rev() {
+                    if let Some(drawer) =
+                        OrgHeadline::cast(ancestor.clone()).and_then(|h| h.properties())
+                    {
+                        for (name, value) in drawer.iter() {
+                            heading
+                                .inherited_properties
+                                .entry(name.to_ascii_uppercase())
+                                .or_insert_with(|| value.to_string());
+                        }
+                    }
+                }
+                heading
+            });
             id
         }
     };
@@ -444,6 +460,7 @@ fn clocked_heading(node: &SyntaxNode, level: u32, line_index: &LineIndex) -> Clo
         title,
         tags,
         properties,
+        inherited_properties: BTreeMap::new(),
     }
 }
 

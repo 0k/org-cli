@@ -576,6 +576,12 @@ pub enum ClockCommands {
         #[arg(long = "has-property", value_name = "NAME")]
         has_property: Vec<String>,
 
+        /// Include this property from the nearest defining heading (self or
+        /// ancestor). Repeatable; names match case-insensitively. Heading
+        /// drawers only, not file-level #+PROPERTY declarations.
+        #[arg(long = "inherit-property", value_name = "NAME")]
+        inherit_property: Vec<String>,
+
         /// NDJSON output (currently the only supported shape).
         #[arg(short = 'j', long, default_value_t = true)]
         json: bool,

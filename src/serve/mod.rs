@@ -54,6 +54,7 @@
 
 mod locks;
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -73,7 +74,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::index::{TodoEvent, TodoQuery, TodoRecord, TodoStore, records_from_snapshot};
 use crate::org::ast::{OrgAstDocument, parse_ast};
 use crate::org::heading::heading_body;
-use crate::org::heading_edit::{set_keyword, set_priority, write_atomic};
+use crate::org::heading_edit::{
+    set_keyword, set_priority, set_property, unset_property, write_atomic,
+};
 use crate::org::snapshot::FileSnapshot;
 use crate::org::todo_keywords::TodoKeywords;
 use locks::FileLocks;
@@ -167,6 +170,8 @@ struct HeadingPatchRequest {
     keyword: Patch<String>,
     #[serde(default, deserialize_with = "deserialize_priority_patch")]
     priority: Patch<String>,
+    #[serde(default)]
+    properties: BTreeMap<String, Option<String>>,
 }
 
 /// Snapshot-scoped heading-detail request, as query parameters.
@@ -514,12 +519,49 @@ async fn heading_patch_handler(
         )
             .into_response();
     }
-    if request.keyword == Patch::Unchanged && request.priority == Patch::Unchanged {
+    if request.keyword == Patch::Unchanged
+        && request.priority == Patch::Unchanged
+        && request.properties.is_empty()
+    {
         return (StatusCode::UNPROCESSABLE_ENTITY, "empty heading patch").into_response();
+    }
+    for (key, value) in &request.properties {
+        if key.is_empty() || key.chars().any(|c| c.is_whitespace() || c == ':') {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "property keys must be non-empty and contain neither whitespace nor ':'",
+            )
+                .into_response();
+        }
+        if value
+            .as_ref()
+            .is_some_and(|value| value.contains(['\n', '\r']))
+        {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "property values must not contain newlines",
+            )
+                .into_response();
+        }
     }
 
     let mut new_content = content.clone();
     let apply_result = (|| {
+        match &request.keyword {
+            Patch::Unchanged => {}
+            Patch::Remove => {
+                new_content = set_keyword(&new_content, request.line, None, &snapshot.keywords)?.0;
+            }
+            Patch::Set(keyword) => {
+                new_content = set_keyword(
+                    &new_content,
+                    request.line,
+                    Some(keyword),
+                    &snapshot.keywords,
+                )?
+                .0;
+            }
+        }
         match &request.priority {
             Patch::Unchanged => {}
             Patch::Remove => {
@@ -535,20 +577,11 @@ async fn heading_patch_handler(
                 .0;
             }
         }
-        match &request.keyword {
-            Patch::Unchanged => {}
-            Patch::Remove => {
-                new_content = set_keyword(&new_content, request.line, None, &snapshot.keywords)?.0;
-            }
-            Patch::Set(keyword) => {
-                new_content = set_keyword(
-                    &new_content,
-                    request.line,
-                    Some(keyword),
-                    &snapshot.keywords,
-                )?
-                .0;
-            }
+        for (key, value) in &request.properties {
+            new_content = match value {
+                Some(value) => set_property(&new_content, request.line, key, value)?.0,
+                None => unset_property(&new_content, request.line, key)?.0,
+            };
         }
         Ok::<(), crate::org::heading_edit::EditError>(())
     })();

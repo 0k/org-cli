@@ -90,6 +90,35 @@ NUL records use the fixed-field layout
 field indices remain stable, but consumers that assert the old exact field
 count must be updated.
 
+** Daemon heading mutation API
+
+=PATCH /api/heading= edits one indexed heading using its snapshot locator
+=(path, line, fingerprint)= and the file's =If-Match: "<etag>"= header.
+The JSON body accepts optional =keyword= and =priority= fields (string to
+set, =null= to remove), and an optional =properties= object:
+
+#+begin_src json
+{"path":"notes.org","line":12,"fingerprint":"<fingerprint>","properties":{"TASK_REF":"customer/248","OLD_KEY":null}}
+#+end_src
+
+A property string sets or updates that key; =null= unsets it. An absent
+or empty =properties= object changes no properties. Keys are non-empty,
+case-sensitive, with neither whitespace nor =:=; values must not contain
+LF or CR. Invalid keys/values or unsetting an absent property return
+=422= without writing. A request with no changes also returns =422=.
+Edits apply in fixed order: keyword, priority, then properties sorted by
+key, through the same editing functions as =heading set=. The transaction
+validates before one atomic file replacement; any edit error leaves the
+whole file unchanged.
+
+Success returns =200= and the updated file snapshot
+=(path, etag, todo_keywords, todos)=, plus the quoted =ETag= header.
+A stale =If-Match= returns =412= with the current snapshot and no write;
+a mismatched heading fingerprint returns =409= with no write. Missing
+=If-Match= returns =428=, malformed headers/JSON return =400=, unindexed
+files return =404=, and disabled remote writes return =403=. The existing
+snapshot/SSE endpoints continue to publish authoritative file state.
+
 ** =clock check= — is this file's time bookkeeping sound?
 
 The single gate to run after any edit that adds, modifies, or moves a
@@ -330,7 +359,7 @@ NUL-separated =file\0op\0line\0\0= records. The rest of the file stays
 byte-for-byte untouched.
 
 #+begin_src bash
-# Set fields (applied in order: keyword, title, tags, properties, content)
+# Set fields (applied in order: keyword, priority, title, tags, properties, content)
 org-cli heading set file.org "Parent/Child" --keyword TODO --title "New title" --write
 org-cli heading set file.org --line 12 --add-tag urgent --remove-tag draft --write
 org-cli heading set file.org --line 12 --set-tags "a,b"        # "" removes all tags

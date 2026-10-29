@@ -261,6 +261,129 @@ fn assert_output_eq(actual: &str, expected: &str) {
 }
 
 #[test]
+fn property_patch_creates_updates_and_removes_drawer() {
+    let content = "* TODO Property task\nBody untouched.\n";
+    let fixture = DaemonFixture::start("properties", content);
+    let mut locator = fixture.locator();
+    for (fields, expected) in [
+        (
+            json!({"properties": {"TASK_REF": "customer/12"}}),
+            indoc! {"
+            * TODO Property task
+              :PROPERTIES:
+              :TASK_REF: customer/12
+              :END:
+            Body untouched.
+        "},
+        ),
+        (
+            json!({"properties": {"TASK_REF": "customer/34"}}),
+            indoc! {"
+            * TODO Property task
+              :PROPERTIES:
+              :TASK_REF: customer/34
+              :END:
+            Body untouched.
+        "},
+        ),
+        (json!({"properties": {"TASK_REF": null}}), content),
+    ] {
+        let response = fixture.patch(&fixture.org, &locator, Some(&quoted(&locator.etag)), fields);
+        assert_eq!(response.status, StatusCode::OK, "{response:?}");
+        assert_output_eq(&std::fs::read_to_string(&fixture.org).unwrap(), expected);
+        assert_ne!(response.body["etag"], locator.etag);
+        assert_eq!(
+            response.etag_header,
+            Some(quoted(response.body["etag"].as_str().unwrap()))
+        );
+        locator = Locator::from_patch_body(&response.body);
+    }
+}
+
+#[test]
+fn property_patch_combines_keyword_priority_and_sorted_properties() {
+    let fixture = DaemonFixture::start("combined-properties", "* TODO [#B] Task\n");
+    let locator = fixture.locator();
+    let response = fixture.patch(&fixture.org, &locator, Some(&quoted(&locator.etag)),
+        json!({"keyword": "DONE", "priority": "A", "properties": {"Z": "last", "TASK_REF": "customer/12"}}));
+    assert_eq!(response.status, StatusCode::OK);
+    assert_output_eq(
+        &std::fs::read_to_string(&fixture.org).unwrap(),
+        indoc! {"
+        * DONE [#A] Task
+          :PROPERTIES:
+          :TASK_REF: customer/12
+          :Z: last
+          :END:
+    "},
+    );
+    assert_eq!(response.body["todos"][0]["keyword"], "DONE");
+    assert_eq!(response.body["todos"][0]["priority"], "A");
+}
+
+#[test]
+fn property_patch_rejects_invalid_input_without_partial_keyword_write() {
+    let content = "* TODO Task\n";
+    let fixture = DaemonFixture::start("invalid-properties", content);
+    let locator = fixture.locator();
+    for properties in [
+        json!({"": "x"}),
+        json!({"BAD KEY": "x"}),
+        json!({"BAD\tKEY": null}),
+        json!({"BAD:KEY": "x"}),
+        json!({"TASK_REF": "first\nsecond"}),
+        json!({"TASK_REF": "first\rsecond"}),
+    ] {
+        let response = fixture.patch(
+            &fixture.org,
+            &locator,
+            Some(&quoted(&locator.etag)),
+            json!({"keyword": "DONE", "properties": properties}),
+        );
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{response:?}"
+        );
+        assert_output_eq(&std::fs::read_to_string(&fixture.org).unwrap(), content);
+    }
+}
+
+#[test]
+fn property_patch_preserves_precondition_and_locator_guards() {
+    let content = "* TODO Task\n";
+    let fixture = DaemonFixture::start("property-guards", content);
+    let locator = fixture.locator();
+    let fields = json!({"properties": {"TASK_REF": "customer/12"}});
+    let stale = fixture.patch(&fixture.org, &locator, Some("\"stale\""), fields.clone());
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(stale.body["etag"], locator.etag);
+    assert_output_eq(&std::fs::read_to_string(&fixture.org).unwrap(), content);
+    let wrong = Locator {
+        fingerprint: "wrong-fingerprint".to_string(),
+        ..locator.clone()
+    };
+    let mismatch = fixture.patch(&fixture.org, &wrong, Some(&quoted(&locator.etag)), fields);
+    assert_eq!(mismatch.status, StatusCode::CONFLICT);
+    assert_output_eq(&std::fs::read_to_string(&fixture.org).unwrap(), content);
+}
+
+#[test]
+fn property_patch_empty_map_and_missing_unset_do_not_write() {
+    let content = "* TODO Task\n";
+    let fixture = DaemonFixture::start("empty-properties", content);
+    let locator = fixture.locator();
+    for fields in [
+        json!({"properties": {}}),
+        json!({"keyword": "DONE", "properties": {"TASK_REF": null}}),
+    ] {
+        let response = fixture.patch(&fixture.org, &locator, Some(&quoted(&locator.etag)), fields);
+        assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_output_eq(&std::fs::read_to_string(&fixture.org).unwrap(), content);
+    }
+}
+
+#[test]
 fn patch_with_matching_etag_updates_only_target_heading_line() {
     let before = indoc! {"
         #+TODO: TODO WIP | DONE CANCELED

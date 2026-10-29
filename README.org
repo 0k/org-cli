@@ -143,6 +143,14 @@ contribute no intervals. When the agenda set cannot be read, the sweep
 narrows to =PATHS= with a warning on stderr, so a file-local check
 keeps working on a machine that never ran org-collect.
 
+To check a candidate version of an agenda file from another location
+(a pre-commit hook checking the staged blob from a temporary copy),
+name the file it stands for with =--replaces PATH= (repeatable): that
+file's on-disk version leaves the sweep, so the copy is not reported
+as overlapping its own twin, while every other agenda file is still
+compared. Paths are matched canonically, so an agenda entry reached
+through a symlink counts; naming a checked =PATH= is an error.
+
 #+begin_src bash
 # After writing a CLOCK into a project file
 org-cli clock check ~/notes/project.org
@@ -152,6 +160,9 @@ org-cli clock check -j -1
 
 # Narrow both the lint and the sweep
 org-cli clock check --exclude '**/archive/**' path/
+
+# A staged copy, checked as a replacement of the live agenda file
+org-cli clock check --replaces ~/notes/project.org /tmp/staged/project.org
 #+end_src
 
 Human output ends with one summary line per rule set — =All CLOCK

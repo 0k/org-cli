@@ -427,6 +427,15 @@ pub enum ClockCommands {
         #[arg(long = "exclude", value_name = "GLOB")]
         exclude_globs: Vec<String>,
 
+        /// File the checked PATHS stand in for (e.g. the working copy
+        /// of a file whose staged version a pre-commit hook checks
+        /// from a temporary copy). Its on-disk version leaves the
+        /// overlap sweep, matched on canonical path so symlinked
+        /// agenda entries count; a path that does not exist changes
+        /// nothing. Repeatable. Naming a checked PATH is an error.
+        #[arg(long = "replaces", value_name = "PATH")]
+        replaces: Vec<std::path::PathBuf>,
+
         /// NUL-separated record output (for safe shell piping).
         #[arg(short = '0', conflicts_with = "json")]
         nul: bool,

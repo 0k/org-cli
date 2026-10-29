@@ -53,6 +53,10 @@ pub struct CheckOptions {
     /// matching files are skipped. For the overlap pass they are
     /// added to the configured `clock.activity-timeline.exclude-globs`.
     pub exclude_globs: Vec<String>,
+    /// Files the checked PATHS stand in for: their on-disk versions
+    /// leave the overlap sweep (matched on canonical path), so a
+    /// candidate copy is not compared against the file it replaces.
+    pub replaces: Vec<PathBuf>,
     pub nul: bool,
     pub json: bool,
     pub first: bool,
@@ -121,6 +125,7 @@ const OVERLAP_TAG: &str = "overlap";
 pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
     let t_total = Instant::now();
     let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
+    let replaced = replaced_files(&opts.replaces, &files)?;
     debug!(
         "checking CLOCK and FILED lines in {} org file(s)",
         files.len()
@@ -202,7 +207,7 @@ pub fn run_check(opts: CheckOptions) -> Result<i32, String> {
     // ---- pass 3: overlap -------------------------------------------
     if !stopped {
         let t_sweep = Instant::now();
-        let pairs = overlap_violations(&opts, &cfg, &files)?;
+        let pairs = overlap_violations(&opts, &cfg, &files, &replaced)?;
         debug!(
             "overlap sweep found {} pair(s) touching the checked files in {:.2} ms",
             pairs.len(),
@@ -255,19 +260,37 @@ fn record_kind(r: &crate::index::clock_blob::Record) -> ClockKeyword {
     }
 }
 
+/// Canonical paths of the `--replaces` files: the files the checked
+/// PATHS stand in for, left out of the overlap sweep. Canonical so an
+/// agenda entry reached through a symlink still matches. A replaced
+/// file that is also checked would silently vanish from its own
+/// sweep, so that is refused before anything is reported.
+fn replaced_files(replaces: &[PathBuf], checked: &[PathBuf]) -> Result<BTreeSet<PathBuf>, String> {
+    let replaced: BTreeSet<PathBuf> = replaces.iter().map(|p| canonical(p)).collect();
+    let checked: BTreeSet<PathBuf> = checked.iter().map(|p| canonical(p)).collect();
+    match replaced.intersection(&checked).next() {
+        Some(both) => Err(format!(
+            "--replaces {} names a checked path: a file cannot stand in for itself",
+            both.display()
+        )),
+        None => Ok(replaced),
+    }
+}
+
 /// The overlap pass of `clock check`: every pair of clean CLOCK
 /// entries sharing an instant, where at least one side lives in
 /// `checked` (the resolved PATHS). Returned in detector order.
 ///
 /// The sweep runs over `checked ∪ agenda set`, minus the configured
-/// `clock.activity-timeline.exclude-globs` and the command-line `--exclude`
-/// patterns. When the agenda set cannot be read, the sweep narrows to
+/// `clock.activity-timeline.exclude-globs`, the command-line `--exclude`
+/// patterns and the `replaced` files. When the agenda set cannot be read, the sweep narrows to
 /// `checked` alone and says so on stderr — a file-local check must
 /// keep working on a machine that never ran org-collect.
 fn overlap_violations(
     opts: &CheckOptions,
     cfg: &Config,
     checked: &[PathBuf],
+    replaced: &BTreeSet<PathBuf>,
 ) -> Result<Vec<Violation>, String> {
     let exclude_globs = activity_timeline_exclusions(cfg, &opts.exclude_globs)?;
 
@@ -303,6 +326,7 @@ fn overlap_violations(
         .into_iter()
         .filter(|p| !path_excluded(p, &patterns))
         .map(|p| canonical(&p))
+        .filter(|p| !replaced.contains(p))
         .collect();
     corpus.sort();
     corpus.dedup();
@@ -2124,6 +2148,7 @@ mod tests {
         CheckOptions {
             paths,
             exclude_globs: Vec::new(),
+            replaces: Vec::new(),
             nul: false,
             json: true, // tests use json so output is unaffected by colors
             first: false,

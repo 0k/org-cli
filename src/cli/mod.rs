@@ -122,6 +122,7 @@ pub fn run() -> Result<(), String> {
             def::ClockCommands::Check {
                 paths,
                 exclude_globs,
+                replaces,
                 nul,
                 json,
                 first,
@@ -132,6 +133,7 @@ pub fn run() -> Result<(), String> {
                 let opts = action::clock::CheckOptions {
                     paths,
                     exclude_globs,
+                    replaces,
                     nul,
                     json,
                     first,

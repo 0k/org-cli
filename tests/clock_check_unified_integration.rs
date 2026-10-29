@@ -525,3 +525,99 @@ fn stale_hint_in_list_abort_points_at_check_not_check_filed() {
     assert!(stderr.contains("org-cli clock check``"), "{stderr}");
     assert!(!stderr.contains("check-filed"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------
+// `--replaces`: checking a candidate version of an agenda file
+// ---------------------------------------------------------------------
+
+/// A candidate copy of an agenda file (e.g. a pre-commit hook's
+/// staged blob) shares every CLOCK with the live file it stands for.
+const OTHER_CLOCK_OVERLAPPING_A: &str = indoc! {"
+    * B
+    :LOGBOOK:
+    CLOCK: [2026-03-02 Mon 09:30 +0100]--[2026-03-02 Mon 10:30 +0100] =>  1:00
+    :END:
+"};
+
+#[test]
+fn candidate_copy_of_an_agenda_file_overlaps_its_live_twin_without_replaces() {
+    let w = World::new();
+    let live = w.write("repo/admin.org", CLEAN_CLOCK_A);
+    let candidate = w.write("staged/repo/admin.org", CLEAN_CLOCK_A);
+    w.agenda(&[&live]);
+
+    let (code, stdout, stderr) = w.check(&["-j", s(&candidate)]);
+    assert_eq!(code, Some(1), "stderr={stderr}");
+    assert_eq!(json_lines(&stdout).len(), 1, "{stdout}");
+}
+
+#[test]
+fn replaces_drops_the_live_file_from_the_overlap_sweep() {
+    let w = World::new();
+    let live = w.write("repo/admin.org", CLEAN_CLOCK_A);
+    let candidate = w.write("staged/repo/admin.org", CLEAN_CLOCK_A);
+    w.agenda(&[&live]);
+
+    let (code, stdout, stderr) = w.check(&["--replaces", s(&live), s(&candidate)]);
+    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("No overlapping CLOCK entries."), "{stdout}");
+}
+
+#[test]
+fn replaces_keeps_genuine_overlaps_with_other_agenda_files() {
+    let w = World::new();
+    let live = w.write("repo/admin.org", "* A\n");
+    let candidate = w.write("staged/repo/admin.org", CLEAN_CLOCK_A);
+    let theirs = w.write("theirs.org", OTHER_CLOCK_OVERLAPPING_A);
+    w.agenda(&[&live, &theirs]);
+
+    let (code, stdout, stderr) = w.check(&["-j", "--replaces", s(&live), s(&candidate)]);
+    assert_eq!(code, Some(1), "stderr={stderr}");
+    let recs = json_lines(&stdout);
+    assert_eq!(recs.len(), 1, "{stdout}");
+    assert_eq!(recs[0]["tag"], "overlap");
+    assert_eq!(
+        Path::new(recs[0]["other"]["file"].as_str().unwrap()),
+        theirs.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn replaces_matches_the_agenda_entry_through_a_symlink_alias() {
+    let w = World::new();
+    let real = w.write("store/admin.org", CLEAN_CLOCK_A);
+    let alias = w.path("config/admin.org");
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let candidate = w.write("staged/store/admin.org", CLEAN_CLOCK_A);
+    // The agenda lists the alias; the caller names the real path.
+    w.agenda(&[&alias]);
+
+    let (code, stdout, stderr) = w.check(&["--replaces", s(&real), s(&candidate)]);
+    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
+}
+
+#[test]
+fn replaces_of_a_file_outside_the_agenda_set_changes_nothing() {
+    let w = World::new();
+    let candidate = w.write("staged/new.org", CLEAN_CLOCK_A);
+    let theirs = w.write("theirs.org", OTHER_CLOCK_OVERLAPPING_A);
+    w.agenda(&[&theirs]);
+    let absent = w.path("repo/new.org");
+
+    let (code, stdout, stderr) = w.check(&["-j", "--replaces", s(&absent), s(&candidate)]);
+    assert_eq!(code, Some(1), "stderr={stderr}");
+    assert_eq!(json_lines(&stdout).len(), 1, "{stdout}");
+}
+
+#[test]
+fn replaces_naming_a_checked_path_is_refused() {
+    let w = World::new();
+    let mine = w.write("mine.org", CLEAN_CLOCK_A);
+    w.agenda(&[&mine]);
+
+    let (code, stdout, stderr) = w.check(&["--replaces", s(&mine), s(&mine)]);
+    assert_eq!(code, Some(1), "stdout={stdout} stderr={stderr}");
+    assert_eq!(stdout, "", "a refused invocation checks nothing");
+    assert!(stderr.contains("--replaces"), "{stderr}");
+}

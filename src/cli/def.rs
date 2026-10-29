@@ -411,7 +411,7 @@ pub enum ClockCommands {
     /// against the whole agenda set, not just PATHS: a CLOCK just
     /// written here may collide with one in any other agenda file.
     /// Only pairs touching PATHS are reported; with no PATHS, every
-    /// pair is. Files matching ``clock.overlap.exclude-globs`` in the
+    /// pair is. Files matching ``clock.activity-timeline.exclude-globs`` in the
     /// config contribute no intervals. ``clock overlap`` remains the
     /// pair-oriented, sortable view of the same rule.
     Check {
@@ -423,7 +423,7 @@ pub enum ClockCommands {
         /// Glob patterns matched against candidate file paths;
         /// matching files are skipped. Repeatable. For the overlap
         /// rule they are added to the configured
-        /// ``clock.overlap.exclude-globs``.
+        /// ``clock.activity-timeline.exclude-globs``.
         #[arg(long = "exclude", value_name = "GLOB")]
         exclude_globs: Vec<String>,
 
@@ -455,7 +455,7 @@ pub enum ClockCommands {
     ///
     /// Unlike ``clock check``, whose rules each apply to a single
     /// line, this compares every clean CLOCK entry against every
-    /// other one across the whole corpus — you cannot be doing two
+    /// other one across the activity timeline — you cannot be doing two
     /// things at the same time, so any overlap is a bookkeeping
     /// error somewhere.
     ///
@@ -467,10 +467,10 @@ pub enum ClockCommands {
     /// (a line whose own timestamps are broken cannot be placed on
     /// a timeline). Run ``clock check`` first for a clean corpus.
     ///
-    /// Files matching ``clock.overlap.exclude-globs`` in the config
+    /// Files matching ``clock.activity-timeline.exclude-globs`` in the config
     /// contribute no intervals — that is where CLOCK lines which
-    /// record evidence rather than work (activity segments,
-    /// presence windows) are declared. ``--exclude`` adds to that
+    /// record evidence rather than lived activity (generated segments,
+    /// presence windows), forecasts or fixtures are declared. ``--exclude`` adds to that
     /// list rather than replacing it.
     Overlap {
         /// Files or directories to scan. When omitted, the agenda
@@ -480,7 +480,7 @@ pub enum ClockCommands {
 
         /// Glob patterns matched against candidate file paths;
         /// matching files are skipped. Repeatable. Added to the
-        /// configured `clock.overlap.exclude-globs`.
+        /// configured `clock.activity-timeline.exclude-globs`.
         #[arg(long = "exclude", value_name = "GLOB")]
         exclude_globs: Vec<String>,
 
@@ -558,6 +558,12 @@ pub enum ClockCommands {
     /// whereabout records.
     List {
         paths: Vec<std::path::PathBuf>,
+
+        /// List only the activity timeline: files whose CLOCKs record lived
+        /// activity, excluding evidence/forecast/fixture files configured in
+        /// clock.activity-timeline.exclude-globs. --exclude narrows it further.
+        #[arg(long)]
+        activity_timeline: bool,
 
         /// Glob patterns matched against candidate file paths;
         /// matching files are skipped. Repeatable.

@@ -10,7 +10,7 @@
 //!   accepted-zones:
 //!     - Europe/Paris
 //!     - Asia/Shanghai
-//!   overlap:
+//!   activity-timeline:
 //!     exclude-globs:
 //!       - ~/notes/activity/**
 //!       - ~/notes/presence/**
@@ -39,26 +39,62 @@ pub struct Config {
 
 /// `clock:` sub-section of the config.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(try_from = "RawClockConfig")]
 pub struct ClockConfig {
     /// IANA zone names (e.g. `"Europe/Paris"`). A CLOCK line's
     /// embedded numerical offset must match at least one of
     /// these zones at the line's instant.
-    #[serde(default, rename = "accepted-zones")]
     pub accepted_zones: Vec<String>,
-    /// Settings for the cross-entry `clock overlap` check.
-    #[serde(default)]
-    pub overlap: OverlapConfig,
+    /// The files whose CLOCKs record lived activity and must never overlap.
+    pub activity_timeline: ActivityTimelineConfig,
 }
 
-/// `clock.overlap:` sub-section of the config.
+#[derive(Deserialize)]
+struct RawClockConfig {
+    #[serde(default, rename = "accepted-zones")]
+    accepted_zones: Vec<String>,
+    #[serde(default, rename = "activity-timeline")]
+    activity_timeline: Option<ActivityTimelineConfig>,
+    #[serde(default)]
+    overlap: Option<ActivityTimelineConfig>,
+}
+
+impl TryFrom<RawClockConfig> for ClockConfig {
+    type Error = String;
+
+    fn try_from(raw: RawClockConfig) -> Result<Self, Self::Error> {
+        let activity_timeline = match (raw.activity_timeline, raw.overlap) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "cannot set both `clock.activity-timeline` and deprecated `clock.overlap`"
+                        .into(),
+                );
+            }
+            (Some(timeline), None) => timeline,
+            (None, Some(timeline)) => {
+                log::warn!(
+                    "config: `clock.overlap` is deprecated, rename it to `clock.activity-timeline`"
+                );
+                timeline
+            }
+            (None, None) => ActivityTimelineConfig::default(),
+        };
+        Ok(Self {
+            accepted_zones: raw.accepted_zones,
+            activity_timeline,
+        })
+    }
+}
+
+/// `clock.activity-timeline:` sub-section of the config.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct OverlapConfig {
+pub struct ActivityTimelineConfig {
     /// Glob patterns matched against candidate file paths; matching
-    /// files contribute no intervals to the overlap check.
+    /// files are outside the activity timeline.
     ///
-    /// This is where the *work log* versus *evidence* distinction
-    /// gets declared. Not every CLOCK line records time spent
-    /// working:
+    /// The timeline records lived activity: work, sport, sleep, or
+    /// anything actually lived. Evidence, forecasts and fixtures
+    /// do not belong to it:
     ///
     /// - `activity/**` holds generated activity segments — the
     ///   raw material a work log is written *from*, not a work log.
@@ -66,15 +102,14 @@ pub struct OverlapConfig {
     ///   stay in a place, routinely months long. Such a line
     ///   overlaps essentially every work clock by construction.
     ///
-    /// Left empty, no file is excluded and the check still runs —
-    /// it just reports the evidence-versus-work collisions too.
+    /// Left empty, no file is excluded from the activity timeline.
     ///
     /// A leading `~/` is expanded to the user's home directory.
     #[serde(default, rename = "exclude-globs")]
     pub exclude_globs: Vec<String>,
 }
 
-impl OverlapConfig {
+impl ClockConfig {
     /// The configured globs with a leading `~/` expanded against the
     /// user's home directory.
     ///
@@ -83,8 +118,9 @@ impl OverlapConfig {
     /// so a missing home directory is an error the caller can
     /// report instead of a silently unexpanded pattern that would
     /// quietly match nothing.
-    pub fn resolve_exclude_globs(&self) -> Result<Vec<String>, String> {
-        self.exclude_globs
+    pub fn activity_timeline_exclude_globs(&self) -> Result<Vec<String>, String> {
+        self.activity_timeline
+            .exclude_globs
             .iter()
             .map(|g| match g.strip_prefix("~/") {
                 Some(rest) => {
@@ -276,13 +312,31 @@ mod tests {
         assert!(err.contains("Mars/Olympus"), "got: {}", err);
     }
 
-    // ----- clock.overlap ------------------------------------------------
+    // ----- clock.activity-timeline --------------------------------------
 
     #[test]
-    fn overlap_exclude_globs_default_to_empty() {
+    fn activity_timeline_exclude_globs_default_to_empty() {
         let c = Config::default();
-        assert!(c.clock.overlap.exclude_globs.is_empty());
-        assert!(c.clock.overlap.resolve_exclude_globs().unwrap().is_empty());
+        assert!(
+            c.clock
+                .activity_timeline_exclude_globs()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parses_dash_cased_activity_timeline_exclude_globs() {
+        let p = write_temp(
+            "activity-timeline",
+            "clock:\n  activity-timeline:\n    exclude-globs: ['/evidence/**', 'relative/**']\n",
+        );
+        let c = Config::load_from(&p).unwrap();
+        assert_eq!(
+            c.clock.activity_timeline_exclude_globs().unwrap(),
+            ["/evidence/**", "relative/**"]
+        );
+        std::fs::remove_file(p).unwrap();
     }
 
     #[test]
@@ -299,7 +353,7 @@ mod tests {
         );
         let c = Config::load_from(&p).unwrap();
         assert_eq!(
-            c.clock.overlap.exclude_globs,
+            c.clock.activity_timeline.exclude_globs,
             vec![
                 "/abs/path/**".to_string(),
                 "~/notes/activity/**".to_string()
@@ -323,7 +377,10 @@ mod tests {
         );
         let c = Config::load_from(&p).unwrap();
         assert_eq!(c.clock.accepted_zones, vec!["Europe/Paris".to_string()]);
-        assert_eq!(c.clock.overlap.exclude_globs, vec!["/x/**".to_string()]);
+        assert_eq!(
+            c.clock.activity_timeline_exclude_globs().unwrap(),
+            vec!["/x/**".to_string()]
+        );
         std::fs::remove_file(p).ok();
     }
 
@@ -336,16 +393,24 @@ mod tests {
             "clock:\n  overlap:\n    exclude_globs:\n      - /x/**\n",
         );
         let c = Config::load_from(&p).unwrap();
-        assert!(c.clock.overlap.exclude_globs.is_empty());
+        assert!(
+            c.clock
+                .activity_timeline_exclude_globs()
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_file(p).ok();
     }
 
     #[test]
     fn resolve_exclude_globs_expands_leading_tilde() {
-        let cfg = OverlapConfig {
-            exclude_globs: vec!["~/notes/activity/**".into()],
+        let cfg = ClockConfig {
+            activity_timeline: ActivityTimelineConfig {
+                exclude_globs: vec!["~/notes/activity/**".into()],
+            },
+            ..Default::default()
         };
-        let resolved = cfg.resolve_exclude_globs().unwrap();
+        let resolved = cfg.activity_timeline_exclude_globs().unwrap();
         let home = dirs::home_dir().unwrap();
         assert_eq!(
             resolved,
@@ -359,10 +424,13 @@ mod tests {
 
     #[test]
     fn resolve_exclude_globs_leaves_absolute_paths_alone() {
-        let cfg = OverlapConfig {
-            exclude_globs: vec!["/abs/**".into(), "relative/**".into()],
+        let cfg = ClockConfig {
+            activity_timeline: ActivityTimelineConfig {
+                exclude_globs: vec!["/abs/**".into(), "relative/**".into()],
+            },
+            ..Default::default()
         };
-        let resolved = cfg.resolve_exclude_globs().unwrap();
+        let resolved = cfg.activity_timeline_exclude_globs().unwrap();
         assert_eq!(
             resolved,
             vec!["/abs/**".to_string(), "relative/**".to_string()]
@@ -373,10 +441,13 @@ mod tests {
     fn resolve_exclude_globs_does_not_expand_bare_tilde_word() {
         // Only a ``~/`` prefix is a home reference; ``~foo`` is a
         // literal path component and must survive untouched.
-        let cfg = OverlapConfig {
-            exclude_globs: vec!["~backup/**".into()],
+        let cfg = ClockConfig {
+            activity_timeline: ActivityTimelineConfig {
+                exclude_globs: vec!["~backup/**".into()],
+            },
+            ..Default::default()
         };
-        let resolved = cfg.resolve_exclude_globs().unwrap();
+        let resolved = cfg.activity_timeline_exclude_globs().unwrap();
         assert_eq!(resolved, vec!["~backup/**".to_string()]);
     }
 

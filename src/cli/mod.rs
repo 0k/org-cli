@@ -195,6 +195,7 @@ pub fn run() -> Result<(), String> {
             def::ClockCommands::List {
                 paths,
                 exclude_globs,
+                activity_timeline,
                 filter,
                 ignore_case,
                 has_property,
@@ -208,6 +209,7 @@ pub fn run() -> Result<(), String> {
                     kind: crate::org::clock::ClockKeyword::Clock,
                     paths,
                     exclude_globs,
+                    activity_timeline,
                     filter,
                     ignore_case,
                     has_property,
@@ -239,6 +241,7 @@ pub fn run() -> Result<(), String> {
                     kind: crate::org::clock::ClockKeyword::Filed,
                     paths,
                     exclude_globs,
+                    activity_timeline: false,
                     filter: None,
                     ignore_case: false,
                     has_property: Vec::new(),

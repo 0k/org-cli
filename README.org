@@ -109,7 +109,7 @@ Rules 1–2 are per-line and scoped to =PATHS=. Rule 3 is pairwise over
 with one in *any* other agenda file, and that is exactly what a
 post-write check must catch. Only pairs touching =PATHS= are reported;
 with no =PATHS= the agenda set is the scope and every pair is. Files
-matching =clock.overlap.exclude-globs= (see =clock overlap= below)
+matching =clock.activity-timeline.exclude-globs= (see =clock overlap= below)
 contribute no intervals. When the agenda set cannot be read, the sweep
 narrows to =PATHS= with a warning on stderr, so a file-local check
 keeps working on a machine that never ran org-collect.
@@ -148,9 +148,20 @@ heading-aware: only CLOCKs whose enclosing heading matches are kept,
 and each emitted NDJSON record gains a =heading= field with the
 parent's =level=, =line=, =title=, =tags=, =properties=.
 
+=--activity-timeline= restricts the scan to files whose CLOCKs record
+lived activity (work, sport, sleep, or anything actually lived). It
+excludes evidence, forecasts and fixtures configured in
+=clock.activity-timeline.exclude-globs=, the same set used by
+=clock overlap= and the overlap pass of =clock check=. =--exclude=
+appends exclusions and narrows that set further. Without the flag,
+=clock list= continues to list every valid CLOCK in the input files.
+
 #+begin_src bash
 # Every CLOCK line (unchanged behavior)
 org-cli clock list path/
+
+# Only the activity timeline, inheriting task references for consumers
+org-cli clock list -j --activity-timeline --inherit-property TASK_REF
 
 # Only CLOCKs under :TASK_REF: headings (with parent heading embedded)
 org-cli clock list --has-property TASK_REF -j path/
@@ -231,7 +242,7 @@ and excluded from listing; =list-filed= exits 1 when it finds one, and
 ** =clock overlap= — find CLOCK lines covering the same instant
 
 The one cross-entry rule: it compares each clean CLOCK entry against
-every other one across the whole corpus, because you cannot be doing
+every other one across the activity timeline, because you cannot be doing
 two things at the same time. =clock check= runs the same rule as its
 third pass; =clock overlap= is the pair-oriented, sortable view of it
 for auditing a corpus.
@@ -271,26 +282,36 @@ than aborting the run: a line whose own timestamps are broken cannot
 be placed on a timeline, but the rest still can. =clock check= reports
 those lines itself, so it stays silent about skipping them.
 
-*** Declaring which CLOCK lines are work logs
+*** Configuring the activity timeline
 
-Not every CLOCK line records time spent working. Files matching
-=clock.overlap.exclude-globs= contribute no intervals:
+The *activity timeline* is the set of agenda files whose CLOCKs record
+real, lived activity: work, sport, sleep, and anything else actually
+lived. CLOCKs on this timeline must never overlap. Not every CLOCK
+records lived activity: evidence, forecasts and fixtures belong outside
+it. Files matching =clock.activity-timeline.exclude-globs= contribute
+no intervals to the overlap check and are skipped by
+=clock list --activity-timeline=:
 
 #+begin_src yaml
 clock:
-  overlap:
+  activity-timeline:
     exclude-globs:
       - ~/notes/activity/**    # activity segments
       - ~/notes/presence/**   # presence windows
 #+end_src
 
-The two classes above are *evidence*, not work logs: segment files are
+The two classes above are *evidence*, not lived activity: segment files are
 the raw material a work log is written from, and a presence window is
 one CLOCK per stay in a place — routinely months long, so it overlaps
 essentially every work clock by construction.
 
 A leading =~/= is expanded to the home directory. The =--exclude= flag
 adds to this list rather than replacing it.
+
+The old key =clock.overlap.exclude-globs= remains a deprecated alias.
+Using only =clock.overlap= emits a warning once per config load to rename
+it to =clock.activity-timeline=. Setting both sections is a hard config
+error, even when their exclusion lists are empty.
 
 NDJSON records carry =a= and =b= (each with =file=, =line=, =start=,
 =end=, =raw=) plus =overlap_seconds=; =a= is always the

@@ -51,7 +51,7 @@ pub struct CheckOptions {
     pub paths: Vec<PathBuf>,
     /// Glob patterns matched against candidate file paths;
     /// matching files are skipped. For the overlap pass they are
-    /// added to the configured `clock.overlap.exclude-globs`.
+    /// added to the configured `clock.activity-timeline.exclude-globs`.
     pub exclude_globs: Vec<String>,
     pub nul: bool,
     pub json: bool,
@@ -260,7 +260,7 @@ fn record_kind(r: &crate::index::clock_blob::Record) -> ClockKeyword {
 /// `checked` (the resolved PATHS). Returned in detector order.
 ///
 /// The sweep runs over `checked ∪ agenda set`, minus the configured
-/// `clock.overlap.exclude-globs` and the command-line `--exclude`
+/// `clock.activity-timeline.exclude-globs` and the command-line `--exclude`
 /// patterns. When the agenda set cannot be read, the sweep narrows to
 /// `checked` alone and says so on stderr — a file-local check must
 /// keep working on a machine that never ran org-collect.
@@ -269,10 +269,7 @@ fn overlap_violations(
     cfg: &Config,
     checked: &[PathBuf],
 ) -> Result<Vec<Violation>, String> {
-    // Config globs first, command-line ones appended: `--exclude`
-    // narrows further, it never re-opens what config excluded.
-    let mut exclude_globs = cfg.clock.overlap.resolve_exclude_globs()?;
-    exclude_globs.extend(opts.exclude_globs.iter().cloned());
+    let exclude_globs = activity_timeline_exclusions(cfg, &opts.exclude_globs)?;
 
     // Membership is decided on canonical paths: the caller may name
     // a file relatively while the agenda set lists it absolutely.
@@ -575,7 +572,7 @@ pub struct OverlapOptions {
     /// set" (see [`crate::cli::action::walk::read_agenda_set`]).
     pub paths: Vec<PathBuf>,
     /// Glob patterns from the command line. Added to the configured
-    /// `clock.overlap.exclude-globs` rather than replacing them.
+    /// `clock.activity-timeline.exclude-globs` rather than replacing them.
     pub exclude_globs: Vec<String>,
     pub nul: bool,
     pub json: bool,
@@ -671,11 +668,8 @@ pub struct Overlap {
 /// Run `clock overlap`. Returns 0 when no overlap was found, 1 when
 /// at least one was reported, `Err` on usage / I/O errors.
 pub fn run_overlap(opts: OverlapOptions) -> Result<i32, String> {
-    // Config globs first, command-line ones appended: `--exclude`
-    // narrows further, it never re-opens what config excluded.
     let cfg = Config::load_default()?;
-    let mut exclude_globs = cfg.clock.overlap.resolve_exclude_globs()?;
-    exclude_globs.extend(opts.exclude_globs.iter().cloned());
+    let exclude_globs = activity_timeline_exclusions(&cfg, &opts.exclude_globs)?;
 
     let t_total = Instant::now();
     let files = resolve_input_files(&opts.paths, &exclude_globs)?;
@@ -1239,6 +1233,13 @@ fn emit_fix_record(
 // `clock list`
 // =====================================================================
 
+/// Config exclusions define the activity timeline; CLI exclusions narrow it.
+fn activity_timeline_exclusions(cfg: &Config, cli: &[String]) -> Result<Vec<String>, String> {
+    let mut globs = cfg.clock.activity_timeline_exclude_globs()?;
+    globs.extend_from_slice(cli);
+    Ok(globs)
+}
+
 /// CLI options for `clock list`.
 #[derive(Debug, Clone)]
 pub struct ListOptions {
@@ -1249,6 +1250,8 @@ pub struct ListOptions {
     /// Glob patterns matched against candidate file paths;
     /// matching files are skipped.
     pub exclude_globs: Vec<String>,
+    /// Restrict CLOCKs to the configured activity timeline.
+    pub activity_timeline: bool,
     /// Match enclosing heading title against regex.
     pub filter: Option<String>,
     /// Case-insensitive enclosing heading title regex.
@@ -1363,14 +1366,19 @@ struct ListReject {
 /// incomplete".
 pub fn run_list(opts: ListOptions) -> Result<i32, String> {
     let t_total = Instant::now();
-    let files = resolve_input_files(&opts.paths, &opts.exclude_globs)?;
+    let cfg = Config::load_default()?;
+    let exclude_globs = if opts.activity_timeline {
+        activity_timeline_exclusions(&cfg, &opts.exclude_globs)?
+    } else {
+        opts.exclude_globs.clone()
+    };
+    let files = resolve_input_files(&opts.paths, &exclude_globs)?;
     debug!(
         "listing {} lines from {} org file(s)",
         opts.kind.as_str(),
         files.len()
     );
 
-    let cfg = Config::load_default()?;
     let zones = cfg.clock.resolve_zones()?;
     let heading_filter = build_heading_filter(&opts)?;
 
@@ -2542,6 +2550,7 @@ mod tests {
             kind: ClockKeyword::Clock,
             paths,
             exclude_globs: Vec::new(),
+            activity_timeline: false,
             filter: None,
             ignore_case: false,
             has_property: Vec::new(),
@@ -2564,6 +2573,7 @@ mod tests {
             kind: ClockKeyword::Clock,
             paths: Vec::new(),
             exclude_globs: Vec::new(),
+            activity_timeline: false,
             filter: filter.map(str::to_string),
             ignore_case,
             has_property: has_property
